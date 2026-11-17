@@ -386,11 +386,18 @@ def check_login(rootfs: Path) -> None:
     _require_in(_read(inittab), "ttyS0::askfirst:/bin/login", inittab)
     pam = _require(rootfs / "etc/pam.d/common-auth", "PAM 配置")
     pam_text = _read(pam)
-    _require_in(pam_text, "auth sufficient libmico-pam.so", pam)
-    _require_in(pam_text, "account sufficient libmico-pam.so", pam)
-    if not re.search(r"^#\s*auth\s+\[success=1 default=ignore\]\s+pam_unix\.so",
+    # 接受两种状态：原厂（libmico 未注释、pam_unix 被注释）与已打过本补丁
+    # （libmico 已注释、pam_unix 已启用）；其他状态一律拒绝。
+    # （2026-11-17：旧版只认原厂状态，已打过补丁的 rootfs 重跑 patch_login
+    # 必在这里失败；见 test_patch_login_twice_on_sha512_shadow。）
+    for line in (r"auth sufficient libmico-pam\.so",
+                 r"account sufficient libmico-pam\.so"):
+        if not re.search(r"^#?\s*" + line + r"\s*$",
+                         pam_text, re.MULTILINE):
+            raise PatchError(f"前置条件不满足：{pam} 里找不到 {line} 行")
+    if not re.search(r"^#?\s*auth\s+\[success=1 default=ignore\]\s+pam_unix\.so",
                      pam_text, re.MULTILINE):
-        raise PatchError(f"前置条件不满足：{pam} 里找不到被注释的 pam_unix.so 行")
+        raise PatchError(f"前置条件不满足：{pam} 里找不到 pam_unix.so 行")
 
 
 def patch_login(rootfs: Path) -> str:
@@ -409,11 +416,6 @@ def patch_login(rootfs: Path) -> str:
     text = _read(shadow)
     text, n = re.subn(r"^root:\$[156]\$[^:]+:", f"root:{new_hash}:", text,
                       count=1, flags=re.MULTILINE)
-
-    shadow = rootfs / "etc/shadow"
-    text = _read(shadow)
-    text, n = re.subn(r"^root:\$1\$[^:]+:", f"root:{new_hash}:", text,
-                      count=1, flags=re.MULTILINE)
     if n != 1:
         raise PatchError(f"root 密码行替换失败：{shadow}")
     _write(shadow, text)
@@ -425,13 +427,18 @@ def patch_login(rootfs: Path) -> str:
 
     pam = rootfs / "etc/pam.d/common-auth"
     text = _read(pam)
-    text = text.replace("auth sufficient libmico-pam.so",
-                        "# auth sufficient libmico-pam.so", 1)
-    text = text.replace("account sufficient libmico-pam.so",
-                        "# account sufficient libmico-pam.so", 1)
+    # 只注释尚未注释的行（已打过补丁时跳过，避免 "# # " 双重注释）。
+    text = re.sub(r"^auth sufficient libmico-pam\.so\s*$",
+                  "# auth sufficient libmico-pam.so", text,
+                  count=1, flags=re.MULTILINE)
+    text = re.sub(r"^account sufficient libmico-pam\.so\s*$",
+                  "# account sufficient libmico-pam.so", text,
+                  count=1, flags=re.MULTILINE)
+    # 只启用仍被注释的 pam_unix 行（已启用时跳过）。
     text, n = re.subn(r"^#\s*auth(\s+\[success=1 default=ignore\]\s+pam_unix\.so.*)$",
                       r"auth\1", text, count=1, flags=re.MULTILINE)
-    if n != 1:
+    if n == 0 and not re.search(r"^auth\s+\[success=1 default=ignore\]\s+pam_unix\.so",
+                                text, re.MULTILINE):
         raise PatchError(f"pam_unix.so 行启用失败：{pam}")
     _write(pam, text)
 

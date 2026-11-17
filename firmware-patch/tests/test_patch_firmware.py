@@ -190,6 +190,26 @@ def test_patch_login_same_password_random_salt(tmp_path):
     assert h1.split("$")[2] != h2.split("$")[2]
 
 
+def test_patch_login_twice_on_sha512_shadow(tmp_path):
+    # 已打过补丁的 rootfs 重跑 patch_login 必须成功（幂等）。
+    # 旧代码两处失败：(1) shadow 第一次 subn（$[156]$ 全覆盖）的结果被紧接着的
+    # 重读文件丢弃，第二次 subn 只处理 $1$，$6$ 行必抛错；(2) check_login 只认
+    # 原厂 PAM 状态，已打过补丁的 rootfs 在前置检查就失败。latent bug，2026-11-17 修。
+    root = copy_rootfs(tmp_path / "rootfs")
+    h1 = patch_login(root)
+    assert h1.startswith("$6$")
+    h2 = patch_login(root)
+    assert h2.startswith("$6$")
+    assert h2 != h1  # 新盐、新 hash
+    assert f"root:{h2}:" in (root / "etc/shadow").read_text()
+    assert hash_matches_password(TEST_SSH_PASSWORD, h2)
+    # PAM 两次打补丁后仍是恰好一次注释、无双重注释。
+    pam = (root / "etc/pam.d/common-auth").read_text()
+    assert "# # auth sufficient" not in pam
+    assert "# # account sufficient" not in pam
+    assert "auth\t[success=1 default=ignore]\tpam_unix.so nullok_secure" in pam
+
+
 def test_patch_login_rejects_short_password(tmp_path, monkeypatch):
     root = copy_rootfs(tmp_path / "rootfs")
     monkeypatch.setenv("SSH_PASSWORD", "short")
