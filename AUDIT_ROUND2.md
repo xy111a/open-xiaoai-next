@@ -662,7 +662,7 @@
 - 提交：`e12e395`（CI 修复：Go job 加 `libopusfile-dev`；固件测试在缺 fixture 时显式跳过）、`40d30fc`（第二轮审计：firmware-patch / deploy / CI 面报告）、`2cdb724`（AUDIT_ROUND2.md + 分面报告 + Python job 拆分）。
 - PR：https://github.com/xy111a/open-xiaoai-next/pull/1（未合并，待 bai 看报告后定）。
 - **首跑结果（run 44084093818，2026-11-17 12:32 UTC）**：Go ✓（1m11s）、Rust ✓（1m46s）、Python（固件）✓（9s）、Semgrep ✓（20s）；**Python（kws-sidecar）✗（1m8s）**。两处批准的修复均生效（Go 的 `opusfile.pc` 缺失已解决；固件 job 的跳过路径已工作），但拆分暴露了此前被掩盖的第三个失败——边车 job 冷启动失败，见 A.5。
-- **重跑结果**：（click 修复提交后重跑，待填写；以 GitHub Actions 实跑为准。）
+- **最终结果（run 44086824940，2026-11-17 12:53 UTC，提交 2f52c8e）**：Go ✓（1m7s）、Rust ✓（1m43s）、Python（固件）✓（8s）、Python（kws-sidecar）✓（1m3s）、Semgrep ✓（28s）——**5 个 job 全绿**。中间三跑的曲折（边车缺 click → 缺 sentencepiece → Go 替身并发写 panic）见 A.5、A.6；每次失败的根因、修复与本地验证都已记在对应小节里。
 
 ### A.5 PR 首跑暴露的第三个 CI 失败：边车冷启动缺 `click`（已修）
 
@@ -672,7 +672,7 @@
 - **冷验证（第一次，走了 fallback 分支——事后发现不忠实）**：全新 venv（只装 requirements + requirements-dev + piper-tts）+ 空 `KWS_TEST_ASSETS=/tmp/cold-assets`：模型下载、11 个样本生成，`16 passed in 15.24s`。但复核发现：pytest 是用 venv 的 python 绝对路径跑的，venv 的 bin 不在 PATH 里，`command -v sherpa-onnx-cli` 找不到，`download-model.sh` 走了“写已验证 token 行”的 fallback 分支，text2token 根本没跑——所以这次验证没能发现下一个缺失的依赖。教训：冷验证必须把 venv 的 bin 放进 PATH（与 CI 一致），否则测的不是同一条分支。
 - **PR 第二跑（run 44085140541）**：Go ✓、Rust ✓、Python（固件）✓、Semgrep ✓；**Python（kws-sidecar）仍 ✗（35s）**——click 已修好（CLI 跑起来了），但 text2token 接下来又缺 `sentencepiece`（`sherpa_onnx/utils.py:41`，`ModuleNotFoundError: No module named 'sentencepiece'`）。根因同款：`text2token`（`--tokens-type ppinyin`）还要 `sentencepiece` 与 `pypinyin`（`utils.py` 里 `from pypinyin import pinyin`），三者都不在 sherpa-onnx 的声明依赖里；`download-model.sh` 的注释（L31-32）与报错提示（L89）其实写明了要装这三样，只是 requirements 里一个都没写。**修复**：requirements.txt 再加 `sentencepiece==0.2.3`、`pypinyin==0.55.0`。
 - **冷验证（第二次，text2token 实跑）**：同一全新 venv 补装 sentencepiece + pypinyin，`PATH` 加上 venv 的 bin（与 CI 一致，强制走 text2token 分支）+ 空 `KWS_TEST_ASSETS=/tmp/cold-assets2`：模型下载、text2token 生成 keywords.txt、11 个样本生成，`16 passed in 14.89s`。`download-model.sh` 有 `set -euo pipefail`，text2token 失败即脚本 exit 1、bootstrap 抛错，所以 16 passed 即证明 text2token 真跑通了。
-- **重跑结果**：（sentencepiece/pypinyin 修复提交后重跑，待填写；以 GitHub Actions 实跑为准。）
+- **重跑结果（run 44086824940，2026-11-17 12:53 UTC，提交 2f52c8e）**：Go ✓（1m7s）、Rust ✓（1m43s）、Python（固件）✓（8s）、Python（kws-sidecar）✓（1m3s）、Semgrep ✓（28s）——**5 个 job 全绿**。边车 job 这次是真跑通了 text2token 冷路径（58s→63s 量级，含模型下载 + 样本生成）。
 - **范围说明**：这是一处 CI 运行中发现的 CI/部署缺陷修复（让任务要求的“边车测试在 CI 里确实跑起来”成立），不是审计发现的代码修复；审计发现本身仍只报告、不修。
 
 ### A.6 PR 第三跑暴露的 Go 测试替身并发写 panic（已修，N-P2-1 的测试替身一半）
