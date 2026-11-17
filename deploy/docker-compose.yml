@@ -1,0 +1,150 @@
+# open-xiaoai-next NAS 部署（部署包，2026-11-17 修订）
+# 宿主：UGREEN DXP6800 Pro（UGOS + Docker），64GB 内存
+# 用法：cp .env.example .env，填好 NAS_IP / HASS_TOKEN / LLM 密钥 / OPEN_XIAOAI_TOKEN，
+# 再按 deploy/NAS_CHECKLIST.md 逐步操作，或跑 deploy/nas-install.sh。
+# 注意：本文件仍未在真 NAS 上跑过（关口 2 BLOCKED）。2026-11-17 修掉三个必死的错：
+#  1) hub 原来写 build: ../hub，但 hub/ 下没有 Dockerfile，up 会直接失败 →
+#     改为 deploy/Dockerfile.hub（装预编译二进制 deploy/hub-linux-amd64）；
+#  2) hub 启动强制要求环境变量 OPEN_XIAOAI_TOKEN（未设则直接退出，冒烟实测确认），
+#     compose 原来没传 → 已补上；
+#  3) netease-api 原来写 binarytorch/neteasecloudmusicapi，Docker Hub 查无此仓库（404）→
+#     改为官方镜像 binaryify/netease_cloud_music_api（Docker Hub 页面已验证）。
+# 第一次 up 出错（最可能是 UGOS Docker 路径、/volume1/music 不存在、端口占用）请把报错贴回来。
+
+services:
+  hub:
+    build:
+      context: .
+      dockerfile: Dockerfile.hub
+    container_name: oxn-hub
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - HASS_TOKEN=${HASS_TOKEN}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - OPEN_XIAOAI_TOKEN=${OPEN_XIAOAI_TOKEN}
+    volumes:
+      # P1-32：去掉 :ro——Hub 运行时要写 config.yaml（语音认领房间、Web 改配置），
+      # 只读挂载下 Save 必然失败。可写/种子配置分离是 P1-22/P1-23 的重构范围，不在此项。
+      - ../hub/config.yaml:/app/config.yaml
+      # P1-31：卷挂到 /app/hub-data——Hub 数据目录就是 ./hub-data（WORKDIR /app），
+      # 原来挂 /app/data 没人用，容器重建后提醒/记忆/TLS 证书全丢。
+      - hub-data:/app/hub-data
+    depends_on:
+      - whisper
+      - piper
+      - mosquitto
+      - kws-sidecar
+
+  # STT：faster-whisper，small-int8，中文；NAS i5-1235U 上 3 秒命令约 0.8–1.2 秒
+  whisper:
+    image: rhasspy/wyoming-whisper:latest
+    container_name: oxn-whisper
+    restart: unless-stopped
+    command: --model small-int8 --language zh --beam-size 1
+    ports:
+      - "10300:10300"
+    volumes:
+      - whisper-data:/data
+
+  # TTS：Piper，中文音色；流式合成
+  piper:
+    image: rhasspy/wyoming-piper:latest
+    container_name: oxn-piper
+    restart: unless-stopped
+    command: --voice zh_CN-huayan-medium
+    ports:
+      - "10200:10200"
+    volumes:
+      - piper-data:/data
+
+  # KWS 边车：服务端唤醒检测（sherpa-onnx WenetSpeech，“你好小李”）。
+  # 音箱只采音，Hub 解码 Opus 后把 16kHz PCM 发到 ws://127.0.0.1:10400/v1/kws。
+  # 寻址（2026-11-17 统一）：边车与 Hub 一样走 network_mode: host——Hub
+  # 本身就在 host 网络下，没有 compose 域名解析能力，写容器名 kws-sidecar
+  # 它解析不到；host 网络下双方都直接用 127.0.0.1:10400，不依赖端口
+  # 映射。边车只暴露一个端口、无需 mDNS/组播发现，host 形态与
+  # hub/snapserver/mpd 一致。不要改回 ports 映射 + 容器名，否则 Hub
+  # 启动时健康检查就会报“唤醒服务暂不可用”。
+  # 模型不 bake 进镜像：首次启动由 entrypoint 下载到 kws-data 卷，下载失败容器报错退出。
+  kws-sidecar:
+    build:
+      context: ../kws-sidecar
+      dockerfile: Dockerfile
+    container_name: oxn-kws-sidecar
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - KWS_HOST=0.0.0.0
+      - KWS_PORT=10400
+      - KWS_MODEL_DIR=/data/kws/models
+    volumes:
+      - kws-data:/data/kws/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:10400/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  # MQTT：设备注册表 + HA 发现
+  mosquitto:
+    image: eclipse-mosquitto:latest
+    container_name: oxn-mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - mosquitto-data:/mosquitto/data
+
+  # 多房间同步播放：Snapcast 服务端 + MPD（沿用已写的两房间包参数）
+  snapserver:
+    image: ivdata/snapserver:latest
+    container_name: oxn-snapserver
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./snapserver.conf:/etc/snapserver.conf:ro
+      - snapfifo:/tmp/snapfifo
+    depends_on:
+      - mpd
+
+  mpd:
+    image: vimagick/mpd:latest
+    container_name: oxn-mpd
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      # 音乐文件夹：默认 /volume1/music；Hub 启动时自动校验，不存在再问
+      - ${MUSIC_FOLDER:-/volume1/music}:/music:ro
+      - snapfifo:/tmp/snapfifo
+      - mpd-data:/var/lib/mpd
+
+  # 网易云：Music Assistant + NeteaseCloudMusicApi（官方镜像，见 README 镜像核实表）
+  music-assistant:
+    image: ghcr.io/music-assistant/server:latest
+    container_name: oxn-music-assistant
+    restart: unless-stopped
+    ports:
+      - "8095:8095"
+    volumes:
+      - ma-data:/data
+    environment:
+      - LOG_LEVEL=INFO
+
+  netease-api:
+    image: binaryify/netease_cloud_music_api:latest
+    container_name: oxn-netease-api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+
+volumes:
+  hub-data:
+  whisper-data:
+  piper-data:
+  kws-data:
+  mosquitto-data:
+  snapfifo:
+  mpd-data:
+  ma-data:

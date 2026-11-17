@@ -1,0 +1,93 @@
+# open-xiaoai-next Hub 配置（唯一配置文件）
+# 改这里不用改代码；Web 面板（Phase 4）就是读写这个文件。
+# 房间名由语音认领写入（“你好小李，我在客厅”），不用手填。
+
+# 服务端 KWS 边车（kws-sidecar）：唤醒词检测已移出音箱、放 NAS 端边车。
+# Hub 把每设备解码后的 PCM 流发给边车，边车命中唤醒词后回 wake 事件，
+# Hub 再走现有 250ms 仲裁 + 语音管线。
+# 寻址（2026-11-17 统一）：Hub 与边车都走 host 网络（见 deploy/docker-compose.yml），
+# Hub 没有 compose 域名解析能力，所以边车地址不用容器名 kws-sidecar，
+# 一律用 127.0.0.1:10400；边车只暴露这一个端口，不需要 mDNS/组播发现。
+# enabled=false（默认）时 Hub 不连边车，语音唤醒不可用；
+# enabled=true 时 url 与 keywords 必填，缺配或配错地址启动即报错。
+kws:
+  enabled: true
+  url: "ws://127.0.0.1:10400/v1/kws"
+  keywords:
+    - "你好小李"
+
+# 默认唤醒词。换词 = 换 KWS 模型文件 + 改这里，不用重刷机。
+wake_word: "你好小李"
+
+# 多唤醒词路由：唤醒词 → Agent 名
+wake_word_routes:
+  "你好小李": hermes
+  "你好龙虾": openclaw
+
+# 已发现的设备（Hub 启动时自动发现写入；手工改也行）
+# IP 由 mDNS/ARP 扫描得到；room 由语音认领写入，未认领为空。
+devices:
+  # 示例占位：第一次启动后由自动发现替换
+  livingroom-speaker:
+    model: lx06
+    ip: ""
+    room: ""
+  bedroom-speaker:
+    model: oh2p
+    ip: ""
+    room: ""
+
+# 音乐文件夹，默认 /volume1/music；启动时自动校验，不存在再问。
+music_folder: /volume1/music
+
+# Home Assistant：Token 走环境变量 HASS_TOKEN，不要写进文件。
+home_assistant:
+  url: "ws://192.168.1.10:8123"
+
+# Agent（OpenAI 兼容 /v1/chat/completions）。密钥走环境变量，不要写进文件。
+agents:
+  hermes:
+    base_url: "http://hermes:8642/v1"
+    model: "deepseek-chat"
+  openclaw:
+    base_url: "http://openclaw:18789/v1"
+    model: "deepseek-chat"
+
+# 网易云：Music Assistant + NeteaseCloudMusicApi
+netease:
+  music_assistant: "http://music-assistant:8095"
+  api: "http://netease-api:3000"
+
+# 家电实体别名表：语音只认这里配了的别名；门锁/燃气/热水器不配进来。
+ha_entities:
+  "客厅灯": "light.living_room"
+  "卧室灯": "light.bedroom"
+
+# Hub 自身参数
+hub:
+  listen: ":4399"
+  tls: true
+  data_dir: "./hub-data"
+  stt: "localhost:10300"
+  tts: "localhost:10200"
+  tts_voice: "zh_CN-huayan-medium"
+  snapcast: "localhost:1705"
+  # MPD 地址（P1-26）：网易云 URL 直播降级路径用；MPD 跑在 host 网络，填 localhost:6600。
+  mpd: "localhost:6600"
+  # 点歌成功后按此切 Snapcast（P1-26）：分组 ID 见 snapserver 的 Server.GetStatus，
+  # 为空表示不强制切流；流名见 deploy/snapserver.conf（NAS音乐）。
+  snapcast_group: ""
+  snapcast_stream: "NAS音乐"
+  # 延迟补偿（ms，P1-26）：key 为 Snapcast 客户端 ID 或显示名；两房间包起始值客厅 0 / 卧室 +15。
+  snapcast_latencies:
+    卧室: 15
+  # P0-1：Web 面板只绑回环地址，远程管理走 SSH 隧道（不要改回 ":8080"）。
+  web_listen: "127.0.0.1:8080"
+  # scan_cidr 为空时自动取本机网段；本地测试可写 "127.0.0.1/32"
+  scan_cidr: ""
+  # 自动发现默认关闭（P0-4）：只有显式写 scan_enabled: true 才在启动时扫一次；
+  # 还须配 discovery_fingerprints（设备证书 SHA-256 指纹白名单），否则不发 Token。
+  # scan_enabled: false
+  # discovery_fingerprints: []
+  # 勿扰时段（FR-10 主动播报跳过该时段）
+  do_not_disturb: "23:00-07:00"

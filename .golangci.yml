@@ -1,0 +1,27 @@
+# golangci-lint 配置（hub/ Go 部分）。
+# 自定义规则不在此文件里：golangci-lint 的自定义 linter 需要编译插件，
+# 本仓库改用 go vet 风格的检查脚本（见 scripts/），由 scripts/lint.sh
+# 与 .github/workflows/ci.yml 与 golangci-lint 一起跑：
+#   规则 1 接线覆盖：scripts/check-wiring.go
+#   规则 2 nil 守卫：scripts/check-nil-guards.go
+#   规则 3 上限/超时：scripts/check-bounds.go（Go 部分；Rust/Python 见 .semgrep/）
+run:
+  timeout: 5m
+  go: "1.23"
+  # 本配置只在 hub/ 下跑（golangci-lint run ./...），client/（Rust）与
+  # firmware-patch/（Python）不在 Go 检查范围，无需 skip-dirs。
+
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - gofmt
+    - goimports
+    - ineffassign
+    - unused
+    - errcheck
+
+issues:
+  # 每个问题只报一次，避免并行改动期的重复刷屏。
+  max-issues-per-linter: 0
+  max-same-issues: 0

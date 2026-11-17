@@ -1,0 +1,134 @@
+# deploy — NAS 部署
+
+UGREEN DXP6800 Pro（UGOS + Docker）上跑 Hub + Whisper + Piper + Snapcast + Music Assistant。
+
+## 启动
+
+```bash
+cd deploy
+cp .env.example .env   # 填 NAS_IP / HASS_TOKEN / LLM_API_KEY / OPEN_XIAOAI_TOKEN
+docker compose up -d
+docker compose logs -f hub
+```
+
+按顺序做的检查清单见 `NAS_CHECKLIST.md`；一键传文件 + 检查见 `nas-install.sh`
+（用法：`NAS_SSH=root@NAS_IP ./nas-install.sh up`，脚本本身只做过 `bash -n` 校验，
+NAS 上实际运行未验证）。
+
+## 服务
+
+| 服务 | 镜像 | 端口 | 说明 |
+|---|---|---|---|
+| hub | 本地构建（deploy/Dockerfile.hub + 预编译二进制 deploy/hub-linux-amd64） | host | 唯一常驻服务，管仲裁/语音/音乐/HA/OTA |
+| whisper | rhasspy/wyoming-whisper | 10300 | small-int8，中文，beam-size 1 |
+| piper | rhasspy/wyoming-piper | 10200 | zh_CN-huayan-medium，流式合成 |
+| mosquitto | eclipse-mosquitto | 1883 | 预留：设备注册表 + HA 发现（Hub 当前代码里没有 MQTT 引用，不影响运行） |
+| snapserver | ivdata/snapserver | host | 多房间同步播放服务端 |
+| mpd | vimagick/mpd | host | 读 /volume1/music，写 snapfifo |
+| music-assistant | ghcr.io/music-assistant/server | 8095 | 网易云 provider；官方要求 host 网络做 mDNS 发现，见下文已知问题 |
+| netease-api | binaryify/netease_cloud_music_api | 3000 | 网易云非官方 API，Cookie 约 1 个月过期需重登 |
+
+## 2026-11-17 部署包更新（G）
+
+- **Hub 二进制已编好**：`deploy/hub-linux-amd64`，11,534,848 字节，
+  SHA256 `f12c09e00098a00188fcdd8e18a171696ef1d5a82051c51d6aa122573734945b`，
+  `go build -o deploy/hub-linux-amd64 ./cmd/hub`（hub/ 下，Go 1.23.12）。
+  本机冒烟验证：`--help` 打印用法退出 0；设 `OPEN_XIAOAI_TOKEN` 后启动，
+  `curl :8080/api/status` 返回 `{"devices":2,"online":0,"rooms":null,"wake_word":"你好小李"}`，
+  `/api/devices` 返回配置里的两台占位设备；收信号后干净退出，未常驻。
+  未设 `OPEN_XIAOAI_TOKEN` 时 Hub 直接退出（日志 `环境变量 OPEN_XIAOAI_TOKEN 未设置`），
+  所以 compose 里补上了这个环境变量。`ldd` 实测二进制只依赖 libc/libm，
+  Opus 已静态编入，NAS 上不需要装 libopus。
+- **修掉三个必死的错**（否则 `docker compose up` 一定失败）：
+  1. hub 原来写 `build: ../hub`，但 hub/ 下没有 Dockerfile → 改为 `deploy/Dockerfile.hub`
+     （debian:bookworm-slim + ca-certificates，只装预编译二进制；config.yaml 不打进镜像，
+     运行时挂载）。
+  2. compose 原来没传 `OPEN_XIAOAI_TOKEN` → 已补上。
+  3. netease-api 原来写 `binarytorch/neteasecloudmusicapi`，Docker Hub 查无此仓库（404）→
+     改为官方镜像 `binaryify/netease_cloud_music_api`。
+- **镜像核实**（2026-11-17 逐个查 Docker Hub 页面 / 官方文档，见 `NAS_CHECKLIST.md` 末尾的表）：
+  存在：rhasspy/wyoming-whisper、rhasspy/wyoming-piper、eclipse-mosquitto（官方镜像，
+  latest = 2.1.2-alpine）、ivdata/snapserver、vimagick/mpd、ghcr.io/music-assistant/server、
+  binaryify/netease_cloud_music_api；不存在：binarytorch/neteasecloudmusicapi（404）。
+- **已知问题 / 未核实项**（NAS 上首次 `up` 时重点看）：
+  - Hub 跑在 host 网络下，`hub/config.yaml` 里 netease 的 `music-assistant:8095` /
+    `netease-api:3000` 这两个容器名解析不到；`nas-install.sh` 会在 NAS 副本上改成
+    `127.0.0.1:8095` / `127.0.0.1:3000`（本机 `hub/config.yaml` 不动）。
+    同理 `agents` 里的 `hermes:8642` / `openclaw:18789` 也解析不到，Hermes/OpenClaw
+    部署好之前 Hub 只会记连接失败日志，不阻塞启动。
+  - MA 官方要求 host 网络（mDNS/uPnP 发现播放器），本 compose 里 MA 是 bridge 网络 +
+    8095 映射。MA 连 Snapcast 靠手动填 `NAS_IP:1705` 应该能通；若 MA 里看不到播放器，
+    再把 MA 改成 `network_mode: host`。
+  - vimagick/mpd 镜像的默认配置是否把 `/music` 输出到 `/tmp/snapfifo/snapfifo` 未核实
+    （本机无 Docker，拉不了镜像看默认配置）。若 MPD 库为空或 snapserver 收不到流，
+    需要挂自定义 mpd.conf。
+  - `hub/config.yaml` 里 HA 地址 `ws://192.168.1.10:8123` 是占位，`nas-install.sh`
+    会按 `.env` 的 `NAS_IP` 改掉。
+
+## 网易云扫码登录（H，FR-05）
+
+只写流程，未登录过（关口 7 BLOCKED，需要 bai 的网易云账号扫码）。
+
+### 链路
+
+```
+语音点歌 → Hub → Music Assistant（:8095）→ NeteaseCloudMusicApi（:3000）→ 网易云
+```
+
+### 在哪一步扫码
+
+**在 Music Assistant 的界面里扫码**，不是直接扫 API 的二维码端点：
+
+1. 浏览器开 `http://NAS_IP:8095`（Music Assistant Web 界面）。
+2. 设置 → 音乐源 → 添加音乐源 → **NetEase Cloud Music**。
+3. **API base URL 填 `http://netease-api:3000`**（MA 和 netease-api 在同一个 compose
+   网络里，容器名能解析；不要填 `127.0.0.1:3000`，那是 MA 容器自己的回环）。
+4. 点 **QR Login**，会新开一个二维码页面。
+5. 手机打开**网易云音乐 App**扫这个二维码，App 内点确认登录。
+
+底层原理（不用手工操作，了解即可）：MA 点 QR Login 后，后台调 NeteaseCloudMusicApi
+的三步接口——`GET /login/qr/key` 取 unikey → `GET /login/qr/create` 生成二维码 →
+轮询 `GET /login/qr/check` 等结果（801 等待扫码 / 802 已扫码待确认 / 803 成功 /
+800 二维码过期）。二维码本身有有效期（约 2 分钟），过期（800）就点 QR Login 重新生成。
+API 也自带一个演示页 `public/qrlogin.html`，但本部署的标准路径是 MA 界面的 QR Login，
+不要绕过 MA 直接调 API 登录。
+
+### 扫码后登录态存在哪
+
+- 登录态是一串 Cookie，核心是 `MUSIC_U`，由 **Music Assistant 的 NetEase provider
+  保存**，随 MA 的数据一起持久化在 `ma-data` 卷（`/data`）里。
+- **NeteaseCloudMusicApi 容器本身不保存登录态**：它是无状态转发，重启容器不丢登录，
+  但 MA 的数据卷丢了就要重扫。
+- 验证登录态：`curl http://NAS_IP:3000/login/status`（需带 Cookie 时由 MA 代传；
+  最直观的验证是在 MA 界面里能看到网易云歌单/收藏，或直接搜歌能播）。
+
+### Cookie 过期与重登
+
+- Cookie 约 **1 个月过期**（`MUSIC_U` 约 30 天；PLAN.md / 旧文档写 1–2 个月，
+  按 30 天做保守估计）。过期表现：MA 里搜歌/播歌报 301 需要登录，或歌单突然变空。
+- 重登方法：MA 里重新点 QR Login 再扫一次，不用改任何配置、不重建容器。
+  也可以先调 `/login/refresh` 续期，但过期后只能重扫。
+
+### VIP 歌
+
+- **VIP 歌需要 VIP 账号**。MA 官方文档原话：这个源只播账号本身有权限的内容，
+  绕不过网易云的任何限制。非 VIP 账号只能播免费曲库，VIP 歌会播不了或只给试听片段。
+- 未登录时只能搜公开内容、播免费歌；登录后才能看到自己的歌单、收藏和日推。
+
+### 失败时先看什么
+
+| 现象 | 原因 / 做法 |
+|---|---|
+| MA 添加 NetEase 源时连不上 API | 先 `curl http://NAS_IP:3000/` 看 API 容器是否在跑；再确认 MA 里填的是 `http://netease-api:3000` |
+| QR Login 点了没出二维码 | 看 MA 日志和 `curl http://NAS_IP:3000/login/qr/key` 是否返回 unikey |
+| 扫码后 App 显示已确认，MA 还是未登录 | 二维码过期（800）或轮询被断，重新点 QR Login 生成新的再扫 |
+| 昨天还能播，今天报 301 | Cookie 过期，重扫（约 1 个月周期是正常的） |
+| 搜得到歌但播 VIP 歌失败 | 账号不是 VIP，或该歌无版权；换免费歌验证链路本身是否通 |
+
+## 诚实说明
+
+- 本部署包仍是**未在真机上跑过**（关口 2 BLOCKED）。第一次 `up` 出错最可能是：
+  UGOS Docker 路径、`/volume1/music` 不存在、端口占用——把报错贴回来再改。
+- Snapcast 参数沿用已写的两房间包（`speaker-snapcast-3room/`，同样未实测），
+  包括 fifo 必须是文件（`/tmp/snapfifo/snapfifo`）这个已修过的坑。
+- 网易云 VIP 歌需要 VIP 账号；非官方 API 可能失效，Cookie 过期要扫码重登。

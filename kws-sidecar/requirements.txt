@@ -1,0 +1,8 @@
+# KWS 边车运行时依赖。版本说明：
+# - sherpa-onnx==2.0.1：实验（~/workspace/.kws-exp）已验证的版本，
+#   合成语音“你好小李”正 5/5、负 5/5；不要擅自升级。
+# - websockets==17.4：本机实测版本（process_request 健康检查 API）。
+# - numpy 由 sherpa-onnx 带入；pin 住实测版本以防漂移。
+sherpa-onnx==2.0.1
+websockets==17.4
+numpy==2.5.5

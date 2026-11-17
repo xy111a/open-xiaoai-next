@@ -1,0 +1,67 @@
+[package]
+name = "open-xiaoai-client"
+version = "0.1.0"
+edition = "2021"
+description = "Thin client for LX06/OH2P speakers: capture, playback, local KWS, Opus, TLS"
+license = "MIT"
+
+# 目标：ARMv7 32-bit（Amlogic A113X），glibc 2.25 动态链接，跑在 OpenWrt 精简系统上
+# 交叉编译（默认交付，P1-40 方案 B）：cargo build --release --target armv7-unknown-linux-gnueabihf
+# 应急 fallback（musl 静态链接，不能 dlopen）：见 build-armv7.sh
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+futures-util = { version = "0.3", features = ["sink"] }
+# Opus 编解码：纯 Rust 实现（opus-rs，libopus 1.6 的 Rust 移植，无 C 依赖）。
+# 注意：任务书写的 `audopus` 在 crates.io 上不存在（索引查无此包，见 README），
+# 故用功能等价的纯 Rust crate `opus-rs` 替代；`audiopus`/`opus` 均链接系统
+# libopus，ARMv7 musl 交叉编译会卡住，不用。
+opus-rs = "0.1"
+# wss：rustls 0.23（与 tokio-tungstenite 0.26 同版本）+ ring 加密后端。
+# 注意：rustls 0.23 的默认特性含 aws_lc_rs（会拉入 aws-lc-sys 这个数百 MB 的
+# C 编译，既慢又堵死 ARM 交叉编译），必须 default-features = false，只开 ring。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# 指纹验证器用 webpki（ring 后端）直接验 TLS 签名；同样只开 ring，不碰 aws-lc。
+webpki = { version = "0.103", package = "rustls-webpki", features = ["ring"] }
+rustls-native-certs = "0.8"
+sha2 = "0.10"
+alsa = { version = "0.12.1", optional = true }
+libc = "0.2.191"
+libloading = { version = "0.9.1", optional = true }
+# ALSA 采集/播放（任务 E 已接线，见 audio.rs）：
+# `alsa` crate 链接系统 libasound（alsa-sys 经 pkg-config 找 alsa）。
+# 宿主机 x86_64 有 libasound2-dev，直接编；ARMv7 gnueabihf 交叉用音箱自带的
+# libasound.so.2（见 build-armv7-gnueabihf.sh：链接期 staging + 定向 .pc）；
+# musl 应急版则用本机自编的 musl libasound.a（见 build-armv7.sh 注释），
+# 否则 --no-default-features 关掉本特性编一个无 ALSA 的应急版）。
+
+[dev-dependencies]
+# 注意：tokio-rustls 默认特性含 aws_lc_rs（拉入 aws-lc-sys 大 C 编译），
+# 与主依赖一致，只开 ring。
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rcgen = "0.14"
+
+[profile.release]
+opt-level = "s"   # 体积优先：/data 分区小，固件总盘 40MB 上限
+lto = true
+strip = true
+
+[features]
+# 默认开 ALSA：宿主机 cargo test 跑真实 ALSA 代码路径（无硬件时返回明确错误）。
+# ARMv7 gnueabihf 交叉见 build-armv7-gnueabihf.sh：动态链接音箱自带的 libasound.so.2；
+# musl 应急版见 build-armv7.sh：有 musl libasound 时同样开，无时 --no-default-features。
+default = ["alsa"]
+alsa = ["dep:alsa"]
+# sherpa-kws：sherpa-onnx C API 动态加载（libloading），跑 WenetSpeech
+# kws-zipformer 检“你好小李”。默认不开：不开时 client 不依赖任何模型/.so，
+# 照常编译运行；开了也只是运行时 dlopen，ARM 交叉链接不受影响。
+# 见 src/sherpa.rs 与 kws/README.md。
+sherpa-kws = ["dep:libloading"]
+libloading = ["dep:libloading"]

@@ -1,0 +1,111 @@
+# open-xiaoai-next CI：每个 PR 都跑。
+#
+# 覆盖：go test + cargo test + pytest + golangci-lint + semgrep
+#   + 规则 1/2/3 的 go vet 风格检查脚本（scripts/check-*.go）。
+# 注意：本仓库不在 git 远端做 main 分支保护的前提下写成；PR 触发、
+# push 到 main 也跑一次，便于直接推 main 的改动同样被检查。
+# 本文件在 VM 上只做过 YAML 语法检查，未在 GitHub Actions 上实跑过
+# （apt 包名、Action 版本以实跑为准微调）。
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go（test + vet + golangci-lint + 规则 1/2/3）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      # hub/internal/opus 用 cgo 链 libopus。
+      - name: 安装 libopus
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev pkg-config
+      - name: go vet
+        working-directory: hub
+        run: go vet ./...
+      - name: go test
+        working-directory: hub
+        run: go test -count=1 ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64.8
+          working-directory: hub
+          # .golangci.yml 在仓库根，golangci-lint 会向上查找。
+      - name: 规则 1/2/3 检查脚本
+        run: |
+          go run scripts/check-wiring.go --hub hub
+          go run scripts/check-nil-guards.go --hub hub
+          go run scripts/check-bounds.go --hub hub
+
+  rust:
+    name: Rust（test + fmt + clippy）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # client 链 ALSA（alsa-sys）与 Opus。
+      - name: 安装系统依赖
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libopus-dev pkg-config
+      - name: cargo test
+        working-directory: client
+        run: cargo test --locked
+      - name: cargo fmt --check
+        working-directory: client
+        run: cargo fmt --check
+      - name: cargo clippy
+        working-directory: client
+        run: cargo clippy --all-targets
+
+  python:
+    name: Python（pytest）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pytest
+        working-directory: firmware-patch
+        run: |
+          python -m pip install --quiet pytest
+          python -m pytest tests/ -q
+      # kws-sidecar 测试自给自足：CI 里没有 ~/workspace/.kws-exp，
+      # tests/bootstrap.py 会下载模型（scripts/download-model.sh，
+      # SHA256 已 pin）、下载 Piper 语音并生成样本；piper 与 ffmpeg
+      # 是生成样本的工具依赖（见 tests/bootstrap.py）。
+      - name: pytest（kws-sidecar）
+        working-directory: kws-sidecar
+        env:
+          KWS_TEST_ASSETS: /tmp/kws-test-assets
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          python -m pip install --quiet -r requirements.txt -r requirements-dev.txt piper-tts
+          python -m pytest tests/ -q
+
+  semgrep:
+    name: Semgrep（规则 3 Rust/Python / 4 / 5）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装 semgrep
+        run: python -m pip install --quiet 'semgrep==1.185.0'
+      - name: semgrep
+        run: |
+          semgrep --config .semgrep/rules.yml --error \
+            --exclude '*_test.go' --exclude '*/tests/*' --exclude 'test_*.py' \
+            hub client/src firmware-patch/scripts

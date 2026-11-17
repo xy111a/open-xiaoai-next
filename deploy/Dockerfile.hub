@@ -1,0 +1,22 @@
+# open-xiaoai-next Hub 镜像：只装预编译二进制，不在 NAS 上编译 Go。
+#
+# 构建上下文 = deploy/（docker-compose.yml 的 hub 服务指定 context: .）。
+# 二进制由部署代理在本机编好：hub/ 下 `go build -o deploy/hub-linux-amd64 ./cmd/hub`。
+# config.yaml 不打进镜像，运行时由 docker-compose.yml 挂载 ../hub/config.yaml
+#（可写挂载，P1-32：Hub 运行时要写它——语音认领房间、Web 改配置都要落盘，
+# 故不加 :ro；只读挂载下 Save 必然失败）。
+# 运行时依赖：二进制为动态链接 glibc（ldd 实测只依赖 libc/libm，Opus 已静态编入），
+# 不需要 libopus；但 LLM 走 HTTPS，需要 ca-certificates。
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY hub-linux-amd64 /usr/local/bin/hub
+RUN chmod +x /usr/local/bin/hub
+
+WORKDIR /app
+EXPOSE 4399 8080
+ENTRYPOINT ["/usr/local/bin/hub"]
+CMD ["-config", "/app/config.yaml"]

@@ -1,0 +1,46 @@
+# 构建产物
+/target/
+hub/hub
+client/target/
+*.o
+*.a
+
+# Go
+hub/*.test
+
+# 固件与大文件（OTA 包不进仓库，脚本现下）
+*.bin
+*.squashfs
+*.img
+firmware-patch/work/
+firmware-patch/.pytest-tmp/
+# 参考包可由 client/scripts/download-kws-reference.sh 重新下载
+client/kws/vendor-arm/reference-kws.tar.gz
+
+# 构建产物（补充）
+deploy/hub-linux-amd64
+hub/hub-data/
+**/.pytest_cache/
+**/__pycache__/
+
+# KWS 边车：本地 venv 与下载的模型不进仓库
+kws-sidecar/.venv/
+kws-sidecar/kws-models/
+kws-sidecar/__pycache__/
+kws-sidecar/tests/__pycache__/
+
+# 运行期
+*.log
+*.pid
+deploy/data/
+.env
+!.env.example
+
+# 编辑器与系统文件
+.DS_Store
+.idea/
+.vscode/
+*~
+
+# gnueabihf 链接期 staging（build-armv7-gnueabihf.sh 每次运行自 rootfs 重建，不进仓库）
+client/.link-gnueabihf/

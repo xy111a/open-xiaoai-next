@@ -1,0 +1,187 @@
+# open-xiaoai-next 自定义 Semgrep 规则（lint 规则 3/4/5 的 Semgrep 部分）
+#
+# 规则 2（STT/TTS/MPD nil 守卫）与规则 3 的 Go 部分（上限校验、超时）
+# 由 scripts/check-nil-guards.go 与 scripts/check-bounds.go 实现——
+# 它们能识别“同一函数内已有上限比较/守卫”的修复后代码，而纯 Semgrep
+# 模式做不到（Semgrep 看不到兄弟语句里的校验，会把已修复代码也报出来）。
+# Semgrep 在此只负责：规则 3 的 Rust/Python 对应模式与 Go 的
+# `int(x.(float64))` 精确坏形状、规则 4、规则 5。
+#
+# 运行：scripts/lint.sh（或 semgrep --config .semgrep/rules.yml
+#   --error --exclude '*_test.go' --exclude '*/tests/*'
+#   --exclude 'test_*.py' hub client firmware-patch/scripts）
+# 扫描范围：只扫 go/rust/python 源码；测试文件与文档除外。
+#   - Rust 的 #[cfg(test)] 内联测试在源码文件内，规则 4 的比较式豁免
+#     （pattern-not-inside）覆盖了 `== "CHANGE_ME"` 这类校验写法。
+#   - hub/config.yaml 的 http:// 内网服务地址不在本规则扫描范围：
+#     内网 http 与 https/内网可信网络是 AUDIT P1-6 认可的两种选法，
+#     由 config.Validate() 的白名单负责，不由字面量规则判。
+# 误报处理：确属有意的例外（如回环 http），在该行加
+#   `# nosemgrep: <规则 id>`（Go/Rust 用 // nosemgrep），并在注释里写清理由；
+#   不要整文件屏蔽。
+rules:
+  # ---------------- 规则 3：外部长度设上限、网络读带超时 ----------------
+  - id: open-xiaoai-r3-go-unchecked-assert
+    languages: [go]
+    severity: ERROR
+    message: >
+      未校验的类型断言 int(x.(float64))：payload_length 不是数字时直接 panic。
+      请用 v, ok := x.(float64) 的 comma-ok 形式，并校验 v 为非负整数且 <= 上限
+      （如音频 chunk <= 1MB）。见 AUDIT P1-1。
+    patterns:
+      - pattern: int($V.(float64))
+    metadata:
+      rule: "3"
+      audit: P1-1
+
+  # 注意：本规则只有 Vec::with_capacity 分支。vec![x; n] 未覆盖：
+  # 实测 semgrep 1.185.0 的 Rust 宏模式无法可靠表达它——vec![$X; $N]
+  # 会误报普通的 vec![x]、却漏掉真正的 vec![0u8; n]，vec![$X] 则什么
+  # 都匹配不到；用 pattern $X + pattern-regex 兜底又会在每个外层表达式
+  # 上重复报。仓库现状无变量长度的 vec![x; n]（只有 MAX_PACKET_BYTES /
+  # FRAME_SAMPLES 等常量长度），先不覆盖；如后续出现，须换 clippy
+  # 自定义 lint 或等 semgrep 修复宏匹配后再补。
+  - id: open-xiaoai-r3-rust-unbounded-vec
+    languages: [rust]
+    severity: ERROR
+    message: >
+      以外部长度建 Vec 未设上限：Vec::with_capacity(n) 里 n 来自
+      外部时可致 OOM。请先校验 n <= 上限，或改用固定上限 + 截断。见 AUDIT P1-1。
+    patterns:
+      - pattern: Vec::with_capacity($N)
+      - metavariable-pattern:
+          metavariable: $N
+          patterns:
+            - pattern-not-regex: ^\d+$
+            - pattern-not-regex: ^[A-Z][A-Z0-9_]*$
+            - pattern-not-regex: \.len\(\)
+    metadata:
+      rule: "3"
+      audit: P1-1
+
+  - id: open-xiaoai-r3-py-unbounded-read
+    languages: [python]
+    severity: ERROR
+    message: >
+      以外部长度读数据未设上限：.read(n) 里 n 来自外部（如响应头）时可致 OOM。
+      请先校验 n <= 上限，或改用限长读取。见 AUDIT P1-1。
+    patterns:
+      - pattern: $R.read($N)
+      - metavariable-pattern:
+          metavariable: $N
+          patterns:
+            - pattern-not-regex: ^\d+$
+            - pattern-not-regex: ^[A-Z][A-Z0-9_]*$
+            - pattern-not-regex: len\(
+    metadata:
+      rule: "3"
+      audit: P1-1
+
+  # ---------------- 规则 4：Token/密码禁默认值 ----------------
+  # 只匹配“作默认值使用”的位置（赋值、结构体/映射值、return、.to_string()），
+  # 不匹配裸字面量本身——否则拒绝弱值的黑名单（如 transport.go 的 weakTokens
+  # 映射键）与 `== "CHANGE_ME"` 这类校验比较也会被误报。
+  - id: open-xiaoai-r4-weak-default-secret
+    languages: [go, rust, python]
+    severity: ERROR
+    message: >
+      弱默认值/公开默认口令：Token 与 SSH 密码不许写死 CHANGE_ME / open-xiaoai /
+      123456 等公开值，未设必须启动即失败（不要 fallback 到默认值）。
+      见 AUDIT P0-2、P0-3。
+    patterns:
+      - pattern-either:
+          - pattern: $X = "CHANGE_ME"
+          - pattern: $X = "open-xiaoai"
+          - pattern: $X = "123456"
+          - pattern: '$X: "CHANGE_ME"'
+          - pattern: '$X: "open-xiaoai"'
+          - pattern: '$X: "123456"'
+          - pattern: return "CHANGE_ME"
+          - pattern: return "open-xiaoai"
+          - pattern: return "123456"
+          - pattern: '"CHANGE_ME".to_string()'
+          - pattern: '"open-xiaoai".to_string()'
+          - pattern: DEFAULT_PASSWORD = $V
+    metadata:
+      rule: "4"
+      audit: P0-2, P0-3
+
+  - id: open-xiaoai-r4-env-fallback-default
+    languages: [python]
+    severity: ERROR
+    message: >
+      敏感环境变量未设即用默认值：SSH_PASSWORD / Token 类变量未设时必须报错退出，
+      不能 os.environ.get(..., <默认值>)。见 AUDIT P0-2。
+    patterns:
+      - pattern: os.environ.get($KEY, $DEFAULT)
+      - metavariable-regex:
+          metavariable: $KEY
+          # 注意：metavariable-regex 要求整段匹配（不是子串查找），
+          # 所以前后要加 .*；$KEY 的内容含引号，如 "SSH_PASSWORD"。
+          regex: .*(SSH_PASSWORD|OPEN_XIAOAI_TOKEN|HASS_TOKEN|LLM_API_KEY|MA_TOKEN).*
+      - metavariable-pattern:
+          metavariable: $DEFAULT
+          patterns:
+            - pattern-not-regex: ^""$
+            - pattern-not-regex: ^''$
+    metadata:
+      rule: "4"
+      audit: P0-2
+
+  # ---------------- 规则 5：Web/OTA 只允许 https + 白名单 host ----------------
+  # 注意：不要写成 pattern: '"http://..."'——实测 semgrep 1.185.0 里
+  # 字符串内的 .../$X 通配符不生效。改用“赋值/键值 + 正则”的写法：
+  # 只扫被赋给变量/字段的字符串字面量（日志里的拼接串不算）。
+  - id: open-xiaoai-r5-http-literal
+    languages: [go, rust, python]
+    severity: ERROR
+    message: >
+      明文 http:// 字面量：对外取数（尤其 OTA）只允许 https，且 host 须在白名单内。
+      内网回环等确属有意的例外请加 // nosemgrep: open-xiaoai-r5-http-literal
+      并注明理由。见 AUDIT P0-1、P0-5、P1-6。
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: $X = $S
+              - metavariable-regex:
+                  metavariable: $S
+                  regex: (?s).*"http://.*
+          - patterns:
+              - pattern: '$X: $S'
+              - metavariable-regex:
+                  metavariable: $S
+                  regex: (?s).*"http://.*
+    metadata:
+      rule: "5"
+      audit: P0-5
+
+  - id: open-xiaoai-r5-urlfetch-no-allowlist
+    languages: [python]
+    severity: ERROR
+    message: >
+      urlopen/urlretrieve 未经白名单校验：服务端返回的 link 可指向任意 scheme/host，
+      须先校验 scheme 为 https 且 host 在 allowlist 内再下载（urlretrieve 本身
+      无超时，须改带超时的流式下载；先下 .tmp，校验通过再 rename）。见 AUDIT P0-5。
+      白名单校验辅助函数内的直接调用请加 # nosemgrep: open-xiaoai-r5-urlfetch-no-allowlist
+      并注明白名单。
+    patterns:
+      - pattern-either:
+          - pattern: urllib.request.urlopen(...)
+          - pattern: urllib.request.urlretrieve(...)
+    metadata:
+      rule: "5"
+      audit: P0-5
+
+  - id: open-xiaoai-r5-go-direct-http
+    languages: [go]
+    severity: ERROR
+    message: >
+      http.Get/Post 直接取数不带白名单校验：请用带 allowlist 校验（scheme https +
+      host 白名单）的客户端调用。见 AUDIT P0-5、P1-6。
+    patterns:
+      - pattern-either:
+          - pattern: http.Get(...)
+          - pattern: http.Post(...)
+    metadata:
+      rule: "5"
+      audit: P0-5
