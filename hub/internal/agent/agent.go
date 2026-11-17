@@ -45,7 +45,19 @@ type streamChunk struct {
 	} `json:"choices"`
 }
 
-// Client 是一个 Agent 端点。
+// maxUpstreamErrorBody 是拼进错误的上游响应体上限（P1-6）：
+// 旧代码把上游响应全文拼进错误（日志里可能含密钥/长文本），现只留摘要。
+const maxUpstreamErrorBody = 512
+
+// truncateErrorBody 截断上游错误摘要。
+func truncateErrorBody(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > n {
+		return s[:n] + "…（已截断）"
+	}
+	return s
+}
+
 type Client struct {
 	BaseURL string
 	Model   string
@@ -83,8 +95,8 @@ func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("agent %s 返回 %d: %s", c.BaseURL, resp.StatusCode, strings.TrimSpace(string(b)))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBody+1))
+		return "", fmt.Errorf("agent %s 返回 %d: %s", c.BaseURL, resp.StatusCode, truncateErrorBody(string(b), maxUpstreamErrorBody))
 	}
 	var out chatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -121,8 +133,8 @@ func (c *Client) ChatStream(ctx context.Context, messages []Message, onDelta fun
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("agent %s 返回 %d: %s", c.BaseURL, resp.StatusCode, strings.TrimSpace(string(b)))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBody+1))
+		return "", fmt.Errorf("agent %s 返回 %d: %s", c.BaseURL, resp.StatusCode, truncateErrorBody(string(b), maxUpstreamErrorBody))
 	}
 	var full strings.Builder
 	sc := bufio.NewScanner(resp.Body)

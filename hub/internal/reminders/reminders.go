@@ -7,6 +7,7 @@ package reminders
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -26,7 +27,19 @@ const (
 	KindDaily Kind = "daily"
 	// KindInterval 每隔 N 分钟提醒。
 	KindInterval Kind = "interval"
+	// KindAction 定时动作（P1-41）：“2 小时后关灯”——触发时执行一次命令
+	// 而不是播报，触发后删除，与 KindOnce 同调度语义。
+	KindAction Kind = "action"
 )
+
+// validKind 是合法 Kind 白名单（P1-24：Add/Load 拒绝未知 Kind）。
+func validKind(k Kind) bool {
+	switch k {
+	case KindOnce, KindDaily, KindInterval, KindAction:
+		return true
+	}
+	return false
+}
 
 // Reminder 是一条提醒。
 type Reminder struct {
@@ -84,6 +97,11 @@ func (s *Store) Load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, it := range items {
+		// P1-24：磁盘里未知 Kind 的提醒直接丢弃并记日志，不再进表。
+		if !validKind(it.Kind) {
+			log.Printf("reminders: 丢弃未知类型提醒 %s（kind=%q）", it.ID, it.Kind)
+			continue
+		}
 		s.items[it.ID] = it
 	}
 	return nil
@@ -111,6 +129,10 @@ func (s *Store) saveLocked() error {
 // Add 新增一条提醒，返回 ID。Next 由调用方算好传入。
 // ID 用纳秒时间戳 + 进程内自增序号：同一毫秒内连加两条也不能撞 ID。
 func (s *Store) Add(r Reminder) (string, error) {
+	// P1-24：未知 Kind 拒绝入库，不再靠 tick 的无 default 分支兜底。
+	if !validKind(r.Kind) {
+		return "", fmt.Errorf("未知提醒类型 %q", r.Kind)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if r.ID == "" {
@@ -210,7 +232,8 @@ func (s *Store) tick(now time.Time) {
 		due = append(due, &cp)
 		// 算下一次。
 		switch it.Kind {
-		case KindOnce:
+		case KindOnce, KindAction:
+			// KindAction 与 KindOnce 同语义：触发一次后删除。
 			delete(s.items, it.ID)
 		case KindDaily:
 			next, err := NextDaily(it.At, now)
@@ -225,6 +248,11 @@ func (s *Store) tick(now time.Time) {
 			} else {
 				delete(s.items, it.ID)
 			}
+		default:
+			// P1-24：未知 Kind（旧数据/手写文件）删除并记日志——
+			// 否则 Next 恒 ≤ now，每秒触发一次 onFire 永不停。
+			log.Printf("reminders: 删除未知类型提醒 %s（kind=%q）", it.ID, it.Kind)
+			delete(s.items, it.ID)
 		}
 	}
 	_ = s.saveLocked()

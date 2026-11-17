@@ -42,7 +42,7 @@ patch.sh lx06 1.94.13          # 补丁 + 重新打包 → work/lx06_1.94.13/roo
 | 补丁 | 改动 |
 |---|---|
 | SSH | `etc/init.d/dropbear`：去掉 `enable=0` 返回、蓝牙模式不启动、`/data/ssh_en` 门控；启动时 `mkdir -p /data/etc/dropbear`，缺 host key 则 keygen |
-| 登录 | `etc/shadow` root 密码换 sha512crypt（`$6$`，随机盐）；`etc/inittab` 的 ttyS0 改 `/bin/ash --login`；`etc/pam.d/common-auth` 注释 `libmico-pam.so`、启用 `pam_unix.so` |
+| 登录 | `etc/shadow` root 密码换 sha512crypt（`$6$`，随机盐）；`etc/inittab` 的 ttyS0 仍走 `/bin/login`（需 root 密码，P1-36：原先免密 ash 已去掉）；`etc/pam.d/common-auth` 注释 `libmico-pam.so`、启用 `pam_unix.so` |
 | 禁 OTA | `bin/ota` 的 `download_upgrade()`/`upgrade()` 开头 `return 1`；`bin/flash.sh` 的 `upgrade_param_check()` 开头 `return 1`；`etc/init.d/wireless` 的 `ota()` 开头 `echo download_fail` + `exit 3` |
 | 启动 | `etc/rc.local` 增加 `[ -f "/data/init.sh" ] && sh /data/init.sh >/dev/null 2>&1 &` |
 | asound（LX06/OH2P） | `etc/asound.conf` 与 `etc/asound.conf.dts`：`pcm.mico_record`/`pcm.noop` 改走 `Capture`（dsnoop，hw:0,3，48kHz，S32_LE，8ch，period 384，buffer 6144）；`defaults.pcm.rate_converter "speexrate_medium"`（已有则不重复加） |

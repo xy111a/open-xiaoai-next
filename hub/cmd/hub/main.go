@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
@@ -12,7 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -22,7 +23,6 @@ import (
 	"github.com/huajun/open-xiaoai-next/hub/internal/alerts"
 	"github.com/huajun/open-xiaoai-next/hub/internal/arbitration"
 	"github.com/huajun/open-xiaoai-next/hub/internal/config"
-	"github.com/huajun/open-xiaoai-next/hub/internal/discovery"
 	"github.com/huajun/open-xiaoai-next/hub/internal/ha"
 	"github.com/huajun/open-xiaoai-next/hub/internal/intercom"
 	"github.com/huajun/open-xiaoai-next/hub/internal/kws"
@@ -43,10 +43,12 @@ import (
 type hubHandler struct {
 	cfg       *config.Config
 	cfgPath   string
+	cfgMu     *sync.Mutex // 与 web.Server.CfgLock 共享的配置锁（P1-22）
 	reg       *registry.Registry
 	server    *transport.Server
 	arbiter   *arbitration.Arbiter
 	pipeline  *voice.Pipeline
+	router    *router.Router // P1-38：OnWake 在此记唤醒词；nil 时跳过（测试用）
 	decoders  map[string]*opus.Decoder
 	decMu     sync.Mutex
 	intercom  *intercom.Manager
@@ -55,11 +57,81 @@ type hubHandler struct {
 	kws       *kws.Client // 服务端 KWS 边车客户端；nil 表示 KWS 未启用
 
 	// 连续对话会话：deviceID → 截止时间（唤醒后 20s 内不用再喊唤醒词）。
-	sessions  map[string]time.Time
-	sessMu    sync.Mutex
-	playing   map[string]bool // 正在放 TTS 的设备（打断用）
-	playMu    sync.Mutex
-	speakText func(deviceID, text string) // TTS 播报（提醒/主动播报用）
+	sessions map[string]time.Time
+	sessMu   sync.Mutex
+	// playing 是正在放 TTS 的设备（打断用）；playGen 是每设备的播报
+	// 代际计数（P1-16：旧播放的定时清除不得清除新播放）。
+	playing map[string]bool
+	playGen map[string]uint64
+	playMu  sync.Mutex
+	// playLocks 是每设备的播报串行锁（N-P1-3）：speakText 与 onReply
+	// 走同一把锁，Opus 帧不再交错。
+	playLocks   map[string]*sync.Mutex
+	playLocksMu sync.Mutex
+	speakText   func(deviceID, text string) // TTS 播报（提醒/主动播报用）
+}
+
+// playLock 取某设备的播报串行锁（不存在即新建）。
+func (h *hubHandler) playLock(deviceID string) *sync.Mutex {
+	h.playLocksMu.Lock()
+	defer h.playLocksMu.Unlock()
+	if h.playLocks == nil {
+		h.playLocks = map[string]*sync.Mutex{}
+	}
+	if mu, ok := h.playLocks[deviceID]; ok {
+		return mu
+	}
+	mu := &sync.Mutex{}
+	h.playLocks[deviceID] = mu
+	return mu
+}
+
+// playFrames 统一播放协议（P1-16）：start_play → 帧 → stop_play，
+// 按帧数×20ms 估算时长维护 playing；空帧列表不发 start_play；
+// 同设备播报经 playLock 串行化（N-P1-3）。
+func (h *hubHandler) playFrames(deviceID string, frames [][]byte) {
+	if len(frames) == 0 {
+		return
+	}
+	mu := h.playLock(deviceID)
+	mu.Lock()
+	defer mu.Unlock()
+	c, ok := h.server.Conn(deviceID)
+	if !ok {
+		return
+	}
+	h.playMu.Lock()
+	if h.playGen == nil {
+		h.playGen = map[string]uint64{}
+	}
+	h.playGen[deviceID]++
+	gen := h.playGen[deviceID]
+	h.playing[deviceID] = true
+	h.playMu.Unlock()
+	clearPlaying := func() {
+		h.playMu.Lock()
+		if h.playGen[deviceID] == gen {
+			delete(h.playing, deviceID)
+		}
+		h.playMu.Unlock()
+	}
+	// 按音频时长定时清除 playing（只清本代）。
+	dur := time.Duration(len(frames)) * 20 * time.Millisecond
+	time.AfterFunc(dur, clearPlaying)
+	if err := c.SendRPC("play-"+time.Now().Format("150405.000"), "start_play", nil); err != nil {
+		log.Printf("播报 %s：start_play 失败（帧未发）: %v", deviceID, err)
+		clearPlaying()
+		return
+	}
+	for _, f := range frames {
+		if err := c.SendBinary(f); err != nil {
+			log.Printf("播报 %s：发帧失败（%v），停止本次播报", deviceID, err)
+			break
+		}
+	}
+	if err := c.SendRPC("stop-"+time.Now().Format("150405.000"), "stop_play", nil); err != nil {
+		log.Printf("播报 %s：stop_play 失败: %v", deviceID, err)
+	}
 }
 
 func (h *hubHandler) decoderFor(deviceID string) (*opus.Decoder, error) {
@@ -89,10 +161,25 @@ func (h *hubHandler) OnWake(deviceID string, w transport.Wake) {
 		h.playing[deviceID] = false
 		h.playMu.Unlock()
 	}
+	// P1-38：记下本次唤醒词，供 Router 按唤醒词选 Agent。
+	if h.router != nil {
+		h.router.SetWakeWord(deviceID, w.WakeWord)
+	}
 	h.arbiter.Submit(arbitration.WakeEvent{
 		DeviceID: deviceID, WakeWord: w.WakeWord, RMSdB: w.RMSdB,
-		Timestamp: time.Now(),
+		// P1-13：仲裁用事件自带时间戳（边车/客户端上报的 TsMs），
+		// 为零时才补 Hub 收到时间；不再一律 time.Now() 覆盖。
+		Timestamp: wakeTimestamp(w),
 	})
+}
+
+// wakeTimestamp 取唤醒事件时间戳：TsMs > 0 时用它（毫秒时间戳），
+// 否则用 Hub 收到时间。
+func wakeTimestamp(w transport.Wake) time.Time {
+	if w.TsMs > 0 {
+		return time.UnixMilli(w.TsMs)
+	}
+	return time.Now()
 }
 
 func (h *hubHandler) OnAudioStart(deviceID string) {}
@@ -106,20 +193,25 @@ func (h *hubHandler) OnAudioFrame(deviceID string, data []byte) {
 		}
 	}()
 	// 对讲会话中：音频直接转发，不进语音管线与 KWS。
-	if to, isBroadcast, err := h.intercom.Forward(deviceID, data); err == nil {
-		if to != "" || isBroadcast {
-			if isBroadcast {
-				for _, d := range h.reg.Online() {
-					if d.ID == deviceID {
-						continue
-					}
-					if c, ok := h.server.Conn(d.ID); ok {
-						_ = c.SendBinary(data)
-					}
+	// P1-17：Forward 出错（目标掉线等）即记日志并 return，
+	// 不再继续走语音管线（否则对讲断线后对方的话会被当成对本机的命令）。
+	to, isBroadcast, err := h.intercom.Forward(deviceID, data)
+	if err != nil {
+		log.Printf("对讲转发失败（%s）: %v", deviceID, err)
+		return
+	}
+	if to != "" || isBroadcast {
+		if isBroadcast {
+			for _, d := range h.reg.Online() {
+				if d.ID == deviceID {
+					continue
+				}
+				if c, ok := h.server.Conn(d.ID); ok {
+					_ = c.SendBinary(data)
 				}
 			}
-			return
 		}
+		return
 	}
 	// KWS 全量转发（唤醒检测需要连续音频），语音管线只处理仲裁赢了 /
 	// 会话期内的音频。KWS 未启用且不在会话期时直接返回（与旧行为一致，
@@ -211,6 +303,12 @@ func (h *hubHandler) OnRoomClaim(deviceID string, room string) {
 	}
 	// 写回 config.yaml 持久化。P1-32：Save 失败必须记日志，不许吞掉
 	//（只读挂载下房间认领重启后会丢失，操作员要能从日志看到）。
+	// P1-22：与 Web PUT 共用 cfgMu（P1-23 的唯一临时文件只防写坏，
+	// 不防两边同时写丢字段），持锁期间写配置 + 落盘。
+	if h.cfgMu != nil {
+		h.cfgMu.Lock()
+		defer h.cfgMu.Unlock()
+	}
 	h.cfg.Devices[deviceID] = config.Device{
 		Model: mustModel(h.reg, deviceID), IP: mustIP(h.reg, deviceID), Room: room,
 	}
@@ -252,7 +350,25 @@ func (h *hubHandler) OnDisconnect(deviceID string) {
 	h.sessMu.Lock()
 	delete(h.sessions, deviceID)
 	h.sessMu.Unlock()
-	h.intercom.End(deviceID)
+	// P1-15：双向结束对讲（只 End(from) 会漏掉“对端发起、本设备是
+	// 目标方”的会话，断线后对方的帧还会往已死的连接发）。
+	h.intercom.EndFor(deviceID)
+	// P1-28：断线清 Pipeline 残留 utterance 与 decoder，
+	// 半句话不再残留，下次重连不被旧音频污染。
+	if h.pipeline != nil {
+		h.pipeline.Discard(deviceID)
+	}
+	h.decMu.Lock()
+	delete(h.decoders, deviceID)
+	h.decMu.Unlock()
+	// P1-9：断线即视为设备重启（OTA 推送后设备重启重连走此路）：
+	// 有 pushing 任务时转 verifying，30s 内等不到新版本 hello 即失败。
+	if h.otaMgr != nil {
+		h.otaMgr.MarkRebooted(deviceID)
+	}
+	h.playMu.Lock()
+	delete(h.playing, deviceID)
+	h.playMu.Unlock()
 	// 单设备断开即清理其 KWS 流状态（不断流的连接与队列不残留）。
 	if h.kws != nil {
 		h.kws.RemoveDevice(deviceID)
@@ -291,6 +407,10 @@ func main() {
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("config 无效: %v", err)
 	}
+	// P1-45：启动检查 music_folder 必须存在且为目录（Web PUT 不做此检查）。
+	if err := cfg.ValidateStartup(); err != nil {
+		log.Fatalf("config 启动检查失败: %v", err)
+	}
 	token := config.Token()
 	// P0-3：启动时拒绝弱 Token（空 / <16 位 / CHANGE_ME 等常见弱值），
 	// 失败即 Fatal，错误里给出生成命令（openssl rand -hex 16）。
@@ -306,6 +426,12 @@ func main() {
 
 	reg := registry.New()
 	for id, d := range cfg.Devices {
+		// P1-45：种子设备空 IP 不报错（出厂 config.yaml 本身含空 IP
+		// 占位），这里跳过并记日志，等设备主动注册后再认领。
+		if strings.TrimSpace(d.IP) == "" {
+			log.Printf("种子设备 %s（%s）IP 为空，跳过注册，等设备主动注册", id, d.Model)
+			continue
+		}
 		reg.Upsert(registry.Device{ID: id, Model: d.Model, IP: d.IP, Room: d.Room})
 	}
 
@@ -321,22 +447,34 @@ func main() {
 	}
 	var maClient *music.MAClient
 	if cfg.Netease.MusicAssistant != "" {
-		maClient = music.NewMA(cfg.Netease.MusicAssistant, os.Getenv("MA_TOKEN"))
+		// P1-6：MA_TOKEN 为空即拒绝启用 MA（空 Token 等于无认证），
+		// 点歌走 MPD 降级；配好 Token 后重启 Hub 启用。
+		if os.Getenv("MA_TOKEN") == "" {
+			log.Printf("MA_TOKEN 未配置：Music Assistant 不启用，点歌走 MPD 降级")
+		} else {
+			maClient = music.NewMA(cfg.Netease.MusicAssistant, os.Getenv("MA_TOKEN"))
+		}
 	}
 	netease := music.NewNetease(cfg.Netease.API)
 
-	// Agent：按唤醒词路由选默认（你好小李 → hermes）。
+	// Agent：全量建表供 Router 按唤醒词路由（P1-38）；默认大脑取
+	// 唤醒词路由指向的 Agent，未配时按 Agent 名排序取首个（确定性，
+	// 旧代码 Go map 随机迭代 break 是假路由）。
+	agentClients := map[string]*agent.Client{}
+	for name, a := range cfg.Agents {
+		agentClients[name] = agent.New(a.BaseURL, a.Model, config.LLMAPIKey())
+	}
 	var agentClient *agent.Client
 	if name, ok := cfg.WakeWordRoutes[cfg.WakeWord]; ok {
-		if a, ok := cfg.Agents[name]; ok {
-			agentClient = agent.New(a.BaseURL, a.Model, config.LLMAPIKey())
-		}
+		agentClient = agentClients[name]
 	}
-	if agentClient == nil {
-		for _, a := range cfg.Agents {
-			agentClient = agent.New(a.BaseURL, a.Model, config.LLMAPIKey())
-			break
+	if agentClient == nil && len(agentClients) > 0 {
+		names := make([]string, 0, len(agentClients))
+		for name := range agentClients {
+			names = append(names, name)
 		}
+		sort.Strings(names)
+		agentClient = agentClients[names[0]]
 	}
 
 	// 提醒与记忆。
@@ -345,33 +483,43 @@ func main() {
 	memory := router.NewMemory(cfg.Hub.DataDir + "/memory.json")
 	_ = memory.Load()
 
-	// 语音管线（STT/TTS 走 Wyoming；连不上时 Pipeline 报错并记日志）。
-	var stt voice.STT
-	var tts voice.TTS
-	if c, err := wyoming.Dial(cfg.Hub.STT, 3*time.Second); err != nil {
-		log.Printf("Wyoming STT 连接失败（语音识别不可用）: %v", err)
-	} else {
-		stt = &wyomingSTT{c: c}
-	}
-	if c, err := wyoming.Dial(cfg.Hub.TTS, 3*time.Second); err != nil {
-		log.Printf("Wyoming TTS 连接失败（语音合成不可用）: %v", err)
-	} else {
-		tts = &wyomingTTS{c: c}
-	}
+	// 语音管线（STT/TTS 走 Wyoming Dialer，P1-27：懒拨号，断线后
+	// 下次调用自动重拨重试一次；失败时错误带“STT/TTS 不可用”前缀，
+	// 语音管线的降级播报靠此识别）。
+	stt := wyoming.NewDialer(cfg.Hub.STT, 3*time.Second)
+	tts := wyoming.NewDialer(cfg.Hub.TTS, 3*time.Second)
 
 	// 对讲与 OTA。
 	otaMgr := ota.New()
 
 	// Handler 与 Server 先建（Pipeline 的 onReply 需要 server 引用，用闭包晚绑定）。
+	// cfgMu 是 Web PUT 与房间认领共用的配置锁（P1-22），建好后传给两边。
+	cfgMu := &sync.Mutex{}
 	h := &hubHandler{
-		cfg: cfg, cfgPath: *cfgPath, reg: reg,
+		cfg: cfg, cfgPath: *cfgPath, cfgMu: cfgMu, reg: reg,
 		decoders: map[string]*opus.Decoder{},
 		otaMgr:   otaMgr, reminders: remStore,
 		sessions: map[string]time.Time{},
 		playing:  map[string]bool{},
+		playGen:  map[string]uint64{},
 	}
 	server := transport.New(token, reg, h)
 	h.server = server
+	// P1-44：注册制——设备在 WS 上发 register 主动注册，Hub 按指纹
+	// 白名单校验；白名单为空时注册一律拒绝（transport 层 fail closed）。
+	server.SetFingerprints(cfg.Hub.DiscoveryFingerprints)
+	if len(cfg.Hub.DiscoveryFingerprints) == 0 {
+		log.Printf("设备注册制：指纹白名单为空，register 一律拒绝（需在 config.yaml 配 hub.discovery_fingerprints）")
+	} else {
+		log.Printf("设备注册制：已加载 %d 个设备证书指纹白名单", len(cfg.Hub.DiscoveryFingerprints))
+	}
+	// P1-9：hello 成功即调 OTA ConfirmHello（verifying 的任务版本
+	// 对上即成功；无任务时 ConfirmHello 返回 false，什么都不做）。
+	server.OnHello = func(deviceID, version string) {
+		if otaMgr.ConfirmHello(deviceID, version) {
+			log.Printf("OTA 确认成功：%s → %s", deviceID, version)
+		}
+	}
 	h.intercom = intercom.New(func(deviceID string, opusFrame []byte) error {
 		c, ok := server.Conn(deviceID)
 		if !ok {
@@ -412,13 +560,28 @@ func main() {
 			snapClient = c
 		}
 	}
-	rt := router.New(router.Deps{
+	// Router 的 Notify 闭包要读看门狗热换后的最新 HA（P1-27），
+	// 而 rt 在下面才赋值：先声明变量，闭包调用时再读。
+	var rt *router.Router
+	rt = router.New(router.Deps{
 		HA: haClient, MA: maClient, Netease: netease, Agent: agentClient,
+		Agents: agentClients, WakeWordRoutes: cfg.WakeWordRoutes,
 		Reminders: remStore, Memory: memory, QueueID: queueID,
 		MPD: mpdClient, Snap: snapClient,
 		SnapLatencies: cfg.Hub.SnapcastLatencies,
 		SnapGroupID:   cfg.Hub.SnapcastGroup,
 		SnapStreamID:  cfg.Hub.SnapcastStream,
+		// P1-15：对讲触发——语音“呼叫卧室”由此进 intercom；
+		// P1-39：语音房间认领由此写注册表。
+		Intercom: h.intercom,
+		DeviceByRoom: func(room string) (string, bool) {
+			d := reg.ByRoom(room)
+			if d == nil {
+				return "", false
+			}
+			return d.ID, true
+		},
+		RoomClaim: h.OnRoomClaim,
 		RoomOfDevice: func(deviceID string) string {
 			if d, ok := reg.Get(deviceID); ok {
 				return d.Room
@@ -426,63 +589,133 @@ func main() {
 			return ""
 		},
 		Notify: func(ctx context.Context, text string) error {
-			if haClient == nil {
+			// P1-27：读当前 HA（看门狗热换后是最新的），不是启动时那个。
+			c := rt.HA()
+			if c == nil {
 				return fmt.Errorf("HA 未连接，无法通知")
 			}
-			return haClient.FireEvent("open_xiaoai_emergency", map[string]any{"text": text})
+			return c.FireEvent("open_xiaoai_emergency", map[string]any{"text": text})
 		},
 	}, cfg.HAEntities)
+	// P1-38：OnWake 在 hubHandler 里记唤醒词，供 Router 选 Agent。
+	h.router = rt
 
-	// P1-26 后台重试：MPD / Snapcast 启动时没连上时每 30s 重试一次，
-	// 连上即补接到 Router（SetMPD/SetSnap），Hub 不用重启。
-	if mpdClient == nil && cfg.Hub.MPD != "" {
-		go func() {
-			for range time.Tick(30 * time.Second) {
-				c, err := music.DialMPD(cfg.Hub.MPD, 3*time.Second)
+	// P1-27 看门狗：每 30s 探活下游，断线重连并热更新到 Router，
+	// 不再需要重启 Hub；接管原有的 MPD/Snap 启动重试 goroutine。
+	// （Wyoming 走 Dialer 懒重拨，不用看门狗管；HA 重连后要给
+	// alerts Watcher 重订，见下面的 watcher 变量。）
+	var watcher *alerts.Watcher
+	go func() {
+		for range time.Tick(30 * time.Second) {
+			// MA：恢复后取默认播放器 ID 热更新 QueueID（P1-27 核心）。
+			if maClient != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				players, err := maClient.Players(ctx)
+				cancel()
 				if err != nil {
-					log.Printf("MPD 重试连接失败: %v", err)
-					continue
+					log.Printf("看门狗：MA 探活失败: %v", err)
+				} else if len(players) > 0 && players[0].PlayerID != queueID {
+					queueID = players[0].PlayerID
+					rt.SetQueueID(queueID)
+					log.Printf("看门狗：MA 默认播放器更新为 %s", queueID)
 				}
-				rt.SetMPD(c)
-				log.Printf("MPD 已连上（后台重试）: %s", cfg.Hub.MPD)
-				return
 			}
-		}()
-	}
-	if snapClient == nil && cfg.Hub.Snapcast != "" {
-		go func() {
-			for range time.Tick(30 * time.Second) {
-				c, err := music.DialSnap(cfg.Hub.Snapcast, 3*time.Second)
-				if err != nil {
-					log.Printf("Snapcast 重试连接失败: %v", err)
-					continue
+			// MPD：Ping 失败即断开、Router 清空，下轮重拨。
+			if cfg.Hub.MPD != "" {
+				if mpdClient == nil {
+					if c, err := music.DialMPD(cfg.Hub.MPD, 3*time.Second); err != nil {
+						log.Printf("看门狗：MPD 重连失败: %v", err)
+					} else {
+						mpdClient = c
+						rt.SetMPD(c)
+						log.Printf("看门狗：MPD 已连上: %s", cfg.Hub.MPD)
+					}
+				} else if err := mpdClient.Ping(); err != nil {
+					log.Printf("看门狗：MPD 探活失败，断开重连: %v", err)
+					mpdClient.Close()
+					mpdClient = nil
+					rt.SetMPD(nil)
 				}
-				rt.SetSnap(c)
-				log.Printf("Snapcast 已连上（后台重试）: %s", cfg.Hub.Snapcast)
-				return
 			}
-		}()
-	}
+			// Snapcast：同 MPD（GetGroups 探活）。
+			if cfg.Hub.Snapcast != "" {
+				if snapClient == nil {
+					if c, err := music.DialSnap(cfg.Hub.Snapcast, 3*time.Second); err != nil {
+						log.Printf("看门狗：Snapcast 重连失败: %v", err)
+					} else {
+						snapClient = c
+						rt.SetSnap(c)
+						log.Printf("看门狗：Snapcast 已连上: %s", cfg.Hub.Snapcast)
+					}
+				} else if _, err := snapClient.GetGroups(); err != nil {
+					log.Printf("看门狗：Snapcast 探活失败，断开重连: %v", err)
+					snapClient.Close()
+					snapClient = nil
+					rt.SetSnap(nil)
+				}
+			}
+			// HA：GetStates 探活；失败即断开、Router 清空；重连成功后
+			// 热换并给 alerts Watcher 重订。
+			if cfg.HomeAssistant.URL != "" {
+				if haClient == nil {
+					if c, err := ha.Dial(cfg.HomeAssistant.URL, config.HASSToken(), 5*time.Second); err != nil {
+						log.Printf("看门狗：HA 重连失败: %v", err)
+					} else {
+						haClient = c
+						rt.SetHA(c)
+						log.Printf("看门狗：HA 已重连: %s", cfg.HomeAssistant.URL)
+						if watcher != nil {
+							if err := watcher.Rebind(c); err != nil {
+								log.Printf("看门狗：HA 监视重订失败: %v", err)
+							}
+						}
+					}
+				} else if _, err := haClient.GetStates(); err != nil {
+					log.Printf("看门狗：HA 探活失败，断开重连: %v", err)
+					_ = haClient.Close()
+					haClient = nil
+					rt.SetHA(nil)
+				}
+			}
+		}
+	}()
 
-	// Pipeline 的 onReply：把回答的 Opus 帧发给对应设备播放。
+	// Pipeline 的 onReply：把回答的 Opus 帧发给对应设备播放
+	//（P1-16/N-P1-3：统一走 playFrames——start_play → 帧 → stop_play，
+	// 按时长维护 playing，同设备播报串行化）。
 	h.pipeline = voice.New(stt, tts, rt, cfg.Hub.TTSVoice, func(deviceID string, frames [][]byte) {
-		c, ok := server.Conn(deviceID)
-		if !ok {
+		h.playFrames(deviceID, frames)
+	})
+	// 提醒到点：KindAction 是定时动作（走 Route 执行命令），其余是播报。
+	remStore.SetOnFire(func(r reminders.Reminder) {
+		if r.Kind == reminders.KindAction {
+			// P1-41：定时动作——把 Text 当命令走一遍 Route 执行，
+			// 回复播报到对应房间（无房间时播到第一台在线设备）。
+			devID := ""
+			if r.Room != "" {
+				if d := reg.ByRoom(r.Room); d != nil {
+					devID = d.ID
+				}
+			}
+			if devID == "" {
+				if online := reg.Online(); len(online) > 0 {
+					devID = online[0].ID
+				}
+			}
+			if devID == "" {
+				log.Printf("定时动作无在线设备，跳过：%s", r.Text)
+				return
+			}
+			reply, err := rt.Route(context.Background(), devID, r.Text)
+			if err != nil {
+				log.Printf("定时动作执行失败（%s）: %v", r.Text, err)
+				return
+			}
+			if reply != "" && h.speakText != nil {
+				h.speakText(devID, reply)
+			}
 			return
 		}
-		h.playMu.Lock()
-		h.playing[deviceID] = true
-		h.playMu.Unlock()
-		_ = c.SendRPC("play-"+time.Now().Format("150405.000"), "start_play", nil)
-		for _, f := range frames {
-			_ = c.SendBinary(f)
-		}
-		h.playMu.Lock()
-		h.playing[deviceID] = false
-		h.playMu.Unlock()
-	})
-	// 提醒到点：TTS 播报到对应房间（或全屋）。
-	remStore.SetOnFire(func(r reminders.Reminder) {
 		text := "提醒你" + r.Text
 		if r.Room != "" {
 			if d := reg.ByRoom(r.Room); d != nil && h.speakText != nil {
@@ -498,6 +731,8 @@ func main() {
 	})
 	remStore.Start()
 	// speakText：经 Pipeline 的 TTS 合成后发给设备（提醒/主动播报共用）。
+	// P1-16/N-P1-3：合成后统一走 playFrames（start_play → 帧 → stop_play，
+	// 同设备串行化）；Encode 中途出错记 error 日志并停止，不发半截音频。
 	h.speakText = func(deviceID, text string) {
 		// P1-2：提醒 goroutine 里 panic 也不能崩 Hub。
 		defer func() {
@@ -506,51 +741,86 @@ func main() {
 			}
 		}()
 		if tts == nil {
-			log.Printf("TTS 不可用，无法播报给 %s: %s", deviceID, text)
+			log.Printf("TTS 不可用（给 %s）：合成器为空，跳过播报", deviceID)
 			return
 		}
 		audio, err := tts.Synthesize(text, cfg.Hub.TTSVoice)
 		if err != nil {
-			log.Printf("TTS 合成失败: %v", err)
+			// P2-43 顺带：日志只记文本长度，不记全文（提醒内容可能含隐私）。
+			log.Printf("TTS 合成失败（给 %s，%d 字）: %v", deviceID, len([]rune(text)), err)
 			return
 		}
 		enc, err := opus.NewEncoder()
 		if err != nil {
+			log.Printf("speakText 编码器创建失败: %v", err)
 			return
 		}
 		samples := make([]int16, 0, len(audio)/2)
 		for i := 0; i+1 < len(audio); i += 2 {
 			samples = append(samples, int16(audio[i])|int16(audio[i+1])<<8)
 		}
-		c, ok := server.Conn(deviceID)
-		if !ok {
-			return
-		}
+		var frames [][]byte
 		for i := 0; i+opus.FrameSize <= len(samples); i += opus.FrameSize {
 			f, err := enc.Encode(samples[i : i+opus.FrameSize])
 			if err != nil {
+				log.Printf("speakText 编码失败（给 %s，第 %d 帧）: %v", deviceID, len(frames), err)
 				return
 			}
-			_ = c.SendBinary(f)
+			frames = append(frames, f)
 		}
+		h.playFrames(deviceID, frames)
 	}
 
 	// 仲裁：窗口关闭后，赢家开会话 + 发 wake_win，输家发 wake_lose。
+	// P1-13：赢家失败补位——赢家已断线时按 RMS 降序试 losers，
+	// 取第一个仍在线的当赢家；都掉线则本轮无人回。
 	h.arbiter = arbitration.New(arbitration.Window, func(winner string, losers []string) {
 		if winner == "" {
 			return
 		}
-		h.openSession(winner)
-		if c, ok := server.Conn(winner); ok {
+		chosen := winner
+		if _, ok := server.Conn(winner); !ok {
+			chosen = ""
+			for _, l := range losers {
+				if _, ok := server.Conn(l); ok {
+					chosen = l
+					break
+				}
+			}
+			if chosen == "" {
+				log.Printf("仲裁赢家 %s 已断线，输家也都不在线，本轮无人回", winner)
+				return
+			}
+			log.Printf("仲裁赢家 %s 已断线，补位 %s", winner, chosen)
+		}
+		h.openSession(chosen)
+		if c, ok := server.Conn(chosen); ok {
 			_ = c.SendJSON(map[string]string{"type": "wake_win"})
 		}
-		for _, l := range losers {
-			if c, ok := server.Conn(l); ok {
+		for _, id := range append([]string{winner}, losers...) {
+			if id == chosen {
+				continue
+			}
+			if c, ok := server.Conn(id); ok {
 				_ = c.SendJSON(map[string]string{"type": "wake_lose"})
 			}
 		}
 	})
 	go h.sweepSessions()
+
+	// P1-9/P1-15：每 10s 扫一次——OTA 超时任务标失败（pushing 超 10 分钟
+	// 或 verifying 超 30s）、对讲超时会话挂断、紧急呼叫过期清理。
+	go func() {
+		for range time.Tick(10 * time.Second) {
+			if failed := otaMgr.Sweep(time.Now()); len(failed) > 0 {
+				log.Printf("OTA 扫荡：任务失败（超时未验证）: %v", failed)
+			}
+			if ended := h.intercom.Sweep(time.Now()); len(ended) > 0 {
+				log.Printf("对讲扫荡：超时挂断: %v", ended)
+			}
+			rt.SweepEmergency(time.Now())
+		}
+	}()
 
 	// --- 服务端 KWS 边车 ---
 	// 配置非法（enabled=true 但 url/keywords 缺配或配错）时 New 即报错，
@@ -558,7 +828,7 @@ func main() {
 	// 降级为日志 + /api/status 报告 kws_down，音频流重连后自动恢复。
 	var kwsClient *kws.Client
 	if cfg.KWS.Enabled {
-		c, err := kws.New(cfg.KWS.URL, kws.Options{Keywords: cfg.KWS.Keywords})
+		c, err := kws.New(cfg.KWS.URL, kws.Options{Keywords: cfg.KWS.Keywords, Token: config.Token()})
 		if err != nil {
 			log.Fatalf("kws 配置无效: %v", err)
 		}
@@ -586,23 +856,31 @@ func main() {
 	if err != nil {
 		log.Fatalf("监听 %s 失败: %v", cfg.Hub.Listen, err)
 	}
+	// P0-3：mTLS——CA 签发的服务端证书 + 客户端 CA 池。
+	// 证书在启动 goroutine 前签发（P1-10：指纹要同步交给 Web 面板，
+	// 供刷机前取回写进 client.toml）。
+	// LoadOrCreateMTLS() 会在旧自签 hub.crt 已存在且不是 CA 签发时
+	// 重新签发覆盖（指纹随之变，client.toml 的 hub_ca_fingerprint
+	// 需同步更新）；同时签发共享客户端证书（CN open-xiaoai-client，
+	// 随固件下发给音箱）。SetClientCAs 后 Serve() 要求客户端出示
+	// 该 CA 签发的证书（RequireAndVerifyClientCert），只做 Token
+	// 鉴权的旧路径不再走。
+	var serverCert *tls.Certificate
+	hubFingerprint := ""
+	if cfg.TLSEnabled() {
+		cert, pool, fp, err := tlscert.LoadOrCreateMTLS(cfg.Hub.DataDir)
+		if err != nil {
+			log.Fatalf("TLS 证书失败: %v", err)
+		}
+		server.SetClientCAs(pool)
+		serverCert = &cert
+		hubFingerprint = fp
+		log.Printf("wss 已启用（mTLS：要求客户端证书），Hub 证书指纹：%s（刷机前写进 client.toml 的 hub_ca_fingerprint；也可经 Web 面板 /api/fingerprint 取回）", fp)
+	}
 	// 传输层：wss :4399（或 tls=false 时纯 ws）。
 	go func() {
 		if cfg.TLSEnabled() {
-			// P0-3：mTLS——CA 签发的服务端证书 + 客户端 CA 池。
-			// LoadOrCreateMTLS() 会在旧自签 hub.crt 已存在且不是 CA 签发时
-			// 重新签发覆盖（指纹随之变，client.toml 的 hub_ca_fingerprint
-			// 需同步更新）；同时签发共享客户端证书（CN open-xiaoai-client，
-			// 随固件下发给音箱）。SetClientCAs 后 Serve() 要求客户端出示
-			// 该 CA 签发的证书（RequireAndVerifyClientCert），只做 Token
-			// 鉴权的旧路径不再走。
-			cert, pool, fp, err := tlscert.LoadOrCreateMTLS(cfg.Hub.DataDir)
-			if err != nil {
-				log.Fatalf("TLS 证书失败: %v", err)
-			}
-			server.SetClientCAs(pool)
-			log.Printf("wss 已启用（mTLS：要求客户端证书），Hub 证书指纹：%s", fp)
-			if err := server.Serve(ln, &cert); err != nil {
+			if err := server.Serve(ln, serverCert); err != nil {
 				log.Fatalf("wss 服务退出: %v", err)
 			}
 		} else {
@@ -615,6 +893,10 @@ func main() {
 
 	// --- Web 面板（Phase 4）---
 	webServer := web.New(*cfgPath, cfg, reg, otaMgr)
+	// P1-22：PUT 与房间认领共用 cfgMu；P1-10：指纹交给面板，
+	// 供刷机前经 /api/fingerprint 取回。
+	webServer.CfgLock = cfgMu
+	webServer.HubFingerprint = hubFingerprint
 	webServer.KWSStatus = func() string {
 		if kwsClient == nil {
 			return "disabled"
@@ -641,39 +923,12 @@ func main() {
 		}
 	}()
 
-	// --- 自动发现（P0-4：默认关闭；只有配置显式开启才在启动时扫一次）---
-	go func() {
-		scanner := newDiscoveryScanner(cfg, token)
-		if scanner == nil {
-			return // 未显式开启 / 未配指纹白名单 / TLS 未开：本次启动不扫描
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		cidr := cfg.Hub.ScanCIDR
-		if cidr == "" {
-			cidr = localCIDR()
-		}
-		if cidr == "" {
-			log.Printf("自动发现：取不到本机网段，跳过扫描")
-			return
-		}
-		found, err := scanner.Scan(ctx, cidr)
-		if err != nil {
-			log.Printf("自动发现失败: %v", err)
-			return
-		}
-		for _, d := range found {
-			id := transport.DeviceIDFor(d.Model, d.IP)
-			reg.Upsert(registry.Device{ID: id, Model: d.Model, IP: d.IP})
-			log.Printf("自动发现：%s %s", d.Model, d.IP)
-		}
-	}()
-
 	// --- 摄像头监视（FR-10，Phase 4）---
 	// 判定逻辑在 internal/alerts（ShouldAnnounce，可单测）：
 	// 漏水/烟雾/水浸类实体变 on → 向所有在线设备播报，勿扰时段跳过。
+	// watcher 变量在 P1-27 看门狗处已声明（HA 重连后由看门狗 Rebind）。
 	if haClient != nil {
-		watcher := alerts.New(haClient, cfg.Hub.DoNotDisturb, func(text string) {
+		watcher = alerts.New(haClient, cfg.Hub.DoNotDisturb, func(text string) {
 			for _, d := range reg.Online() {
 				h.speakText(d.ID, text)
 			}
@@ -696,89 +951,4 @@ func main() {
 	if haClient != nil {
 		_ = haClient.Close()
 	}
-}
-
-// wyomingSTT 把 wyoming.Client 适配成 voice.STT。
-type wyomingSTT struct{ c *wyoming.Client }
-
-func (w *wyomingSTT) Transcribe(pcm []byte, language string) (string, error) {
-	return w.c.Transcribe(pcm, language)
-}
-
-// wyomingTTS 把 wyoming.Client 适配成 voice.TTS。
-type wyomingTTS struct{ c *wyoming.Client }
-
-func (w *wyomingTTS) Synthesize(text, voice string) ([]byte, error) {
-	return w.c.Synthesize(text, voice)
-}
-
-// discoveryPort 从 cfg.Hub.Listen（如 ":4399"）取端口，供 discovery.Scanner 用。
-// 端口不写死：Hub 监听端口改了，扫描端口跟着走。Listen 已由 config.Validate
-// 校验为合法 host:port，这里只做解析（非法时返回错误，调用方跳过扫描）。
-func discoveryPort(listen string) (int, error) {
-	_, portStr, err := net.SplitHostPort(listen)
-	if err != nil {
-		return 0, fmt.Errorf("hub.listen 不是合法 host:port：%q", listen)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port <= 0 || port > 65535 {
-		return 0, fmt.Errorf("hub.listen 端口非法：%q", listen)
-	}
-	return port, nil
-}
-
-// newDiscoveryScanner 按配置建扫描器（P0-4 接线）：
-//   - 端口取 cfg.Hub.Listen，不写死 4399；
-//   - Enabled 只有配置显式开启（hub.scan_enabled=true）才为 true，默认关闭；
-//   - 指纹白名单 cfg.Hub.DiscoveryFingerprints 原样传入；
-//   - TLS 跟随 Hub 配置（TLS 未开时拒绝明文扫描）。
-//
-// 返回 nil 表示本次启动不扫描：未显式开启、未配指纹白名单、端口非法或
-// TLS 未开（已记日志，调用方直接跳过）。白名单为空时也返回 nil——
-// discovery 层本就拒绝无白名单发 Token，这里直接 fail closed，
-// 避免一次注定失败的 60 秒扫描。
-func newDiscoveryScanner(cfg *config.Config, token string) *discovery.Scanner {
-	if !cfg.Hub.ScanEnabled {
-		return nil
-	}
-	if len(cfg.Hub.DiscoveryFingerprints) == 0 {
-		log.Printf("自动发现：已开启但未配 hub.discovery_fingerprints 白名单，拒绝扫描")
-		return nil
-	}
-	port, err := discoveryPort(cfg.Hub.Listen)
-	if err != nil {
-		log.Printf("自动发现：%v，跳过扫描", err)
-		return nil
-	}
-	if !cfg.TLSEnabled() {
-		log.Printf("自动发现：TLS 未开启，拒绝明文扫描，跳过")
-		return nil
-	}
-	scanner := discovery.New(port, token)
-	scanner.Enabled = true
-	scanner.TLS = true
-	scanner.ExpectedFingerprints = cfg.Hub.DiscoveryFingerprints
-	return scanner
-}
-
-// localCIDR 取本机第一个非回环 IPv4 网段（/24）。
-func localCIDR() string {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return ""
-	}
-	for _, iface := range ifaces {
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, a := range addrs {
-			if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-				if ip := ipnet.IP.To4(); ip != nil {
-					return ip.Mask(net.CIDRMask(24, 32)).String() + "/24"
-				}
-			}
-		}
-	}
-	return ""
 }

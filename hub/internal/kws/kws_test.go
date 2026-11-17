@@ -15,16 +15,20 @@ import (
 
 // fakeSidecar 是测试用边车：WS /v1/kws + HTTP /health。
 // 注意：这是假边车，喂的是合成 PCM（正弦波），测的是接线不是真人唤醒率。
+// SC-P1-3 对接：requireToken 非空时模拟真边车的 hello 鉴权——
+// token 缺失/错误即回 error + 1008 关闭连接，并记 rejected 计数。
 type fakeSidecar struct {
 	ln  net.Listener
 	srv *http.Server
 
-	mu       sync.Mutex
-	writeMu  sync.Mutex // gorilla websocket 要求同一连接最多一个并发写者；handleWS goroutine 与 sendWake/测试 goroutine 会并发写
-	conns    map[string]*websocket.Conn
-	hellos   map[string]map[string]any
-	pcmBytes map[string]int // 每设备收到的 PCM 字节数
-	pcmFrame map[string]int // 每设备收到的二进制帧数
+	mu           sync.Mutex
+	writeMu      sync.Mutex // gorilla websocket 要求同一连接最多一个并发写者；handleWS goroutine 与 sendWake/测试 goroutine 会并发写
+	conns        map[string]*websocket.Conn
+	hellos       map[string]map[string]any
+	pcmBytes     map[string]int // 每设备收到的 PCM 字节数
+	pcmFrame     map[string]int // 每设备收到的二进制帧数
+	requireToken string         // 非空时强制校验 hello.token
+	rejected     int            // 因 token 被拒的 hello 次数
 }
 
 func newFakeSidecar(t *testing.T) *fakeSidecar {
@@ -81,6 +85,20 @@ func (f *fakeSidecar) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deviceID, _ := hello["device_id"].(string)
+	// SC-P1-3：token 缺失/错误即 error + 1008 关闭（与真边车一致）。
+	if f.requireToken != "" {
+		if tok, _ := hello["token"].(string); tok != f.requireToken {
+			f.mu.Lock()
+			f.rejected++
+			f.mu.Unlock()
+			_ = f.writeJSON(conn, map[string]string{"type": "error", "message": "unauthorized"})
+			_ = conn.WriteControl(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "bad token"),
+				time.Now().Add(time.Second))
+			_ = conn.Close()
+			return
+		}
+	}
 	f.mu.Lock()
 	if old, ok := f.conns[deviceID]; ok {
 		_ = old.Close()
@@ -169,9 +187,17 @@ func (f *fakeSidecar) closeConn(deviceID string) {
 	}
 }
 
+// rejectedCount 返回因 token 被拒的 hello 次数。
+func (f *fakeSidecar) rejectedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rejected
+}
+
 func testOpts() Options {
 	return Options{
 		Keywords:         []string{"你好小李"},
+		Token:            "test-kws-token-0123456789abcdef",
 		QueueFrames:      50,
 		DialTimeout:      2 * time.Second,
 		ReconnectInitial: 50 * time.Millisecond,
@@ -218,9 +244,72 @@ func TestHelloAndPCMForward(t *testing.T) {
 	if sr, _ := hello["sample_rate"].(float64); sr != 16000 {
 		t.Fatalf("hello sample_rate 应为 16000，实际 %v", hello["sample_rate"])
 	}
+	// SC-P1-3：hello 必须带 Options.Token（边车缺失即 1008 拒绝）。
+	if tok, _ := hello["token"].(string); tok != "test-kws-token-0123456789abcdef" {
+		t.Fatalf("hello token 应为 Options.Token，实际 %v", hello["token"])
+	}
 	if frames != 10 {
 		t.Fatalf("应收到 10 帧 PCM，实际 %d 帧", frames)
 	}
+}
+
+// TestHelloTokenEnforced：假边车强制校验 token 时（模拟 SC-P1-3 后的
+// 真边车），错误/缺失 token 的 hello 被 1008 拒绝、流连不上；正确 token
+// 的 hello 正常接通。
+func TestHelloTokenEnforced(t *testing.T) {
+	f := newFakeSidecar(t)
+	f.requireToken = "test-kws-token-0123456789abcdef"
+
+	// 错误 token：应被拒绝，流始终连不上。
+	wrong := testOpts()
+	wrong.Token = "wrong-token-0123456789abcdef"
+	cBad, err := New(f.url(), wrong)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendFrames(cBad, "lx06-1", 1)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && f.rejectedCount() == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := f.rejectedCount(); got == 0 {
+		cBad.Close()
+		t.Fatal("错误 token 的 hello 应被边车拒绝，实际 3 秒内 0 次拒绝")
+	}
+	if st := cBad.Status(); st.Connected != 0 {
+		cBad.Close()
+		t.Fatalf("错误 token 时流不应连上，实际 %+v", st)
+	}
+	cBad.Close()
+
+	// 缺失 token：同样被拒。
+	none := testOpts()
+	none.Token = ""
+	cNone, err := New(f.url(), none)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendFrames(cNone, "lx06-1", 1)
+	before := f.rejectedCount()
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && f.rejectedCount() == before {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := f.rejectedCount(); got == before {
+		cNone.Close()
+		t.Fatal("缺失 token 的 hello 应被边车拒绝，实际 3 秒内无新增拒绝")
+	}
+	cNone.Close()
+
+	// 正确 token：正常接通，PCM 能过去。
+	c, err := New(f.url(), testOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	sendFrames(c, "lx06-1", 2)
+	f.waitHello(t, "lx06-1", 3*time.Second)
+	f.waitPCM(t, "lx06-1", 2*640, 3*time.Second)
 }
 
 func TestWakeEventDelivery(t *testing.T) {

@@ -4,6 +4,7 @@ package router
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -38,14 +39,15 @@ func (m *Memory) Load() error {
 	return json.Unmarshal(b, &m.data)
 }
 
-// Set 记一条（key 用时间戳，value 存原文；查的时候按原文匹配）。
+// Set 记一条（key 用纳秒时间戳，value 存原文；查的时候按原文匹配）。
+// key 必须用纳秒级：秒级 RFC3339 会让同一秒内的两条“记住”互相覆盖。
 func (m *Memory) Set(deviceID, text string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.data[deviceID] == nil {
 		m.data[deviceID] = map[string]string{}
 	}
-	m.data[deviceID][time.Now().Format(time.RFC3339)] = text
+	m.data[deviceID][fmt.Sprintf("%d", time.Now().UnixNano())] = text
 	return m.saveLocked()
 }
 

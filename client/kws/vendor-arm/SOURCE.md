@@ -20,26 +20,36 @@ SHA256 校验 tarball → 只取上面两个 .so → 校验 .so SHA256 → `nm -
 
 **为什么它现在还不能用（2026-11-17 实测，写清楚，不粉饰）：**
 
-1. **glibc / libstdc++ 版本不够**：该 .so 要求 `log/pow/exp@GLIBC_2.29` 与
-   `GLIBCXX_3.4.29`；音箱（LX06 1.94.13 / OH2P 1.58.6 原厂 rootfs 实测）
-   最高只有 glibc 2.25、libstdc++ 3.4.22（`libstdc++.so.6.0.22`）。
-   直接放上去 `dlopen` 会报 `version 'GLIBC_2.29' not found`。
-   `libonnxruntime.so` 本身只要求 GLIBC_2.4，没问题；卡的是 sherpa 那层。
-2. **musl 静态 Client 根本不能 dlopen**：当前 ARM Client 是
+1. **glibc / libstdc++ 版本不够**：**两个 .so 都**要求 GLIBC 最高
+   `2.34` 与 GLIBCXX 最高 `3.4.29`（2026-11-17 对本目录两个 .so
+   `readelf -V` 实测确认；`libonnxruntime.so` 最高也是 `GLIBC_2.34`，不是
+   早先写的 GLIBC_2.4——**“ORT 只要求 GLIBC_2.4”已被证伪**，见
+   `AUDIT_ROUND2.md` P1-N3）；音箱（LX06 1.94.13 / OH2P 1.58.6
+   原厂 rootfs 实测）最高只有 glibc 2.25、libstdc++ 3.4.22
+   （`libstdc++.so.6.0.22`）。直接放上去 `dlopen` 会报
+   `version 'GLIBC_2.34' not found`（旧版 v1.10.34/v1.9.29 要求 2.29，
+   同样超标）。两个 .so 都超标，**不只是 sherpa 那层**。
+2. **musl 静态 Client 根本不能 dlopen**（历史记录，本项已随构建目标
+   改变而过时）：早先 ARM Client 默认是
    `armv7-unknown-linux-musleabihf` 静态链接（`file` 显示 statically
    linked，无 dynamic section）。实测：x86_64 上同构的 musl 静态程序
    `dlopen` 宿主 glibc `libsherpa-onnx-c-api.so` 直接失败
    `Dynamic loading not supported`（exit 2），而 glibc 程序同条件
    `dlopen` 成功并解析到 `SherpaOnnxCreateKeywordSpotter`（exit 0）。
    即：**哪怕拿到版本兼容的 .so，不改 Client 链接方式也加载不了**。
+   当前构建目标已是 `armv7-unknown-linux-gnueabihf`（动态链接，
+   `build-armv7-gnueabihf.sh`），musl 静态脚本
+   （`build-armv7.sh`）仅作回退；**链接方式这层障碍已不存在，
+   剩下第 1 条的 glibc 版本问题**。
 
 出路（二选一，需协调人决策，见 `../README.md` §ARM 部署）：
 - (a) 把 Client 改成动态链接 musl（或 static-PIE）+ 交叉编译 musl 版
   sherpa/ORT；或
-- (b) 把 Client 改成 `armv7-unknown-linux-gnueabihf`（glibc 2.25 目标，
-  zig 可指定 `-target arm-linux-gnueabihf.2.25`）+ 从源码重编 sherpa
-  （复用本目录官方 `libonnxruntime.so`，它只要求 GLIBC_2.4）。
-  音箱自带 glibc 2.25 与 `/usr/lib/libasound.so.2`，glibc 路线有现成地基。
+- (b) 从源码重编 sherpa **与** ORT（**不能复用本目录官方
+  `libonnxruntime.so`，它同样要求 GLIBC 2.34**），或 KWS 继续放
+  NAS 边车（`kws-sidecar`，当前唯一能工作的唤醒路径，见 `TEST_REPORT.md`
+  “服务端唤醒”一节）。音箱自带 glibc 2.25 与 `/usr/lib/libasound.so.2`，
+  glibc 路线有现成地基。
 
 ## 2. 参考实现 kws 二进制（过渡，TRANSITIONAL）
 
@@ -65,6 +75,9 @@ SHA256 校验 tarball → 只取上面两个 .so → 校验 .so SHA256 → `nm -
   把 `<timestamp_ms>@<关键词>` 写进 `/tmp/open-xiaoai/kws.log`
   （`__STARTED__` 表示启动完成），Rust 侧用 `src/kws.rs` 的
   `KwsLogMonitor` 尾随该日志取唤醒事件（见 `../README.md` §ARM 部署）。
+  > **作废（2026-11-17）**：服务端 KWS 已落地（NAS `kws-sidecar`），
+  > 本节的参考 kws 二进制 sidecar + `KwsLogMonitor` 旁路方案就此作废，
+  > 不再接线、不再部署到音箱（同 `../README.md` 的作废说明）。
 - 包内 `reference/models/` 是 zipformer2 布局（`encoder.onnx` 等，
   与本项目 transducer 布局的 `encoder-epoch-12-...int8.onnx` 不同），
   sidecar 只能用它自己的模型目录，不要与 `kws-models/` 混用。

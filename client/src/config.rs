@@ -1,8 +1,9 @@
 //! 配置：只读 `/data/open-xiaoai/client.toml`，不存在则用默认值。
 //! 唤醒词、Hub 地址、Token 都在这里改，不用重刷机；改完由 Hub OTA 推送。
 //!
-//! Phase 1 新增：`tls`（默认 true；false = 纯 ws，仅本地测试）、
-//! `hub_ca_fingerprint`（Hub 自签证书的 SHA-256 指纹；有则校验，无则跳过并打警告）、
+//! Phase 1 新增：`tls`（默认 true；false = 纯 ws，仅本地测试，需显式
+//! `allow_insecure_ws = true`）、`hub_ca_fingerprint`（Hub 自签证书的
+//! SHA-256 指纹；`tls=true` 时必填，缺失即拒绝启动，见 P1-10）、
 //! `room`（已认领的房间名，hello 里带给 Hub，可选）。
 
 use anyhow::Result;
@@ -85,8 +86,14 @@ pub struct Config {
     /// true = wss（生产必须），false = 纯 ws（仅本地测试）
     #[serde(default = "default_tls")]
     pub tls: bool,
-    /// Hub 自签证书的 SHA-256 指纹（可带冒号/大小写混用）；有则校验，
-    /// 无则跳过校验并打警告（仅测试环境可接受）。
+    /// `tls=false` 的显式 opt-in（P1-10）：纯 ws 只允许本地测试，生产
+    /// 必须 `tls=true` + 指纹。默认 false；`tls=false` 且本字段为 false
+    /// 时 `validate()` 拒绝启动，不再只 warn 照常启动。
+    #[serde(default)]
+    pub allow_insecure_ws: bool,
+    /// Hub 自签证书的 SHA-256 指纹（可带冒号/大小写混用）；`tls=true` 时
+    /// 必填（`validate()` 拒绝无指纹启动，见 P1-10）；`tls=false` 时不用
+    /// （走纯 ws，不校验证书）。
     #[serde(default)]
     pub hub_ca_fingerprint: Option<String>,
     /// 已认领的房间名（如“客厅”），hello 里带给 Hub；未认领为 None
@@ -107,6 +114,7 @@ impl Default for Config {
             model: default_model(),
             ram_mb: default_ram_mb(),
             tls: true,
+            allow_insecure_ws: false,
             hub_ca_fingerprint: None,
             room: None,
         }
@@ -154,17 +162,82 @@ impl Config {
         self.kws_mode == "local"
     }
 
-    /// 校验 `kws_mode`：只接受 `"server"` / `"local"`，其他值报错，
-    /// 启动即失败（`load_from_str` 调本函数；非法值绝不静默当 server 用）。
+    /// 校验配置（启动即失败，绝不静默带病上线）。
+    ///
+    /// - `kws_mode`：只接受 `"server"` / `"local"`（旧行为）。
+    /// - P1-10（收紧）：`tls=true` 时 `hub_ca_fingerprint` 必填——无指纹
+    ///   只 warn 走系统根证书的时代结束了（自签 Hub 证书不在系统根里，
+    ///   不配指纹要么连不上、要么被引导去关 TLS）。指纹获取：Hub 启动时
+    ///   打到日志，`firmware-patch/scripts/gen-certs.sh` 也写进
+    ///   `fingerprints.txt`；刷机前抄进 client.toml。格式非法同样报错。
+    /// - P1-10（收紧）：`tls=false` 只允许显式本地测试（`allow_insecure_ws
+    ///   = true`），否则拒绝启动；且 `tls=false` 时 `hub_url` 必须是
+    ///   `ws://`——`wss://` 会悄悄走系统根证书 TLS、不走指纹校验，与
+    ///   “tls=false = 纯 ws”自述矛盾（P2-N3，挡着 P1-10 的路顺带修掉）。
+    /// - `hub_url` 必须带 `ws://` / `wss://` scheme；`model` 只支持
+    ///   `lx06` / `oh2p`；`ram_mb` 必须 >0（P2-42 的一部分：以前
+    ///   `model`/`ram_mb`/`hub_url` 无任何校验）。
+    ///
+    /// 注意：`FingerprintVerifier` 同时校验有效期与 SAN 是 P2-1 的范围，
+    /// 不在本项（见 AUDIT_ROUND2.md §6）。
     pub fn validate(&self) -> Result<()> {
-        if self.is_server_kws_mode() || self.is_local_kws_mode() {
-            Ok(())
-        } else {
+        if !(self.is_server_kws_mode() || self.is_local_kws_mode()) {
             anyhow::bail!(
                 "invalid kws_mode {:?}: expected \"server\" (default, wake detection on the NAS sidecar) or \"local\" (on-device sherpa KWS)",
                 self.kws_mode
             )
         }
+        if !(self.hub_url.starts_with("ws://") || self.hub_url.starts_with("wss://")) {
+            anyhow::bail!(
+                "invalid hub_url {:?}: expected ws:// or wss:// (e.g. wss://192.168.1.10:4399)",
+                self.hub_url
+            )
+        }
+        if self.tls {
+            match self.normalized_fingerprint() {
+                Some(_) => {}
+                None => {
+                    if self
+                        .hub_ca_fingerprint
+                        .as_ref()
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false)
+                    {
+                        anyhow::bail!(
+                            "hub_ca_fingerprint malformed (want 64 hex chars, colons/spaces allowed): {:?}",
+                            self.hub_ca_fingerprint
+                        );
+                    }
+                    anyhow::bail!(
+                        "hub_ca_fingerprint is required when tls=true: the hub uses a self-signed certificate, copy its SHA-256 fingerprint from the hub startup log (or fingerprints.txt from gen-certs.sh) into client.toml"
+                    );
+                }
+            }
+        } else {
+            if !self.allow_insecure_ws {
+                anyhow::bail!(
+                    "tls=false requires allow_insecure_ws=true in client.toml (plain ws is local-test only; production must use tls=true with hub_ca_fingerprint)"
+                );
+            }
+            if !self.hub_url.starts_with("ws://") {
+                anyhow::bail!(
+                    "tls=false requires hub_url to start with ws:// (got {:?}); wss:// with tls=false would silently use system-root TLS instead of fingerprint verification",
+                    self.hub_url
+                );
+            }
+        }
+        if self.model != "lx06" && self.model != "oh2p" {
+            anyhow::bail!(
+                "invalid model {:?}: expected \"lx06\" or \"oh2p\"",
+                self.model
+            )
+        }
+        if self.ram_mb == 0 {
+            anyhow::bail!(
+                "invalid ram_mb 0: expected the speaker RAM size in MB (256 for LX06/OH2P)"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -203,6 +276,7 @@ mod tests {
         assert_eq!(cfg.model, "lx06");
         assert_eq!(cfg.ram_mb, 256);
         assert!(cfg.tls);
+        assert!(!cfg.allow_insecure_ws);
         assert_eq!(cfg.hub_ca_fingerprint, None);
         assert_eq!(cfg.room, None);
         assert_eq!(cfg.kws_model_dir, "/data/open-xiaoai/kws/models");
@@ -211,16 +285,29 @@ mod tests {
         assert_eq!(cfg.kws_mode, "server");
         assert!(cfg.is_server_kws_mode());
         assert!(!cfg.is_local_kws_mode());
-        assert!(cfg.validate().is_ok());
+        // P1-10：默认配置无指纹 + tls=true，validate 必须拒绝启动
+        // （以前只 warn 走系统根证书）。配上合法指纹后才通过。
+        let err = cfg
+            .validate()
+            .expect_err("default config without fingerprint must fail validation");
+        assert!(
+            err.to_string().contains("hub_ca_fingerprint is required"),
+            "unexpected error: {err}"
+        );
+        let mut with_fp = cfg.clone();
+        with_fp.hub_ca_fingerprint = Some("aa".repeat(32));
+        assert!(with_fp.validate().is_ok());
     }
 
     #[test]
     fn kws_mode_local_parses_and_server_explicit_parses() {
-        let local = load_from_str("kws_mode = \"local\"\n").unwrap();
+        // P1-10：load_from_str 走 validate，tls=true 时须带合法指纹。
+        let fp_line = format!("hub_ca_fingerprint = \"{}\"", "aa".repeat(32));
+        let local = load_from_str(&format!("kws_mode = \"local\"\n{fp_line}\n")).unwrap();
         assert_eq!(local.kws_mode, "local");
         assert!(local.is_local_kws_mode());
         assert!(!local.is_server_kws_mode());
-        let server = load_from_str("kws_mode = \"server\"\n").unwrap();
+        let server = load_from_str(&format!("kws_mode = \"server\"\n{fp_line}\n")).unwrap();
         assert!(server.is_server_kws_mode());
     }
 
@@ -255,6 +342,7 @@ mod tests {
             model = "oh2p"
             ram_mb = 256
             tls = false
+            allow_insecure_ws = true
             hub_ca_fingerprint = "AA:bb:CC:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:AA:bb:CC:dd:ee:ff:00:11:22:33:44:55:66:77:88:99"
             room = "客厅"
             "#,
@@ -264,6 +352,7 @@ mod tests {
         assert_eq!(cfg.token, "secret");
         assert_eq!(cfg.model, "oh2p");
         assert!(!cfg.tls);
+        assert!(cfg.allow_insecure_ws);
         assert_eq!(cfg.room.as_deref(), Some("客厅"));
         // 冒号分隔 + 大小写混用应归一化为 64 位小写 hex
         let fp = cfg.normalized_fingerprint().unwrap();
@@ -276,17 +365,23 @@ mod tests {
     #[test]
     fn parse_partial_toml_uses_defaults() {
         // 只写两个字段，其余全部走默认值（旧 client.toml 不会被新字段拖垮）。
-        let cfg = load_from_str("hub_url = \"wss://10.0.0.2:4399\"\ntoken = \"x\"\n").unwrap();
+        // P1-10：tls=true 默认须带指纹，这里补一个合法指纹（64 位 hex）。
+        let cfg = load_from_str(
+            "hub_url = \"wss://10.0.0.2:4399\"\ntoken = \"x\"\nhub_ca_fingerprint = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n",
+        )
+        .unwrap();
         assert_eq!(cfg.hub_url, "wss://10.0.0.2:4399");
         assert_eq!(cfg.wake_word, "你好小李");
         assert!(cfg.tls);
-        assert_eq!(cfg.hub_ca_fingerprint, None);
+        assert!(cfg.has_valid_fingerprint());
     }
 
     #[test]
     fn malformed_fingerprint_detected() {
-        let mut cfg = Config::default();
-        cfg.hub_ca_fingerprint = Some("not-a-fingerprint".to_string());
+        let mut cfg = Config {
+            hub_ca_fingerprint: Some("not-a-fingerprint".to_string()),
+            ..Config::default()
+        };
         assert!(cfg.normalized_fingerprint().is_none());
         assert!(cfg.has_malformed_fingerprint());
         cfg.hub_ca_fingerprint = Some("aabb".to_string());
@@ -298,5 +393,71 @@ mod tests {
         let cfg = load_from_path("/tmp/definitely-not-exist-open-xiaoai-client.toml").unwrap();
         assert_eq!(cfg.hub_url, Config::default().hub_url);
         assert!(cfg.tls);
+    }
+
+    // --- P1-10 收紧 + P2-N3 / model / ram_mb 校验 ---
+    #[test]
+    fn validate_requires_fingerprint_when_tls() {
+        let mut cfg = Config {
+            hub_ca_fingerprint: Some("aa".repeat(32)),
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_ok());
+        // 指纹格式非法 → 报错（不是 warn 后继续）。
+        cfg.hub_ca_fingerprint = Some("xyz".to_string());
+        let err = cfg.validate().expect_err("malformed fingerprint must fail");
+        assert!(
+            err.to_string().contains("malformed"),
+            "unexpected error: {err}"
+        );
+        // 指纹缺失 → 报错（P1-10：不再只 warn 走系统根证书）。
+        cfg.hub_ca_fingerprint = None;
+        let err = cfg.validate().expect_err("missing fingerprint must fail");
+        assert!(
+            err.to_string().contains("hub_ca_fingerprint is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_tls_false_needs_explicit_opt_in() {
+        let mut cfg = Config {
+            tls: false,
+            hub_url: "ws://127.0.0.1:4399".to_string(),
+            ..Config::default()
+        };
+        // 无 opt-in → 拒绝启动（P1-10：不再只 warn 照常启动）。
+        let err = cfg
+            .validate()
+            .expect_err("tls=false must fail without opt-in");
+        assert!(
+            err.to_string().contains("allow_insecure_ws"),
+            "unexpected error: {err}"
+        );
+        // 显式 opt-in 后通过。
+        cfg.allow_insecure_ws = true;
+        assert!(cfg.validate().is_ok());
+        // P2-N3：tls=false + wss:// → 拒绝（会悄悄走系统根证书 TLS）。
+        cfg.hub_url = "wss://127.0.0.1:4399".to_string();
+        let err = cfg.validate().expect_err("tls=false with wss:// must fail");
+        assert!(err.to_string().contains("ws://"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_bad_hub_url_model_ram() {
+        let mut cfg = Config {
+            hub_ca_fingerprint: Some("aa".repeat(32)),
+            hub_url: "192.168.1.10:4399".to_string(),
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_err(), "hub_url without scheme must fail");
+        cfg.hub_url = "wss://192.168.1.10:4399".to_string();
+        cfg.model = "lx05".to_string();
+        assert!(cfg.validate().is_err(), "unknown model must fail");
+        cfg.model = "oh2p".to_string();
+        cfg.ram_mb = 0;
+        assert!(cfg.validate().is_err(), "ram_mb 0 must fail");
+        cfg.ram_mb = 256;
+        assert!(cfg.validate().is_ok());
     }
 }

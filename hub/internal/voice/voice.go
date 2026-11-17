@@ -17,6 +17,7 @@ import (
 	"log"
 	"math"
 	"sync"
+	"time"
 
 	"github.com/huajun/open-xiaoai-next/hub/internal/opus"
 )
@@ -68,10 +69,18 @@ type Pipeline struct {
 	utterances map[string]*utterance
 	onReply    func(deviceID string, opusFrames [][]byte)
 
+	// inFlight 是每设备正在回答的标记（P1-29）：同一设备上一句还没
+	// 答完时新结算直接丢弃（只记日志），不让回答在后台无限排队。
+	inFlight map[string]bool
+
 	// sem 是 answer 的总并发上限（P1-2）：满了直接报“繁忙”，不排队阻塞
 	// transport 读循环。
 	sem chan struct{}
 }
+
+// answerTimeout 是单次回答的总超时（P1-29）：STT→Router→TTS→编码全程
+// 120s，超时则 answer 的 ctx 取消，不让后台 goroutine 永久挂住。
+const answerTimeout = 120 * time.Second
 
 // New 新建 Pipeline。onReply 在合成好回答后被调用，参数是 Opus 帧列表。
 func New(stt STT, tts TTS, router Router, voice string, onReply func(deviceID string, opusFrames [][]byte)) *Pipeline {
@@ -79,9 +88,46 @@ func New(stt STT, tts TTS, router Router, voice string, onReply func(deviceID st
 		stt: stt, tts: tts, router: router, voice: voice,
 		silenceThreshold: 200, silenceEndMs: 800,
 		utterances: map[string]*utterance{},
+		inFlight:   map[string]bool{},
 		onReply:    onReply,
 		sem:        make(chan struct{}, MaxConcurrentAnswers),
 	}
+}
+
+// Discard 丢弃某设备的未结算 utterance（P1-28：OnDisconnect 调，
+// 断线后半句话不再残留，下次重连不被旧音频污染）。已在回答中的
+// inFlight 不受影响（由 answerTimeout 兜底）。
+func (p *Pipeline) Discard(deviceID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.utterances, deviceID)
+}
+
+// settle 异步结算一句话（P1-29）：FramePCM/End 只把 PCM 交出来就返回，
+// 回答（STT→Router→TTS→编码）在后台 goroutine 跑，不再阻塞 transport
+// 读循环；带 120s 超时 ctx；同一设备上一句未答完时新结算直接丢弃。
+func (p *Pipeline) settle(ctx context.Context, deviceID string, pcm []int16) error {
+	p.mu.Lock()
+	if p.inFlight[deviceID] {
+		p.mu.Unlock()
+		log.Printf("voice: 设备 %s 上一句还没答完，本句丢弃", deviceID)
+		return nil
+	}
+	p.inFlight[deviceID] = true
+	p.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, answerTimeout)
+	go func() {
+		defer cancel()
+		defer func() {
+			p.mu.Lock()
+			delete(p.inFlight, deviceID)
+			p.mu.Unlock()
+		}()
+		if err := p.answer(ctx, deviceID, pcm); err != nil {
+			log.Printf("voice: 设备 %s 回答失败: %v", deviceID, err)
+		}
+	}()
+	return nil
 }
 
 // RMS 算一帧 PCM 的均方根（供 VAD 与测试用）。
@@ -149,7 +195,8 @@ func (p *Pipeline) FramePCM(ctx context.Context, deviceID string, pcm []int16) e
 	if !finished {
 		return nil
 	}
-	return p.answer(ctx, deviceID, full)
+	// P1-29：异步结算，不阻塞 transport 读循环。
+	return p.settle(ctx, deviceID, full)
 }
 
 // End 强制结束当前一句话（收到 audio_end 时调）。
@@ -166,7 +213,8 @@ func (p *Pipeline) End(ctx context.Context, deviceID string) error {
 	full := u.pcm
 	delete(p.utterances, deviceID)
 	p.mu.Unlock()
-	return p.answer(ctx, deviceID, full)
+	// P1-29：异步结算，不阻塞 transport 读循环。
+	return p.settle(ctx, deviceID, full)
 }
 
 // answer 转写 → 路由 → 合成 → 回 Opus 帧。

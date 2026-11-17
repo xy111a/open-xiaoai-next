@@ -148,7 +148,9 @@ def test_patch_sh_end_to_end(unpacked_work, tmp_path):
     assert "mkdir -p /data/etc/dropbear" in dropbear
     assert "micocfg_work_mode" not in dropbear
     assert (verify / "etc/inittab").read_text().count(
-        "ttyS0::askfirst:/bin/ash --login") == 1
+        "ttyS0::askfirst:/bin/login") == 1
+    assert "ttyS0::askfirst:/bin/ash --login" not in \
+        (verify / "etc/inittab").read_text()
     ota = (verify / "bin/ota").read_text()
     for func_re in (r"^download_upgrade\(\) \{$", r"^upgrade\(\) \{$"):
         m = re.search(func_re, ota, re.MULTILINE)
@@ -212,6 +214,37 @@ def _tamper(path, offset=1000):
     path.write_bytes(bytes(data))
 
 
+# P1-8 测试替身 unblob：不真的解固件，只按 -e 参数建 extract 目录，并按
+# FAKE_SQFS_COUNT / FAKE_MICO_TEXT 放文件，供 unpack.sh 的 find 恰好一个
+# 与 mico_version 版本比对走完整流程（白名单校验仍用真实 .bin）。
+FAKE_UNBLOB = """#!/usr/bin/env bash
+set -u
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-e" ]; then out="$a"; fi
+  prev="$a"
+done
+[ -n "$out" ] || exit 1
+mkdir -p "$out/a" "$out/b"
+n="${FAKE_SQFS_COUNT:-1}"
+i=0
+while [ "$i" -lt "$n" ]; do
+  d="$out"
+  [ "$i" -gt 0 ] && d="$out/a"
+  : > "$d/root.squashfs"
+  i=$((i + 1))
+done
+printf '%s' "$FAKE_MICO_TEXT" > "$out/mico_version"
+"""
+
+
+def _write_fake_unblob(path):
+    path.write_text(FAKE_UNBLOB)
+    path.chmod(0o755)
+    return str(path)
+
+
 def test_unpack_rejects_unknown_version(tmp_path):
     """P0-5：不在白名单的版本拒绝解包（发任何解包动作之前）。"""
     work = tmp_path / "work"
@@ -236,6 +269,64 @@ def test_unpack_rejects_tampered_bin(tmp_path):
     assert r.returncode != 0
     assert "白名单" in (r.stdout + r.stderr)
     assert not (work / "lx06_1.94.13" / "rootfs").exists()
+
+
+# --- P1-8：find 任选 / 旧产物不清 / mico_version 不比对 ---
+
+def test_unpack_rejects_multiple_root_sqfs(tmp_path):
+    """P1-8：extract 里 carve 出多个 root.squashfs 时拒绝任选，直接失败。"""
+    require_firmware_bin()  # 白名单校验仍需真实 .bin：CI 里跳过
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copyfile(FIRMWARE_BIN, work / "lx06_1.94.13.bin")
+    fake = _write_fake_unblob(tmp_path / "fake-unblob.sh")
+    env = {"PATCH_WORK_DIR": str(work), "REA_UNBLOB_COMMAND": fake,
+           "FAKE_SQFS_COUNT": "2", "FAKE_MICO_TEXT": "LX06\n1.94.13\n"}
+    r = run(["bash", str(SCRIPTS / "unpack.sh"), "lx06", "1.94.13"],
+            env_extra=env)
+    assert r.returncode != 0
+    assert "多个" in (r.stdout + r.stderr)
+    assert not (work / "lx06_1.94.13" / "rootfs").exists()
+
+
+def test_unpack_rejects_mico_version_mismatch(tmp_path):
+    """P1-8：mico_version 里没有入参版本时拒绝解包。"""
+    require_firmware_bin()  # 白名单校验仍需真实 .bin：CI 里跳过
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copyfile(FIRMWARE_BIN, work / "lx06_1.94.13.bin")
+    fake = _write_fake_unblob(tmp_path / "fake-unblob.sh")
+    env = {"PATCH_WORK_DIR": str(work), "REA_UNBLOB_COMMAND": fake,
+           "FAKE_SQFS_COUNT": "1", "FAKE_MICO_TEXT": "LX06\n1.94.12\n"}
+    r = run(["bash", str(SCRIPTS / "unpack.sh"), "lx06", "1.94.13"],
+            env_extra=env)
+    assert r.returncode != 0
+    assert "mico_version" in (r.stdout + r.stderr)
+    assert not (work / "lx06_1.94.13" / "rootfs").exists()
+
+
+def test_unpack_cleans_stale_products_before_unblob(tmp_path):
+    """P1-8：重跑先清旧产物——旧 rootfs / extract / 旧补丁镜像都不残留。"""
+    require_firmware_bin()  # 白名单校验仍需真实 .bin：CI 里跳过
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copyfile(FIRMWARE_BIN, work / "lx06_1.94.13.bin")
+    out = work / "lx06_1.94.13"
+    (out / "rootfs").mkdir(parents=True)
+    (out / "rootfs" / "SENTINEL").write_text("stale")
+    (work / "lx06_1.94.13-extract").mkdir()
+    (work / "lx06_1.94.13-extract" / "SENTINEL").write_text("stale")
+    (out / "root-patched.squashfs").write_bytes(b"stale-patched")
+    fake = _write_fake_unblob(tmp_path / "fake-unblob.sh")
+    env = {"PATCH_WORK_DIR": str(work), "REA_UNBLOB_COMMAND": fake,
+           "FAKE_SQFS_COUNT": "1", "FAKE_MICO_TEXT": "LX06\n1.94.13\n"}
+    r = run(["bash", str(SCRIPTS / "unpack.sh"), "lx06", "1.94.13"],
+            env_extra=env)
+    # 假 sqfs 解不开 unsquashfs，本次运行必然失败；关键是旧产物已被清掉。
+    assert r.returncode != 0
+    assert not (out / "rootfs" / "SENTINEL").exists()
+    assert not (work / "lx06_1.94.13-extract" / "SENTINEL").exists()
+    assert not (out / "root-patched.squashfs").exists()
 
 
 def test_patch_rejects_tampered_bin(unpacked_work, tmp_path):
@@ -271,6 +362,25 @@ def test_patch_rejects_tampered_sqfs_when_bin_absent(unpacked_work, tmp_path):
             env_extra={"PATCH_WORK_DIR": str(work)}, timeout=300)
     assert r.returncode != 0
     assert "白名单" in (r.stdout + r.stderr)
+    assert not (work / "lx06_1.94.13" / "root-patched.squashfs").exists()
+
+
+def test_patch_rejects_multiple_orig_sqfs(unpacked_work, tmp_path):
+    """P1-8：$DIR/root.squashfs 缺失时回退到 $DIR-extract；多个同名文件即失败。"""
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copytree(unpacked_work / "lx06_1.94.13", work / "lx06_1.94.13",
+                    symlinks=True)
+    shutil.rmtree(work / "lx06_1.94.13" / "squashfs-root", ignore_errors=True)
+    (work / "lx06_1.94.13" / "root.squashfs").unlink()
+    extract = work / "lx06_1.94.13-extract"
+    (extract / "a").mkdir(parents=True)
+    (extract / "root.squashfs").write_bytes(b"fake1")
+    (extract / "a" / "root.squashfs").write_bytes(b"fake2")
+    r = run(["bash", str(SCRIPTS / "patch.sh"), "lx06", "1.94.13"],
+            env_extra={"PATCH_WORK_DIR": str(work)}, timeout=300)
+    assert r.returncode != 0
+    assert "多个" in (r.stdout + r.stderr)
     assert not (work / "lx06_1.94.13" / "root-patched.squashfs").exists()
 
 

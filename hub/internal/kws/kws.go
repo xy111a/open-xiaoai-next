@@ -74,6 +74,11 @@ type Options struct {
 	ReconnectMax     time.Duration
 	// HealthInterval 是后台健康检查间隔；<=0 时 30s（Start 后生效）。
 	HealthInterval time.Duration
+	// Token 是边车鉴权 Token（SC-P1-3）：与 Hub 的 OPEN_XIAOAI_TOKEN
+	// 复用同一值，hello 里必须带上；边车缺失/错误即回 error + 1008 关闭。
+	// 生产由 main.go 从 config.Token() 传入；为空时边车会拒绝连接
+	// （Hub 启动时已由 transport.ValidateToken 保证 Token 非空且 ≥16 位）。
+	Token string
 	// Logger 为空时用标准 log。
 	Logger *log.Logger
 }
@@ -525,6 +530,9 @@ func (s *stream) dial() (*websocket.Conn, error) {
 func (s *stream) serve(conn *websocket.Conn) error {
 	hello := map[string]any{
 		"type": "hello", "device_id": s.deviceID, "sample_rate": s.client.opts.SampleRate,
+		// SC-P1-3 对接：边车要求 hello 带 token（hmac 常数时间比较），
+		// 缺失/错误即 error + 1008 关闭；不带 token 时升级边车后唤醒立即全断。
+		"token": s.client.opts.Token,
 	}
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if err := conn.WriteJSON(hello); err != nil {

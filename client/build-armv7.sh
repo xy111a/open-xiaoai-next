@@ -99,12 +99,14 @@ if [ -f "$VENDOR_LIB" ]; then
     fi
   done
   echo "ASSERT OK: $VENDOR_LIB exports all 10 required KWS symbols"
-  # 4) 兼容性提醒（只警告，不致命）：官方 .so 要求 GLIBC_2.29 /
+  # 4) 兼容性提醒（只警告，不致命）：官方 .so 要求 GLIBC 最高 2.34 /
   #    GLIBCXX_3.4.29，音箱只有 2.25 / 3.4.22（见 kws/vendor-arm/SOURCE.md）。
+  #    模式覆盖 GLIBC_2.29 及以上——实测 .so 最高 2.34，只匹配 2.29 会漏报。
   READELF_TXT="$TMPDIR/libsherpa-onnx-c-api.readelf.txt"
   readelf -V "$VENDOR_LIB" > "$READELF_TXT" 2>/dev/null || true
-  if grep -q "GLIBC_2.29" "$READELF_TXT"; then
-    echo "WARNING: $VENDOR_LIB requires GLIBC_2.29, speaker has glibc 2.25 — will NOT load on-device as-is (see kws/vendor-arm/SOURCE.md)"
+  if grep -Eq "GLIBC_2\.(29|[3-9][0-9])" "$READELF_TXT"; then
+    MAX_GLIBC=$(grep -o "GLIBC_2\.[0-9.]*" "$READELF_TXT" | sort -Vu | tail -n 1)
+    echo "WARNING: $VENDOR_LIB requires ${MAX_GLIBC:-GLIBC_2.29+}, speaker has glibc 2.25 — will NOT load on-device as-is (see kws/vendor-arm/SOURCE.md)"
   fi
   if grep -q "GLIBCXX_3.4.29" "$READELF_TXT"; then
     echo "WARNING: $VENDOR_LIB requires GLIBCXX_3.4.29, speaker has libstdc++ 3.4.22 — will NOT load on-device as-is (see kws/vendor-arm/SOURCE.md)"

@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/huajun/open-xiaoai-next/hub/internal/opus"
 )
@@ -112,7 +113,8 @@ func TestPipelineEndToEnd(t *testing.T) {
 		if len(out) != 320 {
 			t.Fatalf("回帧应解出 320 点，实际 %d", len(out))
 		}
-	default:
+	case <-time.After(2 * time.Second):
+		// P1-29：回答改为异步结算，这里等一等再断言。
 		t.Fatal("VAD 800ms 静音后未触发回答")
 	}
 }
@@ -143,7 +145,8 @@ func TestPipelineEndForcesAnswer(t *testing.T) {
 		if len(frames) != 1 {
 			t.Fatalf("640 字节 TTS PCM 应编成 1 帧，实际 %d", len(frames))
 		}
-	default:
+	case <-time.After(2 * time.Second):
+		// P1-29：回答改为异步结算，这里等一等再断言。
 		t.Fatal("End 后未触发回答")
 	}
 }
@@ -166,6 +169,7 @@ func TestPipelineSilenceOnlyNoAnswer(t *testing.T) {
 	select {
 	case <-replied:
 		t.Fatal("纯静音不应触发回答")
-	default:
+	case <-time.After(200 * time.Millisecond):
+		// P1-29：回答异步，等 200ms 确认确实没触发（不是没来得及）。
 	}
 }

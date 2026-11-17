@@ -15,8 +15,12 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
   见 `deploy/docker-compose.yml`；容器名 `kws-sidecar` 在 host 网络下解析不到，
   不要改回容器名）
 - Hub → 边车，首条消息（JSON 文本）：
-  `{"type":"hello","device_id":"lx06-192-168-1-20","sample_rate":16000}`
+  `{"type":"hello","device_id":"lx06-192-168-1-20","sample_rate":16000,"token":"..."}`
   `sample_rate` 必须为 16000，否则返回 `error` 并关闭连接。
+  `token` 必须与边车启动时传入的 Token 一致（与 Hub 的
+  `OPEN_XIAOAI_TOKEN` 同一机密，≥16 位，常数时间比较）；缺失/错误
+  返回 `error` 后以 1008 关闭。边车未配 Token 时拒绝启动。
+  WS 连接数上限默认 16，超限的新连接返回 `error` 后以 1013 关闭。
 - Hub → 边车，二进制帧：原始 PCM int16 LE 单声道 16kHz，
   20ms 一帧 = 640 字节（超长帧按 20ms 切分喂入）。
 - 边车 → Hub（JSON 文本）：
@@ -26,8 +30,11 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
     `timestamp_ms` 为服务端 Unix 毫秒时间戳；检出后该设备流自动
     复位（re-arm），可继续检下一次唤醒；
   - `{"type":"error","message":"..."}`：协议错误或模型故障。
-- 健康检查：`GET /health` → 200 `{"status":"ok","model_loaded":true}`；
-  模型未加载好时 503。模型加载失败时进程直接非零退出（不静默跑）。
+- 健康检查：`GET /health` → 200
+  `{"status":"ok","model_loaded":true,"keywords":1,"devices":0,
+    "uptime_s":...,"total_wakes":0}`；模型未加载、关键词表为空或推理
+  连续失败（≥5 次）时 503 `{"status":"error",...,"reason":"..."}`。
+  模型加载失败时进程直接非零退出（不静默跑）。
 
 ## 并发与状态
 
@@ -37,7 +44,10 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
 - 连接断开即丢弃该设备流状态；同一 `device_id` 重连从零开始，
   旧的半句唤醒词不会残留（见 `tests/test_kws_sidecar.py::
   test_reconnect_drops_old_state`）。
-- 同一 `device_id` 在旧连接未断时又连上来，旧流被丢弃并记一条 warning。
+- 同一 `device_id` 在旧连接未断时又连上来（且新连接已通过鉴权），
+  旧连接被主动关闭（1000 "replaced by new connection"），旧流状态
+  丢弃、旧连接此后不再产生 wake（见 `test_duplicate_device_id_
+  closes_old_connection`）；未通过鉴权的连接杀不掉合法旧连接。
 
 ## 配置
 
@@ -52,6 +62,8 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
 | `KWS_THRESHOLD` | `0.25` | keywords_threshold（实验验证值） |
 | `KWS_SCORE` | `1.0` | keywords_score（实验验证值） |
 | `KWS_NUM_THREADS` | `1` | sherpa 解码线程数 |
+| `OPEN_XIAOAI_TOKEN`（或 `--token`） | （必填，无默认） | WS hello 鉴权 Token，与 Hub 的 `OPEN_XIAOAI_TOKEN` 同一机密（≥16 位）；未配或太短时边车拒绝启动。Token 只经环境变量/命令行传入，绝不写进仓库、日志或代码 |
+| `KWS_MAX_CONNECTIONS`（或 `--max-connections`） | `16` | WS 连接数上限；超限的新连接以 1013 拒绝 |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
 
 换唤醒词：改 `keywords.txt`（每行 `token 序列 @显示词`，拼音建模），
@@ -79,6 +91,7 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 KWS_MODEL_DIR=$HOME/workspace/.kws-exp/models/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01 \
 KWS_KEYWORDS_FILE=$HOME/workspace/.kws-exp/keywords.txt \
+OPEN_XIAOAI_TOKEN='<与 Hub 相同的 Token，≥16 位>' \
 .venv/bin/python server.py
 
 # NAS（见 deploy/docker-compose.yml 的 kws-sidecar 服务）
@@ -95,7 +108,10 @@ curl http://<NAS_IP>:10400/health
 
 测试起一个真实 server 子进程（端口 10401），用实验的合成样本
 做端到端 WebSocket 实测：正样本出 wake、负样本静默、双设备隔离、
-断开重连不残留、非法 hello、/health、模型缺失非零退出。
+断开重连不残留、非法 hello、/health、模型缺失非零退出；另有
+P1 回归测试：重复 `device_id` 关闭旧连接、空关键词表拒绝启动、
+hello 缺/错 Token 拒绝、未配 Token 拒绝启动、连接数上限拒绝超限、
+`/health` 503 分支可达。
 
 ### 测试资产自给自足（tests/bootstrap.py）
 

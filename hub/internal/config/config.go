@@ -8,6 +8,9 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -16,117 +19,117 @@ import (
 // Config 是 config.yaml 的完整结构。
 type Config struct {
 	// WakeWord 默认唤醒词，例如 "你好小李"。换词 = 换 KWS 模型文件 + 改这里。
-	WakeWord string `yaml:"wake_word"`
+	WakeWord string `yaml:"wake_word" json:"wake_word"`
 
 	// WakeWordRoutes 多唤醒词路由：唤醒词 → Agent 名。
 	// 例：你好小李 → hermes（管家），你好龙虾 → openclaw（通用）。
-	WakeWordRoutes map[string]string `yaml:"wake_word_routes"`
+	WakeWordRoutes map[string]string `yaml:"wake_word_routes" json:"wake_word_routes"`
 
 	// Devices 已发现的设备（自动发现写入；手工改也行）。
 	// Key 是 Hub 分配的设备 ID，IP 由 mDNS/ARP 扫描得到。
-	Devices map[string]Device `yaml:"devices"`
+	Devices map[string]Device `yaml:"devices" json:"devices"`
 
 	// MusicFolder 音乐文件夹，默认 /volume1/music；启动时自动校验，不存在再问。
-	MusicFolder string `yaml:"music_folder"`
+	MusicFolder string `yaml:"music_folder" json:"music_folder"`
 
 	// HomeAssistant 地址，例如 ws://192.168.1.10:8123，Token 走环境变量 HASS_TOKEN。
-	HomeAssistant HomeAssistant `yaml:"home_assistant"`
+	HomeAssistant HomeAssistant `yaml:"home_assistant" json:"home_assistant"`
 
 	// Agents 可用的 Agent（OpenAI 兼容 /v1/chat/completions）。
-	Agents map[string]Agent `yaml:"agents"`
+	Agents map[string]Agent `yaml:"agents" json:"agents"`
 
 	// Netease 网易云：Music Assistant 地址 + NeteaseCloudMusicApi 地址。
-	Netease Netease `yaml:"netease"`
+	Netease Netease `yaml:"netease" json:"netease"`
 
 	// HAEntities 是 HA 实体别名表：{"客厅灯": "light.living_room"}。
 	// 语音家电命令只认这里配了的别名；门锁/燃气/热水器不配进来。
-	HAEntities map[string]string `yaml:"ha_entities"`
+	HAEntities map[string]string `yaml:"ha_entities" json:"ha_entities"`
 
 	// Hub 是 Hub 自身的运行参数（监听、鉴权、TLS、下游服务地址）。
-	Hub Hub `yaml:"hub"`
+	Hub Hub `yaml:"hub" json:"hub"`
 
 	// KWS 是服务端 KWS 边车（kws-sidecar）的连接配置。
 	// Enabled=false（默认）时 Hub 不连边车，语音唤醒不可用，/api/status
 	// 报告 kws_status=disabled；Enabled=true 时 URL 与 Keywords 必填。
-	KWS KWS `yaml:"kws"`
+	KWS KWS `yaml:"kws" json:"kws"`
 }
 
 // KWS 是服务端 KWS 边车的连接配置（Hub 侧只接线，不跑模型）。
 type KWS struct {
 	// Enabled 是否启用服务端唤醒（默认 false；显式写 true 才连边车）。
-	Enabled bool `yaml:"enabled"`
+	Enabled bool `yaml:"enabled" json:"enabled"`
 	// URL 是边车 WS 地址，例如 ws://127.0.0.1:10400/v1/kws（部署默认：
 	// Hub 与边车都走 host 网络，见 deploy/docker-compose.yml，用回环地址）。
-	URL string `yaml:"url"`
+	URL string `yaml:"url" json:"url"`
 	// Keywords 是接受的唤醒词表，默认应含 WakeWord（如“你好小李”）。
-	Keywords []string `yaml:"keywords"`
+	Keywords []string `yaml:"keywords" json:"keywords"`
 }
 
 // Device 是一台音箱。
 type Device struct {
-	Model string `yaml:"model"` // lx06 / oh2p（只支持这两款）
-	IP    string `yaml:"ip"`    // 自动发现填入
-	Room  string `yaml:"room"`  // 语音认领写入，例如 "客厅"；未认领为空
+	Model string `yaml:"model" json:"model"` // lx06 / oh2p（只支持这两款）
+	IP    string `yaml:"ip" json:"ip"`       // 自动发现填入
+	Room  string `yaml:"room" json:"room"`   // 语音认领写入，例如 "客厅"；未认领为空
 }
 
 // HomeAssistant 是 HA 连接参数。
 type HomeAssistant struct {
-	URL string `yaml:"url"`
+	URL string `yaml:"url" json:"url"`
 }
 
 // Agent 是一个 OpenAI 兼容的 Agent/LLM。
 type Agent struct {
-	BaseURL string `yaml:"base_url"` // 例如 http://hermes:8642/v1
-	Model   string `yaml:"model"`    // 例如 deepseek-chat
+	BaseURL string `yaml:"base_url" json:"base_url"` // 例如 http://hermes:8642/v1
+	Model   string `yaml:"model" json:"model"`       // 例如 deepseek-chat
 }
 
 // Netease 是网易云接入参数。
 type Netease struct {
-	MusicAssistant string `yaml:"music_assistant"` // 例如 http://music-assistant:8099
-	API            string `yaml:"api"`             // 例如 http://netease-api:3000
+	MusicAssistant string `yaml:"music_assistant" json:"music_assistant"` // 例如 http://music-assistant:8099
+	API            string `yaml:"api" json:"api"`                         // 例如 http://netease-api:3000
 }
 
 // Hub 是 Hub 自身的运行参数。
 type Hub struct {
 	// Listen 是 Client 接入地址，例如 ":4399"。
-	Listen string `yaml:"listen"`
+	Listen string `yaml:"listen" json:"listen"`
 	// TLS 是否启用 wss（生产必须 true；本地测试可设 false 走纯 ws）。
 	// 用 *bool：没写时默认 true，只有显式写 false 才关闭。
-	TLS *bool `yaml:"tls"`
+	TLS *bool `yaml:"tls" json:"tls"`
 	// DataDir 是 Hub 数据目录（TLS 证书、提醒持久化等），默认 ./hub-data。
-	DataDir string `yaml:"data_dir"`
+	DataDir string `yaml:"data_dir" json:"data_dir"`
 	// STT 是 Wyoming STT 地址，例如 localhost:10300。
-	STT string `yaml:"stt"`
+	STT string `yaml:"stt" json:"stt"`
 	// TTS 是 Wyoming TTS 地址，例如 localhost:10200。
-	TTS string `yaml:"tts"`
+	TTS string `yaml:"tts" json:"tts"`
 	// TTSVoice 是 Piper 音色，例如 zh_CN-huayan-medium。
-	TTSVoice string `yaml:"tts_voice"`
+	TTSVoice string `yaml:"tts_voice" json:"tts_voice"`
 	// Snapcast 是 Snapcast JSON-RPC 地址，例如 localhost:1705。
-	Snapcast string `yaml:"snapcast"`
+	Snapcast string `yaml:"snapcast" json:"snapcast"`
 	// MPD 是 MPD 地址，例如 localhost:6600（网易云 URL 直播降级路径用，P1-26）。
-	MPD string `yaml:"mpd"`
+	MPD string `yaml:"mpd" json:"mpd"`
 	// SnapcastLatencies 是 Snapcast 延迟补偿（ms，P1-26）：key 为 Snapcast
 	// 客户端 ID，未知 ID 时也可按客户端显示名（如“客厅”）配；点歌成功后
 	// 按此表调 SetClientLatency。
-	SnapcastLatencies map[string]int `yaml:"snapcast_latencies"`
+	SnapcastLatencies map[string]int `yaml:"snapcast_latencies" json:"snapcast_latencies"`
 	// SnapcastGroup 是点歌成功后要切流的分组 ID（P1-26）；为空表示不强制切流。
 	// 分组 ID 见 Snapcast Server.GetStatus 的返回。
-	SnapcastGroup string `yaml:"snapcast_group"`
+	SnapcastGroup string `yaml:"snapcast_group" json:"snapcast_group"`
 	// SnapcastStream 是点歌成功后分组要切到的流 ID（P1-26），如 "NAS音乐"。
-	SnapcastStream string `yaml:"snapcast_stream"`
+	SnapcastStream string `yaml:"snapcast_stream" json:"snapcast_stream"`
 	// WebListen 是 Web 面板监听地址，例如 ":8080"（Phase 4）。
-	WebListen string `yaml:"web_listen"`
+	WebListen string `yaml:"web_listen" json:"web_listen"`
 	// ScanCIDR 是自动发现扫描的网段，例如 "192.168.1.0/24"；为空则自动取本机网段。
-	ScanCIDR string `yaml:"scan_cidr"`
+	ScanCIDR string `yaml:"scan_cidr" json:"scan_cidr"`
 	// ScanEnabled 是自动发现总开关（P0-4）：默认 false，启动不扫描；
 	// 只有显式写 true 才在启动时扫一次。光开开关不够，还须配
 	// DiscoveryFingerprints 白名单，否则扫描拒绝发 Token。
-	ScanEnabled bool `yaml:"scan_enabled"`
+	ScanEnabled bool `yaml:"scan_enabled" json:"scan_enabled"`
 	// DiscoveryFingerprints 是自动发现的设备证书 SHA-256 指纹白名单（P0-4），
 	// 小写 hex，冒号可有可无。为空时扫描拒绝发 Token。
-	DiscoveryFingerprints []string `yaml:"discovery_fingerprints"`
+	DiscoveryFingerprints []string `yaml:"discovery_fingerprints" json:"discovery_fingerprints"`
 	// DoNotDisturb 是勿扰时段（FR-10 主动播报跳过该时段），格式 "23:00-07:00"。
-	DoNotDisturb string `yaml:"do_not_disturb"`
+	DoNotDisturb string `yaml:"do_not_disturb" json:"do_not_disturb"`
 }
 
 // RoomNames 返回已认领的房间名列表。
@@ -196,7 +199,7 @@ func (c *Config) Validate() error {
 		return err
 	}
 	for _, hp := range []struct{ name, addr string }{
-		{"hub.stt", c.Hub.STT}, {"hub.tts", c.Hub.TTS}, {"hub.snapcast", c.Hub.Snapcast},
+		{"hub.stt", c.Hub.STT}, {"hub.tts", c.Hub.TTS}, {"hub.snapcast", c.Hub.Snapcast}, {"hub.mpd", c.Hub.MPD},
 	} {
 		if hp.addr == "" {
 			continue
@@ -218,6 +221,28 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("hub.scan_cidr 必须是内网网段，实际是 %q", c.Hub.ScanCIDR)
 		}
 	}
+	// P1-45：勿扰时段必须是 HH:MM-HH:MM 格式（时 0–23，分 0–59）。
+	if c.Hub.DoNotDisturb != "" {
+		if err := validateDND(c.Hub.DoNotDisturb); err != nil {
+			return err
+		}
+	}
+	// P1-45：唤醒词路由的值必须是在 agents 里配了的 Agent 名，
+	// 否则唤醒后路由不到任何大脑（P1-38 的回退只能兜底，不能当配置）。
+	for word, name := range c.WakeWordRoutes {
+		if _, ok := c.Agents[name]; !ok {
+			return fmt.Errorf("wake_word_routes[%q] 指向不存在的 agent %q", word, name)
+		}
+	}
+	// N-P2-6：web_listen 不许绑全部接口（":8080"、"0.0.0.0:8080"）——
+	// 必须绑回环或明确的内网 IP；公网 IP 也不许。
+	if c.Hub.WebListen != "" {
+		if err := validateWebListen(c.Hub.WebListen); err != nil {
+			return err
+		}
+	}
+	// P1-45：种子设备空 IP 不报错（随仓库发的 config.yaml 本身含空 IP
+	// 占位，报错会破坏启动）；main.go 种子注册时跳过空 IP 设备并记日志。
 	// KWS 边车：启用时 URL 与 Keywords 必填，且 URL 只许 ws/wss + 内网 host
 	//（与下游地址同一白名单规则）；缺配置或配错地址时启动即报错，
 	// 不要静默连错地址或静默关闭唤醒。未启用时 URL/Keywords 不校验（忽略）。
@@ -257,6 +282,57 @@ func validateKWSURL(raw string) error {
 	}
 	if u.Path == "" || u.Path == "/" {
 		return fmt.Errorf("kws.url 必须带路径（边车 WS 路径，如 /v1/kws），实际是 %q", raw)
+	}
+	return nil
+}
+
+// validateDND 校验勿扰时段格式 HH:MM-HH:MM（时 0–23，分 0–59）。
+func validateDND(s string) error {
+	m := dndRe.FindStringSubmatch(s)
+	if m == nil {
+		return fmt.Errorf("hub.do_not_disturb 格式必须是 HH:MM-HH:MM（如 23:00-07:00），实际是 %q", s)
+	}
+	for _, part := range [][2]string{{m[1], m[2]}, {m[3], m[4]}} {
+		h, _ := strconv.Atoi(part[0])
+		mi, _ := strconv.Atoi(part[1])
+		if h < 0 || h > 23 || mi < 0 || mi > 59 {
+			return fmt.Errorf("hub.do_not_disturb 时间超出范围：%q", s)
+		}
+	}
+	return nil
+}
+
+var dndRe = regexp.MustCompile(`^(\d{2}):(\d{2})-(\d{2}):(\d{2})$`)
+
+// validateWebListen 校验 Web 监听地址：不许绑全部接口（":8080"、
+// "0.0.0.0:8080"），host 必须是回环或内网 IP（N-P2-6）。
+func validateWebListen(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("hub.web_listen 不是合法监听地址：%q", addr)
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return fmt.Errorf("hub.web_listen 不许绑全部接口（%q），请绑回环或明确内网 IP（如 127.0.0.1:8080）", addr)
+	}
+	if !isPrivateHost(host) {
+		return fmt.Errorf("hub.web_listen 的 host 必须是回环或内网 IP，实际是 %q", addr)
+	}
+	return nil
+}
+
+// ValidateStartup 做启动时才跑的检查（P1-45）：music_folder 必须存在且为目录。
+// 与 Validate 分开：Web PUT 不做文件系统检查（面板环境的路径未必存在），
+// 启动时 main.go 调它，缺失即启动报错（不要等点歌时才发现没音乐）。
+func (c *Config) ValidateStartup() error {
+	if c.MusicFolder == "" {
+		return fmt.Errorf("music_folder 为空")
+	}
+	fi, err := os.Stat(c.MusicFolder)
+	if err != nil {
+		return fmt.Errorf("music_folder 不存在：%q", c.MusicFolder)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("music_folder 不是目录：%q", c.MusicFolder)
 	}
 	return nil
 }
@@ -399,17 +475,38 @@ func (c *Config) applyDefaults() {
 }
 
 // Save 把当前配置写回文件（房间认领、Web 面板改配置时用）。
-// 先写临时文件再改名，避免写一半断电损坏原文件。
+// 先写唯一临时文件再改名，避免写一半断电损坏原文件；
+// P1-23：用 os.CreateTemp 生成唯一临时文件，不再固定 path+".tmp"，
+// 防止 PUT 与房间认领并发写同一 .tmp 文件互相覆盖。
 func (c *Config) Save(path string) error {
 	b, err := yaml.Marshal(c)
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0644); err != nil {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, 0644); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // Token 从环境变量 OPEN_XIAOAI_TOKEN 读 Client 鉴权 Token。

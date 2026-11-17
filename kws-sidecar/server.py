@@ -9,21 +9,31 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
 若干帧（trailing blanks）才能吐出结果；真实使用中麦克风会持续
 送入静音帧，所以这里不需要测试脚本里那种显式补 1s 静音。
 
-协议（已定，不许改）：
+协议（已定，不许改；2026-11-17 P1 修复后 hello 增加 token 字段）：
   WS  ws://127.0.0.1:10400/v1/kws（部署时 Hub 与边车都走 host 网络，
   见 deploy/docker-compose.yml；容器名 kws-sidecar 在 host 网络下解析不到）
-  Hub -> 边车 首条：{"type":"hello","device_id":"...","sample_rate":16000}
+  Hub -> 边车 首条：{"type":"hello","device_id":"...","sample_rate":16000,
+                     "token":"<与 Hub 的 OPEN_XIAOAI_TOKEN 同一机密>"}
+  鉴权：hello 的 token 须与边车启动时传入的 Token 一致（常数时间比较），
+  缺失/错误即 error + 1008 关闭；边车未配 Token（<16 位亦然）时拒绝启动。
+  同 device_id 重连：旧连接被关闭（1000 "replaced by new connection"），
+  旧流状态丢弃，旧连接此后不再产生 wake。
+  连接数上限：默认 16，超限即 error + 1013 关闭。
   Hub -> 边车 二进制帧：PCM int16 LE 单声道 16kHz（20ms = 640 字节）
   边车 -> Hub {"type":"ready"} / {"type":"wake","device_id","keyword",
                  "rms","timestamp_ms"} / {"type":"error","message"}
-  HTTP GET /health -> 200 {"status":"ok","model_loaded":true}（模型未
-                 加载好时 503；模型加载失败则进程直接非零退出）
+  HTTP GET /health -> 200 {"status":"ok","model_loaded":true,
+                 "keywords":1,"devices":0,"uptime_s":...,"total_wakes":0}；
+                 模型未加载、关键词表为空或推理连续失败时 503 + reason。
+                 模型加载失败则进程直接非零退出。
 
 并发模型：单事件循环内串行解码；每 device_id 独立的 KeywordSpotter
-流状态（stream），互不干扰；连接断开即丢弃该设备流状态，重连从零开始。
+流状态（stream），互不干扰；连接断开即丢弃该设备流状态，重连从零开始；
+同一 device_id 重连时旧连接被主动关闭、旧流丢弃（不再出 wake）。
 """
 import argparse
 import asyncio
+import hmac
 import json
 import logging
 import math
@@ -45,6 +55,10 @@ FRAME_SAMPLES = 320          # 20ms @ 16kHz
 FRAME_BYTES = FRAME_SAMPLES * 2
 RMS_WINDOW_FRAMES = 50       # wake 事件的 rms 取最近 1s 的帧 RMS 合成
 
+TOKEN_MIN_LENGTH = 16        # 与 Hub 的 OPEN_XIAOAI_TOKEN 规则一致（>=16 位）
+DEFAULT_MAX_CONNECTIONS = 16  # WS 连接数上限（每设备一路流，2 台设备余量充足）
+MAX_CONSECUTIVE_STREAM_ERRORS = 5  # 连续推理失败达此数即标记服务不健康（/health 503）
+
 # 模型文件（int8 encoder；与 client/scripts/download-kws-model.sh 一致）
 ENCODER_INT8 = "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"
 DECODER = "decoder-epoch-12-avg-2-chunk-16-left-64.onnx"
@@ -55,8 +69,37 @@ KEYWORDS = "keywords.txt"
 REQUIRED_MODEL_FILES = [ENCODER_INT8, DECODER, JOINER, TOKENS]
 
 
+def count_keywords(keywords_file):
+    """校验关键词表：至少含一行非空、含 '@' 的有效行；返回有效行数。
+
+    空表/全注释/无 '@' 的行都会抛 ValueError（调用方 FATAL 退出，
+    绝不带病上线——空表时 sherpa 恒无检出，/health 却会报 200，
+    即 SC-P1-2 的 fail-open）。
+    """
+    count = 0
+    with open(keywords_file, encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            tokens, sep, _word = line.partition("@")
+            if not sep or not tokens.strip():
+                raise ValueError(
+                    f"keywords file {keywords_file}:{lineno}: invalid line "
+                    f"(expected '<tokens> @<word>'): {raw.strip()!r}")
+            count += 1
+    if count == 0:
+        raise ValueError(
+            f"keywords file {keywords_file} has no valid keyword lines; "
+            "refusing to start with an empty keyword table")
+    return count
+
+
 def load_spotter(model_dir, keywords_file, threshold, score, num_threads):
-    """加载 KeywordSpotter；缺文件或加载失败直接抛异常（调用方非零退出）。"""
+    """加载 KeywordSpotter；缺文件/空词表/加载失败直接抛异常（调用方非零退出）。
+
+    返回 (spotter, keywords_count)。
+    """
     missing = [f for f in REQUIRED_MODEL_FILES
                if not os.path.isfile(os.path.join(model_dir, f))]
     if missing:
@@ -64,6 +107,7 @@ def load_spotter(model_dir, keywords_file, threshold, score, num_threads):
             f"model dir {model_dir} missing files: {', '.join(missing)}")
     if not os.path.isfile(keywords_file):
         raise FileNotFoundError(f"keywords file not found: {keywords_file}")
+    keywords_count = count_keywords(keywords_file)
     t0 = time.perf_counter()
     spotter = sherpa_onnx.KeywordSpotter(
         tokens=os.path.join(model_dir, TOKENS),
@@ -76,9 +120,9 @@ def load_spotter(model_dir, keywords_file, threshold, score, num_threads):
         keywords_score=score,
     )
     LOG.info("model loaded in %.2fs (encoder=int8, threshold=%s, score=%s, "
-             "keywords=%s)", time.perf_counter() - t0, threshold, score,
-             keywords_file)
-    return spotter
+             "keywords=%s, keyword_lines=%d)", time.perf_counter() - t0,
+             threshold, score, keywords_file, keywords_count)
+    return spotter, keywords_count
 
 
 class DeviceStream:
@@ -90,6 +134,9 @@ class DeviceStream:
         self.stream = spotter.create_stream()
         self.rms_frames = deque(maxlen=RMS_WINDOW_FRAMES)
         self.wake_count = 0
+        # 被同 device_id 的新连接取代时置 True：旧 handler 见此标志即停喂，
+        # 且即使算出结果也不再发 wake（SC-P1-1 的双保险）。
+        self.replaced = False
 
     def feed(self, pcm_int16):
         """喂一帧 PCM；返回检出的关键词（无检出返回 None）。"""
@@ -115,22 +162,62 @@ class DeviceStream:
 
 
 class Server:
-    def __init__(self, spotter):
+    def __init__(self, spotter, keywords_count=0, token=None,
+                 max_connections=DEFAULT_MAX_CONNECTIONS):
         self.spotter = spotter
+        self.keywords_count = keywords_count
+        self.token = token  # 与 Hub 的 OPEN_XIAOAI_TOKEN 同一机密；绝不记日志
+        self.max_connections = max_connections
         self.model_loaded = spotter is not None
-        self.devices = {}  # device_id -> DeviceStream
+        self.devices = {}  # device_id -> (DeviceStream, ws)
+        self.connections = 0  # 当前 WS 连接数（含未完成 hello 的半开连接）
+        self.started_at = time.monotonic()
+        self.total_wakes = 0
+        self._consecutive_stream_errors = 0
+        self._fatal_error = None  # 置起后 /health 即 503（fail-closed，需重启恢复）
+
+    def health_reason(self):
+        """None 表示健康；否则返回 503 应报告的原因字符串。"""
+        if not self.model_loaded or self.spotter is None:
+            return "model not loaded"
+        if self.keywords_count <= 0:
+            return "keywords table is empty"
+        if self._fatal_error is not None:
+            return self._fatal_error
+        return None
+
+    def note_feed_success(self):
+        self._consecutive_stream_errors = 0
+
+    def note_feed_error(self):
+        self._consecutive_stream_errors += 1
+        if self._consecutive_stream_errors >= MAX_CONSECUTIVE_STREAM_ERRORS:
+            self._fatal_error = (
+                "repeated stream errors "
+                f"({self._consecutive_stream_errors} consecutive "
+                "decode failures)")
+            LOG.error("marking sidecar unhealthy: %s", self._fatal_error)
 
     # ---- HTTP（经 websockets 的 process_request 拦截）----
     async def process_request(self, connection, request: Request):
         if request.path == "/health":
-            if self.model_loaded:
-                body = json.dumps(
-                    {"status": "ok", "model_loaded": True}).encode()
+            reason = self.health_reason()
+            body_dict = {
+                "model_loaded": bool(self.model_loaded),
+                "keywords": self.keywords_count,
+                "devices": len(self.devices),
+                "uptime_s": round(time.monotonic() - self.started_at, 1),
+                "total_wakes": self.total_wakes,
+            }
+            if reason is None:
+                body_dict["status"] = "ok"
+                body = json.dumps(body_dict).encode()
                 return Response(200, "OK", Headers([("Content-Type",
                                                       "application/json")]),
                                 body)
-            body = json.dumps(
-                {"status": "error", "model_loaded": False}).encode()
+            body_dict["status"] = "error"
+            body_dict["reason"] = reason
+            body = json.dumps(body_dict).encode()
             return Response(503, "Service Unavailable",
                             Headers([("Content-Type", "application/json")]),
                             body)
@@ -141,6 +228,20 @@ class Server:
     # ---- WebSocket ----
     async def handler(self, ws):
         device_id = None
+        stream = None
+        # 连接数上限：在事件循环内同步检查 + 计数，无竞态；半开连接也计入。
+        self.connections += 1
+        if self.connections > self.max_connections:
+            LOG.warning("connection limit reached (%d); refusing new "
+                        "connection", self.max_connections)
+            try:
+                await self._send_error(ws, "too many connections")
+                await ws.close(code=1013, reason="too many connections")
+            except websockets.ConnectionClosed:
+                pass
+            finally:
+                self.connections -= 1
+            return
         try:
             hello_raw = await asyncio.wait_for(ws.recv(), timeout=10)
             if not isinstance(hello_raw, str):
@@ -172,15 +273,41 @@ class Server:
                         f"{sample_rate!r}")
                 await ws.close(code=1002, reason="bad sample_rate")
                 return
+            # 鉴权（SC-P1-3）：hello 须带与边车 Token 一致的 token，常数时间
+            # 比较；缺失/错误即 error + 1008 关闭。Token 值绝不记日志、
+            # 不回显。注意：鉴权在取代旧连接之前——未通过鉴权的连接
+            # 杀不掉合法旧连接。
+            token = hello.get("token")
+            if (not isinstance(token, str) or self.token is None
+                    or not hmac.compare_digest(token, self.token)):
+                await self._send_error(ws, "authentication failed")
+                await ws.close(code=1008, reason="bad token")
+                return
             if device_id in self.devices:
-                LOG.warning("device %s reconnected while old stream alive; "
-                            "dropping old stream", device_id)
+                old_stream, old_ws = self.devices[device_id]
+                # 先标记取代（旧 handler 见标志即停喂、不再发 wake），
+                # 再尽力关闭旧连接；关闭超时也不阻塞新连接——
+                # replaced 标志本身已保证旧流不再出 wake。
+                old_stream.replaced = True
+                LOG.warning("device %s reconnected; closing old connection",
+                            device_id)
+                try:
+                    await asyncio.wait_for(
+                        old_ws.close(code=1000,
+                                     reason="replaced by new connection"),
+                        timeout=5)
+                except (asyncio.TimeoutError, websockets.ConnectionClosed):
+                    LOG.warning("device %s: old connection close timed out "
+                                "or already closed; old stream already "
+                                "invalidated", device_id)
             stream = DeviceStream(self.spotter, device_id)
-            self.devices[device_id] = stream
+            self.devices[device_id] = (stream, ws)
             LOG.info("device connected: %s", device_id)
             await ws.send(json.dumps({"type": "ready"}))
 
             async for message in ws:
+                if stream.replaced:
+                    break
                 if isinstance(message, str):
                     await self._send_error(
                         ws, "unexpected text frame after hello; "
@@ -193,8 +320,17 @@ class Server:
                 pcm = np.frombuffer(message, dtype=np.int16)
                 # 按 20ms 切块喂入（Hub 约定 640 字节/帧；超长帧也照此切分）
                 for i in range(0, len(pcm), FRAME_SAMPLES):
-                    keyword = stream.feed(pcm[i:i + FRAME_SAMPLES])
+                    try:
+                        keyword = stream.feed(pcm[i:i + FRAME_SAMPLES])
+                    except Exception:
+                        self.note_feed_error()
+                        raise
+                    self.note_feed_success()
                     if keyword:
+                        # 取代后旧流即使算出结果也不发 wake（双保险）。
+                        if stream.replaced or self.devices.get(
+                                device_id, (None,))[0] is not stream:
+                            break
                         event = {
                             "type": "wake",
                             "device_id": device_id,
@@ -203,6 +339,7 @@ class Server:
                             "timestamp_ms": int(time.time() * 1000),
                         }
                         await ws.send(json.dumps(event, ensure_ascii=False))
+                        self.total_wakes += 1
                         LOG.info("wake: device=%s keyword=%s rms=%s",
                                  device_id, keyword, event["rms"])
         except websockets.ConnectionClosed:
@@ -214,10 +351,13 @@ class Server:
             except websockets.ConnectionClosed:
                 pass
         finally:
-            if device_id is not None and self.devices.get(device_id) is stream:
-                del self.devices[device_id]
-                LOG.info("device disconnected, stream state dropped: %s",
-                         device_id)
+            self.connections -= 1
+            if device_id is not None:
+                entry = self.devices.get(device_id)
+                if entry is not None and entry[0] is stream:
+                    del self.devices[device_id]
+                    LOG.info("device disconnected, stream state dropped: %s",
+                             device_id)
 
     @staticmethod
     async def _send_error(ws, message):
@@ -242,6 +382,13 @@ def build_arg_parser():
                    default=float(os.environ.get("KWS_SCORE", "1.0")))
     p.add_argument("--num-threads", type=int,
                    default=int(os.environ.get("KWS_NUM_THREADS", "1")))
+    p.add_argument("--token",
+                   default=os.environ.get("OPEN_XIAOAI_TOKEN", ""),
+                   help="WS hello 鉴权 Token；与 Hub 的 OPEN_XIAOAI_TOKEN "
+                        "同一机密（>=16 位）。未配时拒绝启动。")
+    p.add_argument("--max-connections", type=int,
+                   default=int(os.environ.get("KWS_MAX_CONNECTIONS", "16")),
+                   help="WS 连接数上限；超限的新连接以 1013 拒绝。")
     p.add_argument("--log-level",
                    default=os.environ.get("LOG_LEVEL", "INFO"))
     return p
@@ -254,20 +401,33 @@ async def amain():
         format="%(asctime)s %(levelname)s %(name)s %(message)s")
     keywords_file = args.keywords_file or os.path.join(args.model_dir,
                                                        KEYWORDS)
+    # 鉴权 Token 是启动前置条件：未配或太短即拒绝启动（SC-P1-3 fail-closed，
+    # 与 Hub 的 OPEN_XIAOAI_TOKEN 规则一致；Token 值绝不记日志）。
+    token = args.token
+    if not token or len(token) < TOKEN_MIN_LENGTH:
+        LOG.error("FATAL: refusing to start without a KWS token "
+                  "(pass --token or set OPEN_XIAOAI_TOKEN to at least %d "
+                  "characters; reuse the Hub's OPEN_XIAOAI_TOKEN value)",
+                  TOKEN_MIN_LENGTH)
+        sys.exit(1)
     try:
-        spotter = load_spotter(args.model_dir, keywords_file,
-                               args.threshold, args.score, args.num_threads)
+        spotter, keywords_count = load_spotter(
+            args.model_dir, keywords_file,
+            args.threshold, args.score, args.num_threads)
     except Exception:  # noqa: BLE001 - 模型故障必须明确报错退出，不静默跑
         LOG.exception("FATAL: failed to load KWS model from %s; refusing "
                       "to start without a model", args.model_dir)
         sys.exit(1)
-    server = Server(spotter)
+    server = Server(spotter, keywords_count=keywords_count, token=token,
+                    max_connections=args.max_connections)
     async with serve(server.handler, args.host, args.port,
                      process_request=server.process_request,
                      max_size=1 << 20):
         LOG.info("kws-sidecar listening on ws://%s:%d/v1/kws "
-                 "(health: http://%s:%d/health)",
-                 args.host, args.port, args.host, args.port)
+                 "(health: http://%s:%d/health, keywords=%d, "
+                 "max_connections=%d)",
+                 args.host, args.port, args.host, args.port,
+                 keywords_count, args.max_connections)
         await asyncio.Future()  # run forever
 
 

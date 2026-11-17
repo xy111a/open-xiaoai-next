@@ -167,29 +167,33 @@ feature 开时 KWS 后端缺失，Client 直接非零退出，不再静默跑 RM
 | `libsherpa-onnx-c-api.so` | 4,733,132 | `46d52505…8bc6b`（全值见 SOURCE.md） |
 | `libonnxruntime.so` | 20,617,061 | `4636872e…72dc`（全值见 SOURCE.md） |
 
-但它要求 `log/pow/exp@GLIBC_2.29` 与 `GLIBCXX_3.4.29`，而音箱
+但它要求 GLIBC 最高 `2.34` 与 `GLIBCXX_3.4.29`（2026-11-17 对本目录
+两个 .so `readelf -V` 实测确认），而音箱
 （LX06 1.94.13 / OH2P 1.58.6 原厂 rootfs 实测）最高只有 glibc 2.25、
 libstdc++ 3.4.22（`libstdc++.so.6.0.22`）。直接放上去 `dlopen` 会报
-`version 'GLIBC_2.29' not found`。`libonnxruntime.so` 本身只要求
-GLIBC_2.4，没问题；卡的是 sherpa 那层。
+`version 'GLIBC_2.34' not found`。**两个 .so 都超标，不只是 sherpa
+那层**——`libonnxruntime.so` 同样要求 GLIBC 最高 2.34，“ORT 只要求
+GLIBC_2.4”的旧说法已被证伪（见 `AUDIT_ROUND2.md` P1-N3；旧版
+v1.10.34/v1.9.29 要求 2.29，同样超标）。
 
-### 第 2 层：musl 静态 Client 根本不能 dlopen
+### 第 2 层：musl 静态 Client 根本不能 dlopen（历史记录，已过时）
 
-当前 ARM Client 是 `armv7-unknown-linux-musleabihf` 静态链接（`file`
+早先 ARM Client 默认是 `armv7-unknown-linux-musleabihf` 静态链接（`file`
 显示 statically linked，无 dynamic section）。实测：x86_64 上同构的
 musl 静态程序 `dlopen` 宿主 glibc `libsherpa-onnx-c-api.so` 直接失败
 `Dynamic loading not supported`（exit 2），而 glibc 程序同条件 `dlopen`
 成功并解析到 `SherpaOnnxCreateKeywordSpotter`（exit 0）。
 即：**哪怕拿到版本兼容的 .so，不改 Client 链接方式也加载不了。**
+当前构建目标已是 `armv7-unknown-linux-gnueabihf`（动态链接），
+**链接方式这层障碍已不存在，剩下第 1 层的 glibc 版本问题**。
 
 出路（二选一，需协调人决策）：
 - (a) 把 Client 改成动态链接 musl（或 static-PIE）+ 交叉编译 musl 版
   sherpa/ORT（ORT 没有 musl 预编译，需从源码编，工作量大）；或
-- (b) 把 Client 改成 `armv7-unknown-linux-gnueabihf`（glibc 2.25 目标，
-  zig 可指定 `-target arm-linux-gnueabihf.2.25`）+ 从源码重编 sherpa
-  （复用 `kws/vendor-arm/` 里官方 `libonnxruntime.so`，它只要求
-  GLIBC_2.4）。音箱自带 glibc 2.25 与 `/usr/lib/libasound.so.2`，
-  glibc 路线有现成地基。
+- (b) 从源码重编 sherpa **与** ORT（**不能复用 `kws/vendor-arm/` 里官方
+  `libonnxruntime.so`，它同样要求 GLIBC 2.34**），或 KWS 继续放 NAS
+  边车（`kws-sidecar`，当前唯一能工作的唤醒路径）。音箱自带 glibc 2.25
+  与 `/usr/lib/libasound.so.2`，glibc 路线有现成地基。
 
 ### 过渡路线（TRANSITIONAL）：参考 kws 二进制 sidecar
 

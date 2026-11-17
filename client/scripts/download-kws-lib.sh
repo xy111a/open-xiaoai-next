@@ -20,12 +20,13 @@
 # .so 文件不要提交进 git 仓库（大文件；见 kws/vendor-arm/SOURCE.md）。
 #
 # !!! 兼容性警告（2026-11-17 实测，见 kws/vendor-arm/SOURCE.md）：
-#   该官方 .so 要求 GLIBC_2.29 + GLIBCXX_3.4.29，音箱只有 glibc 2.25 /
-#   libstdc++ 3.4.22，直接 dlopen 会失败；且当前 ARM Client 是 musl
-#   静态链接，dlopen 本身就不被支持（"Dynamic loading not supported"）。
+#   该官方 .so 要求 GLIBC 最高 2.34 + GLIBCXX_3.4.29，音箱只有 glibc 2.25 /
+#   libstdc++ 3.4.22，直接 dlopen 会失败；且早先 ARM Client 是 musl
+#   静态链接时 dlopen 本身就不被支持（"Dynamic loading not supported"），
+#   当前默认构建目标已改为 gnueabihf（动态链接），链接方式这层障碍已不存在。
 #   本脚本只负责“把官方 ARM .so 取到本地并校验”，不代表“能上音箱跑”。
-#   真机可用之前，须先解决上述两项（重编 .so 和/或改 Client 链接方式），
-#   或走过渡路线：scripts/download-kws-reference.sh（kws.tar.gz sidecar）。
+#   真机可用之前，须先解决 glibc 版本问题（从源码重编 .so），
+#   或走服务端 KWS 路线（NAS kws-sidecar，当前唯一能工作的唤醒路径）。
 set -euo pipefail
 
 TARBALL_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-v2.0.1-linux-arm-gnueabihf-shared.tar.bz2"
@@ -90,8 +91,10 @@ echo "==> checking speaker compatibility (informational only, does not fail)"
 # 同上：readelf 输出先落盘再 grep，避免 pipefail + grep -q 提早关管道
 # 导致 readelf SIGPIPE、if 条件被误判为假（警告悄悄不打印）。
 readelf -V "$OUT_DIR/libsherpa-onnx-c-api.so" > "$TMP/readelf-v.txt" 2>/dev/null || true
-if grep -q "GLIBC_2.29" "$TMP/readelf-v.txt"; then
-    echo "WARNING: libsherpa-onnx-c-api.so requires GLIBC_2.29, but the speaker (LX06 1.94.13 / OH2P 1.58.6) only has glibc 2.25 — it will NOT load on-device as-is. See kws/vendor-arm/SOURCE.md."
+# 模式覆盖 GLIBC_2.29 及以上——实测 .so 最高 2.34，只匹配 2.29 会漏报。
+if grep -Eq "GLIBC_2\.(29|[3-9][0-9])" "$TMP/readelf-v.txt"; then
+    MAX_GLIBC=$(grep -o "GLIBC_2\.[0-9.]*" "$TMP/readelf-v.txt" | sort -Vu | tail -n 1)
+    echo "WARNING: libsherpa-onnx-c-api.so requires ${MAX_GLIBC:-GLIBC_2.29+}, but the speaker (LX06 1.94.13 / OH2P 1.58.6) only has glibc 2.25 — it will NOT load on-device as-is. See kws/vendor-arm/SOURCE.md."
 fi
 if grep -q "GLIBCXX_3.4.29" "$TMP/readelf-v.txt"; then
     echo "WARNING: libsherpa-onnx-c-api.so requires GLIBCXX_3.4.29, but the speaker only has libstdc++ 3.4.22 — it will NOT load on-device as-is. See kws/vendor-arm/SOURCE.md."

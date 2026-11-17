@@ -10,6 +10,16 @@
 #  3) netease-api 原来写 binarytorch/neteasecloudmusicapi，Docker Hub 查无此仓库（404）→
 #     改为官方镜像 binaryify/netease_cloud_music_api（Docker Hub 页面已验证）。
 # 第一次 up 出错（最可能是 UGOS Docker 路径、/volume1/music 不存在、端口占用）请把报错贴回来。
+# 2026-11-17 晚 P1 修复（FW-P1-1 / P1-4 / P1-37 / P1-46）：
+#   - hub 传 OPEN_XIAOAI_WEB_TOKEN（Web 面板鉴权，见 .env.example）；
+#   - whisper/piper/netease 只绑 127.0.0.1（Hub 走 host 网络，本机回环可达）；
+#     MA 的 8095 仍向局域网发布（浏览器开 NAS_IP:8095 做网易云扫码登录，用户直面入口）；
+#   - mosquitto 已删：Hub 代码里没有任何 MQTT 引用，它只是预留；匿名 broker 暴露 1883
+#     不如删掉，需要时再加带密码配置的版本；
+#   - 各服务加 TZ=Asia/Shanghai 与 deploy.resources 限额（起始值，NAS 上按实测再调）；
+#   - 镜像仍用 :latest、未钉 digest：本机到 registry-1.docker.io 的 manifest 接口
+#     超时（token 接口通），无法可信解析 digest；钉死前先在能访问 Docker Hub 的
+#     机器上取各镜像 latest 的 Docker-Content-Digest 再填。
 
 services:
   hub:
@@ -20,9 +30,18 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
+      - TZ=Asia/Shanghai
       - HASS_TOKEN=${HASS_TOKEN}
       - LLM_API_KEY=${LLM_API_KEY}
       - OPEN_XIAOAI_TOKEN=${OPEN_XIAOAI_TOKEN}
+      # FW-P1-1：Web 面板 /api/* 的 Bearer Token，与 OPEN_XIAOAI_TOKEN 独立；
+      # 未传时 Hub 以空 Token 启动，/api/* 一律 401（见 hub/internal/web/web.go）。
+      - OPEN_XIAOAI_WEB_TOKEN=${OPEN_XIAOAI_WEB_TOKEN}
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
     volumes:
       # P1-32：去掉 :ro——Hub 运行时要写 config.yaml（语音认领房间、Web 改配置），
       # 只读挂载下 Save 必然失败。可写/种子配置分离是 P1-22/P1-23 的重构范围，不在此项。
@@ -33,28 +52,44 @@ services:
     depends_on:
       - whisper
       - piper
-      - mosquitto
       - kws-sidecar
 
   # STT：faster-whisper，small-int8，中文；NAS i5-1235U 上 3 秒命令约 0.8–1.2 秒
+  # P1-4：Wyoming 协议无鉴权，只绑 127.0.0.1——Hub 走 host 网络，本机回环可达，
+  # 局域网其他机器连不上。
   whisper:
     image: rhasspy/wyoming-whisper:latest
     container_name: oxn-whisper
     restart: unless-stopped
     command: --model small-int8 --language zh --beam-size 1
     ports:
-      - "10300:10300"
+      - "127.0.0.1:10300:10300"
+    environment:
+      - TZ=Asia/Shanghai
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
     volumes:
       - whisper-data:/data
 
   # TTS：Piper，中文音色；流式合成
+  # P1-4：同 whisper，只绑 127.0.0.1。
   piper:
     image: rhasspy/wyoming-piper:latest
     container_name: oxn-piper
     restart: unless-stopped
     command: --voice zh_CN-huayan-medium
     ports:
-      - "10200:10200"
+      - "127.0.0.1:10200:10200"
+    environment:
+      - TZ=Asia/Shanghai
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
     volumes:
       - piper-data:/data
 
@@ -75,9 +110,19 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      - KWS_HOST=0.0.0.0
+      - TZ=Asia/Shanghai
+      - KWS_HOST=127.0.0.1
       - KWS_PORT=10400
       - KWS_MODEL_DIR=/data/kws/models
+      # SC-P1-3：边车 hello 要求 token（复用 OPEN_XIAOAI_TOKEN，与 hub 服务同一变量、
+      # 同一值；未配或 <16 位时边车拒绝启动）。变量说明与强度校验见 .env.example
+      # 与 nas-install.sh §0 预检查。
+      - OPEN_XIAOAI_TOKEN=${OPEN_XIAOAI_TOKEN}
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
     volumes:
       - kws-data:/data/kws/models
     healthcheck:
@@ -87,22 +132,25 @@ services:
       start_period: 60s
       retries: 3
 
-  # MQTT：设备注册表 + HA 发现
-  mosquitto:
-    image: eclipse-mosquitto:latest
-    container_name: oxn-mosquitto
-    restart: unless-stopped
-    ports:
-      - "1883:1883"
-    volumes:
-      - mosquitto-data:/mosquitto/data
+  # P1-37：mosquitto 已删（2026-11-17 晚）。Hub 代码里没有任何 MQTT 引用，
+  # 它只是“设备注册表 + HA 发现”的预留；留着就是一个匿名 broker 占 1883。
+  # 需要 MQTT 时再加回来，带显式配置 + 密码认证，不要匿名发布。
 
   # 多房间同步播放：Snapcast 服务端 + MPD（沿用已写的两房间包参数）
+  # P1-4：host 网络保留——Snapcast 客户端（音箱）在局域网连 1704/1705，
+  # MPD 经 fifo 出流；改 bridge 会断播放链。只加 TZ 与限额。
   snapserver:
     image: ivdata/snapserver:latest
     container_name: oxn-snapserver
     restart: unless-stopped
     network_mode: host
+    environment:
+      - TZ=Asia/Shanghai
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
     volumes:
       - ./snapserver.conf:/etc/snapserver.conf:ro
       - snapfifo:/tmp/snapfifo
@@ -114,6 +162,13 @@ services:
     container_name: oxn-mpd
     restart: unless-stopped
     network_mode: host
+    environment:
+      - TZ=Asia/Shanghai
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
     volumes:
       # 音乐文件夹：默认 /volume1/music；Hub 启动时自动校验，不存在再问
       - ${MUSIC_FOLDER:-/volume1/music}:/music:ro
@@ -121,6 +176,9 @@ services:
       - mpd-data:/var/lib/mpd
 
   # 网易云：Music Assistant + NeteaseCloudMusicApi（官方镜像，见 README 镜像核实表）
+  # P1-4：MA 的 8095 仍向局域网发布——浏览器开 http://NAS_IP:8095 做网易云扫码
+  # 登录是用户直面入口，绑 127.0.0.1 会断掉扫码流程；MA 自带首次设置向导，
+  # 接受该暴露并记在这里。netease-api 只给 MA 与 Hub 用，绑 127.0.0.1。
   music-assistant:
     image: ghcr.io/music-assistant/server:latest
     container_name: oxn-music-assistant
@@ -130,21 +188,33 @@ services:
     volumes:
       - ma-data:/data
     environment:
+      - TZ=Asia/Shanghai
       - LOG_LEVEL=INFO
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
 
   netease-api:
     image: binaryify/netease_cloud_music_api:latest
     container_name: oxn-netease-api
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
+    environment:
+      - TZ=Asia/Shanghai
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
 
 volumes:
   hub-data:
   whisper-data:
   piper-data:
   kws-data:
-  mosquitto-data:
   snapfifo:
   mpd-data:
   ma-data:

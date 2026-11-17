@@ -204,6 +204,24 @@ func (m *Manager) End(from string) bool {
 	return true
 }
 
+// EndFor 结束任何以 id 为发起方或目标方的会话（P1-15：
+// OnDisconnect 双向 End 用——只调 End(from) 会漏掉“对端发起、
+// 本设备是目标方”的会话，断线后对方的帧还会继续往已死的连接发）。
+func (m *Manager) EndFor(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ended := false
+	for from, s := range m.sessions {
+		// 点对点：发起方或目标方断线都结束；广播（ToAll）：只有发起方
+		// 断线才结束，某个收听方断线不影响其他收听方。
+		if from == id || s.To == id {
+			delete(m.sessions, from)
+			ended = true
+		}
+	}
+	return ended
+}
+
 // Active 返回进行中的会话数。
 func (m *Manager) Active() int {
 	m.mu.Lock()
