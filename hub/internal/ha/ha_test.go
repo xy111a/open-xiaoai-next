@@ -13,12 +13,20 @@ import (
 
 // 假 HA：走真 WebSocket，按 HA 协议做 auth 握手 + get_states/call_service/subscribe_events/fire_event。
 type fakeHA struct {
-	t      *testing.T
-	mu     sync.Mutex
-	calls  []map[string]any // 收到的 call_service
-	fired  []string         // 收到的 fire_event 类型
-	states map[string]string
-	conn   *websocket.Conn
+	t       *testing.T
+	mu      sync.Mutex
+	writeMu sync.Mutex       // gorilla websocket 要求同一连接最多一个并发写者；handle goroutine 与 pushEvent（测试 goroutine）会并发写
+	calls   []map[string]any // 收到的 call_service
+	fired   []string         // 收到的 fire_event 类型
+	states  map[string]string
+	conn    *websocket.Conn
+}
+
+// writeJSON 是本替身唯一的写入口（持 writeMu），防并发写 panic。
+func (f *fakeHA) writeJSON(v any) error {
+	f.writeMu.Lock()
+	defer f.writeMu.Unlock()
+	return f.conn.WriteJSON(v)
 }
 
 func startFakeHA(t *testing.T) (*fakeHA, string) {
@@ -36,17 +44,17 @@ func startFakeHA(t *testing.T) (*fakeHA, string) {
 		f.conn = c
 		defer c.Close()
 		// 1. 发 auth_required。
-		_ = c.WriteJSON(map[string]any{"type": "auth_required", "ha_version": "2026.1"})
+		_ = f.writeJSON(map[string]any{"type": "auth_required", "ha_version": "2026.1"})
 		// 2. 读 auth。
 		var auth map[string]any
 		if err := c.ReadJSON(&auth); err != nil {
 			return
 		}
 		if auth["type"] != "auth" || auth["access_token"] != "hass-token" {
-			_ = c.WriteJSON(map[string]any{"type": "auth_invalid", "message": "bad token"})
+			_ = f.writeJSON(map[string]any{"type": "auth_invalid", "message": "bad token"})
 			return
 		}
-		_ = c.WriteJSON(map[string]any{"type": "auth_ok", "ha_version": "2026.1"})
+		_ = f.writeJSON(map[string]any{"type": "auth_ok", "ha_version": "2026.1"})
 		// 3. 处理请求 + 推送事件。
 		for {
 			var msg map[string]any
@@ -63,7 +71,7 @@ func startFakeHA(t *testing.T) (*fakeHA, string) {
 func (f *fakeHA) handle(msg map[string]any) {
 	id, _ := msg["id"].(float64)
 	reply := func(result any) {
-		_ = f.conn.WriteJSON(map[string]any{"id": int(id), "type": "result", "success": true, "result": result})
+		_ = f.writeJSON(map[string]any{"id": int(id), "type": "result", "success": true, "result": result})
 	}
 	switch msg["type"] {
 	case "get_states":
@@ -98,13 +106,13 @@ func (f *fakeHA) handle(msg map[string]any) {
 		f.mu.Unlock()
 		reply(nil)
 	default:
-		_ = f.conn.WriteJSON(map[string]any{"id": int(id), "type": "result", "success": false, "error": map[string]any{"code": "unknown", "message": "unknown type"}})
+		_ = f.writeJSON(map[string]any{"id": int(id), "type": "result", "success": false, "error": map[string]any{"code": "unknown", "message": "unknown type"}})
 	}
 }
 
 // pushEvent 从服务端主动推一条 state_changed 事件。
 func (f *fakeHA) pushEvent() {
-	_ = f.conn.WriteJSON(map[string]any{
+	_ = f.writeJSON(map[string]any{
 		"type": "event",
 		"event": map[string]any{
 			"event_type": "state_changed",

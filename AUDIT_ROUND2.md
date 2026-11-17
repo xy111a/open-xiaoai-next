@@ -674,3 +674,10 @@
 - **冷验证（第二次，text2token 实跑）**：同一全新 venv 补装 sentencepiece + pypinyin，`PATH` 加上 venv 的 bin（与 CI 一致，强制走 text2token 分支）+ 空 `KWS_TEST_ASSETS=/tmp/cold-assets2`：模型下载、text2token 生成 keywords.txt、11 个样本生成，`16 passed in 14.89s`。`download-model.sh` 有 `set -euo pipefail`，text2token 失败即脚本 exit 1、bootstrap 抛错，所以 16 passed 即证明 text2token 真跑通了。
 - **重跑结果**：（sentencepiece/pypinyin 修复提交后重跑，待填写；以 GitHub Actions 实跑为准。）
 - **范围说明**：这是一处 CI 运行中发现的 CI/部署缺陷修复（让任务要求的“边车测试在 CI 里确实跑起来”成立），不是审计发现的代码修复；审计发现本身仍只报告、不修。
+
+### A.6 PR 第三跑暴露的 Go 测试替身并发写 panic（已修，N-P2-1 的测试替身一半）
+
+- **失败**：run 44085962471 的 Go job：`--- FAIL: TestSubscribeEventsReceivesPush`，`panic: concurrent write to websocket connection`，栈：gorilla `conn.go:480 NextWriter` → `WriteJSON` → `fakeHA.pushEvent`（`ha_test.go:107`）。其余 21 个包全过。同一测试在前两跑（44084093818、44085140541）都过了——是时序相关的 flaky 失败。
+- **根因**：正是本轮审计的 N-P2-1：`fakeHA` 的 handler goroutine（`handle()` → `reply()` → `WriteJSON`）与测试 goroutine（`pushEvent()` → `WriteJSON`）并发写同一条 WS 连接；gorilla websocket 禁止同一连接并发写，直接 panic。`fakeSidecar`（kws_test.go）有同款结构（`handleWS` 写 `ready`、`sendWake`/测试写 `wake`/`error`），本轮 `-race` 也报过竞态，只是还没在 CI 里炸出来。
+- **修复**（只改两个测试文件，不动生产代码）：`fakeHA` 与 `fakeSidecar` 各加一个 `writeMu sync.Mutex` + 唯一的 `writeJSON` 写入口，全部写操作走它。本地验证：`go test -count=1 -race ./...` 22 个包全 ok（此前 ha、kws 两包在 `-race` 下 FAIL）；`go test -count=10 ./internal/ha/ ./internal/kws/` 全过；`gofmt` 干净。
+- **未动**：生产代码的同款问题 P1-21（HA 客户端 `call()` 与 `SubscribeEvents` 的 `WriteJSON` 不持写锁）仍开，见 §6；本修复只修测试替身，不碰生产代码。
