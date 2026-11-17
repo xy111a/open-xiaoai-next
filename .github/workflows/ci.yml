@@ -26,9 +26,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.23"
-      # hub/internal/opus 用 cgo 链 libopus。
+      # hub/internal/opus 用 cgo 链 libopus 与 libopusfile。
       - name: 安装 libopus
-        run: sudo apt-get update && sudo apt-get install -y libopus-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev libopusfile-dev pkg-config
       - name: go vet
         working-directory: hub
         run: go vet ./...
@@ -76,11 +76,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # 依赖真实固件材料的测试（firmware/rootfs、官方 .bin、work/ 补丁镜像）
+      # 在干净 checkout 里不存在：conftest.py 会以 pytest.skip 带明确理由
+      # 跳过（-rs 让理由显示在输出里），而不是 FileNotFoundError 炸掉 job；
+      # 本地有材料时照常执行。固件材料不进仓库，也不让 CI 现场下载解固件。
       - name: pytest
         working-directory: firmware-patch
         run: |
           python -m pip install --quiet pytest
-          python -m pytest tests/ -q
+          python -m pytest tests/ -q -rs
       # kws-sidecar 测试自给自足：CI 里没有 ~/workspace/.kws-exp，
       # tests/bootstrap.py 会下载模型（scripts/download-model.sh，
       # SHA256 已 pin）、下载 Piper 语音并生成样本；piper 与 ffmpeg
