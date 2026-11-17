@@ -659,5 +659,15 @@
 ### A.4 PR 与 CI 结果
 
 - 分支：`audit-round2-ci-fix`（从 main 509e57a 切出）。
-- 提交：`e12e395`（CI 修复：Go job 加 `libopusfile-dev`；固件测试在缺 fixture 时显式跳过）、`40d30fc`（第二轮审计：firmware-patch / deploy / CI 面报告）。
-- PR 链接与 CI 结果：（待 PR 开通、CI 跑完后填写；以 GitHub Actions 实跑为准。）
+- 提交：`e12e395`（CI 修复：Go job 加 `libopusfile-dev`；固件测试在缺 fixture 时显式跳过）、`40d30fc`（第二轮审计：firmware-patch / deploy / CI 面报告）、`2cdb724`（AUDIT_ROUND2.md + 分面报告 + Python job 拆分）。
+- PR：https://github.com/xy111a/open-xiaoai-next/pull/1（未合并，待 bai 看报告后定）。
+- **首跑结果（run 44084093818，2026-11-17 12:32 UTC）**：Go ✓（1m11s）、Rust ✓（1m46s）、Python（固件）✓（9s）、Semgrep ✓（20s）；**Python（kws-sidecar）✗（1m8s）**。两处批准的修复均生效（Go 的 `opusfile.pc` 缺失已解决；固件 job 的跳过路径已工作），但拆分暴露了此前被掩盖的第三个失败——边车 job 冷启动失败，见 A.5。
+- **重跑结果**：（click 修复提交后重跑，待填写；以 GitHub Actions 实跑为准。）
+
+### A.5 PR 首跑暴露的第三个 CI 失败：边车冷启动缺 `click`（已修）
+
+- **失败**：run 44084093818 的 `python-sidecar` job：bootstrap（`tests/bootstrap.py` → `resolve_assets()` → `_ensure_model()`）在空 `/tmp/kws-test-assets` 下调 `scripts/download-model.sh` 下载模型（SHA256 校验通过），随后 `sherpa-onnx-cli text2token` 生成 keywords.txt 时报 `ModuleNotFoundError: No module named 'click'`，bootstrap 抛 `RuntimeError`，conftest 导入失败，pytest exit code 4，0 个测试执行。
+- **根因**：`sherpa-onnx==2.0.1` 的元数据只声明依赖 `sherpa-onnx-core==2.0.1`，不声明 `click`，但其 `sherpa-onnx-cli` 入口在 import 时就要 click（`sherpa_onnx/cli.py:6`）。本地此前只跑过暖缓存（`~/workspace/.kws-exp` 已有模型 + keywords.txt，`download-model.sh` 从未执行），冷启动路径从未被实际跑过——本次 PR 首跑是它第一次被跑。本地 `.venv` 里同样没有 click，复核确认。
+- **修复**：`kws-sidecar/requirements.txt` 加 `click==8.5.1`（带注释说明原因）。同一行同时修掉 NAS 首次部署的同款隐患：容器 entrypoint 在模型缺失时也调 `download-model.sh`，缺 click 同样会 FATAL 退出、容器拒绝启动（`download-model.sh` 的 fallback 只在 `sherpa-onnx-cli` 不存在时触发，cli 存在但崩溃时不触发）。
+- **冷验证**：全新 venv（只装 requirements + requirements-dev + piper-tts）+ 空 `KWS_TEST_ASSETS=/tmp/cold-assets`：模型下载、keywords.txt 生成、11 个样本生成，`16 passed in 15.24s`。这是该冷路径第一次真正跑通。
+- **范围说明**：这是一处 CI 运行中发现的 CI/部署缺陷修复（让任务要求的“边车测试在 CI 里确实跑起来”成立），不是审计发现的代码修复；审计发现本身仍只报告、不修。

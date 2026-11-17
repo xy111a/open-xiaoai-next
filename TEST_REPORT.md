@@ -463,3 +463,14 @@ prosody/停顿的差异让 transducer 的关键词路径丢了；另 6 次同文
 - **跨句拼接是否算误唤醒**：见上文观察项——“你好”停 1s 再喊“小李”会被拼成唤醒；真人场景下的误唤醒率需真机验证。
 - **kws_status 显示滞后**：边车恢复后 `/api/status` 的 `kws_status` 最多滞后一个 30s 健康检查周期才回 `ok`（唤醒本身恢复即时）；只是状态显示问题，未改行为（改健康检查间隔是可选优化，未做）。
 - 其余关口（刷机、NAS 部署、HA 联调、网易云扫码等）见“硬件关口检查清单”，状态不变。
+
+## CI 修复（2026-11-17，第二轮审计，分支 `audit-round2-ci-fix`，PR #1）
+
+CI 首次实跑（run 44063914126）：Rust ✓、Semgrep ✓；Go ✗、Python ✗。
+
+- **Go 失败原因**：`go vet` 编译 `gopkg.in/hraban/opus.v2` 时报 `Package opusfile was not found in the pkg-config search path`；`opusfile.pc` 由 `libopusfile-dev` 提供，ci.yml 只装了 `libopus-dev`。**修复**：apt 安装行加上 `libopusfile-dev`。
+- **Python 失败原因**：firmware-patch 的测试依赖仓库外的固件 rootfs（本地在 `speaker-open-xiaoai-rebuild/firmware/rootfs/`，9.7GB，不进仓库），CI 环境里没有，setup 直接 FileNotFoundError；且固件步骤先失败、job 中止，kws-sidecar 测试一步从未执行。**修复**：依赖 fixture 的测试在缺失时 `pytest.skip` 带明确理由（不删测试、不静默跳过、不把 rootfs 塞进仓库）；原 `python` job 拆为 `python-firmware` + `python-sidecar` 两个 job，边车测试独立跑、独立出结果。
+- **本地预验证**：CI 条件模拟（干净 checkout，无固件材料）24 passed / 37 skipped，0 failed；本地有 fixture 时 61 passed；kws-sidecar 16 passed；YAML 校验通过。
+- **PR 首跑结果（run 44084093818）**：Go ✓、Rust ✓、Python（固件）✓、Semgrep ✓；**Python（kws-sidecar）✗**——边车 job 冷启动失败：bootstrap 调 `download-model.sh` 下载模型（SHA 校验通过），随后 `sherpa-onnx-cli text2token` 生成 keywords.txt 时报 `ModuleNotFoundError: No module named 'click'`。根因：`sherpa-onnx==2.0.1` 只声明依赖 `sherpa-onnx-core`，不声明 `click`，但其 `sherpa-onnx-cli` 在 import 时就要 click；本地此前只跑过暖缓存（`~/workspace/.kws-exp` 已有模型 + keywords.txt，`download-model.sh` 从未执行），冷启动路径从未被实际跑过。**修复**：`kws-sidecar/requirements.txt` 加 `click==8.5.1`（带注释）。同一行同时修掉 NAS 首次部署的同款隐患：容器 entrypoint 在模型缺失时也调 `download-model.sh`，缺 click 同样会 FATAL 退出。
+- **click 修复的冷验证**：全新 venv（只装 requirements + requirements-dev + piper-tts）+ 空 `KWS_TEST_ASSETS`：模型下载、keywords.txt 生成、11 个样本生成，`16 passed in 15.24s`。
+- **最终 CI 结果**：（重跑后填写；以 GitHub Actions 实跑为准。）
