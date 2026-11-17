@@ -18,15 +18,20 @@
 //!     32-bit ARM 上指针 4 字节，尺寸不同是正常的（repr(C) 自动算）。
 //!   - 线程：sherpa C API 的调用全由 `&mut self` 串行化；`SherpaSpotter`
 //!     只被录音任务独占，因此 `unsafe impl Send`（不实现 Sync）。
-//!   - 音箱端现状（P1-40，2026-11-17 实测）：ARM 版 `libsherpa-onnx-c-api.so`
-//!     已取到（官方 v2.0.1 linux-arm-gnueabihf 预编译，见
-//!     `kws/vendor-arm/SOURCE.md`），但**仍不能在音箱上加载**：
-//!     (1) 它要求 GLIBC_2.29 + GLIBCXX_3.4.29，音箱只有 glibc 2.25 /
-//!     libstdc++ 3.4.22；(2) 当前 ARM Client 是 musl 静态链接，
-//!     `dlopen` 本身就不被支持（实测同构 musl 静态程序 dlopen 报
-//!     "Dynamic loading not supported"，glibc 程序同条件成功）。
-//!     在这两项解决前，真机唤醒走过渡路线：参考 kws 二进制 sidecar +
-//!     `kws.rs` 的 `KwsLogMonitor`（见 `kws/README.md` §ARM 部署）。
+//!   - 音箱端现状（P1-40，2026-11-17 实测，P1-N3 纠正后）：ARM 版
+//!     `libsherpa-onnx-c-api.so` 已取到（官方 v2.0.1
+//!     linux-arm-gnueabihf 预编译，见 `kws/vendor-arm/SOURCE.md`），但
+//!     **仍不能在音箱上加载**：官方 v2.0.1 的两个 ARM `.so`
+//!     （`libsherpa-onnx-c-api.so` 与 `libonnxruntime.so`）都要求
+//!     GLIBC 最高 2.34 + GLIBCXX 最高 3.4.29（`readelf -V` 实测），
+//!     音箱只有 glibc 2.25 / libstdc++ 3.4.22。**“ORT 只要求
+//!     GLIBC_2.4”的旧说法已被证伪**（见 AUDIT_ROUND2.md P1-N3）。
+//!     早先的第二层障碍（musl 静态 Client 不能 dlopen）已随构建目标
+//!     改为 gnueabihf（动态链接）而消失；剩下 glibc 版本问题，须从
+//!     源码重编 ORT + sherpa，或 KWS 继续放 NAS 边车——**当前唯一能
+//!     工作的唤醒路径是 server 模式**（Hub → `kws-sidecar`，见
+//!     `TEST_REPORT.md`“服务端唤醒”一节）。参考 kws 二进制 sidecar +
+//!     `KwsLogMonitor` 的过渡路线已于 2026-11-17 作废，不再接线。
 //!     本模块的 FFI 定义本身与上述无关：32-bit ARM 上指针 4 字节，
 //!     结构体尺寸见测试 `c_api_struct_sizes_match_c_header` 的 32-bit 分支。
 
@@ -589,7 +594,9 @@ mod tests {
         }
         let data = data.expect("no data chunk in wav");
         assert_eq!(data.len() % 2, 0, "odd wav data length");
-        data.chunks_exact(2)
+        data.as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect()
     }
@@ -640,8 +647,7 @@ mod tests {
         let mut hit: Option<String> = None;
         let feed = |s: &mut SherpaSpotter, pcm: &[i16]| -> Option<String> {
             let mut out = None;
-            for chunk in pcm.chunks_exact(FRAME_SAMPLES) {
-                let frame: &[i16; FRAME_SAMPLES] = chunk.try_into().unwrap();
+            for frame in pcm.as_chunks::<FRAME_SAMPLES>().0 {
                 if let Some(kw) = s.feed_frame(frame).unwrap() {
                     out = Some(kw);
                 }

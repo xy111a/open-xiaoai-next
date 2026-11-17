@@ -80,14 +80,15 @@ func TestStatusAndDevices(t *testing.T) {
 func TestConfigPutValidation(t *testing.T) {
 	s, cfgPath := testServer(t)
 	// 非法型号 → 400，文件不应被改写。
-	bad := `{"WakeWord":"你好小李","MusicFolder":"/volume1/music","Devices":{"d1":{"Model":"lx07","IP":"192.168.1.9"}}}`
+	// P1-22：PUT 体用 snake_case（与 YAML 一致）；PascalCase 字段不再识别。
+	bad := `{"wake_word":"你好小李","music_folder":"/volume1/music","devices":{"d1":{"model":"lx07","ip":"192.168.1.9"}}}`
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, authedReq(http.MethodPut, "/api/config", []byte(bad)))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("非法配置 PUT 应 400，实际 %d: %s", rec.Code, rec.Body.String())
 	}
 	// 合法配置 → 200，且落盘可重读。
-	good := `{"WakeWord":"你好小李","MusicFolder":"/volume1/music","Devices":{"lx06-1":{"Model":"lx06","IP":"192.168.1.2","Room":"客厅"},"oh2p-1":{"Model":"oh2p","IP":"192.168.1.3"}}}`
+	good := `{"wake_word":"你好小李","music_folder":"/volume1/music","devices":{"lx06-1":{"model":"lx06","ip":"192.168.1.2","room":"客厅"},"oh2p-1":{"model":"oh2p","ip":"192.168.1.3"}}}`
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, authedReq(http.MethodPut, "/api/config", []byte(good)))
 	if rec.Code != http.StatusOK {
@@ -210,21 +211,21 @@ func TestConfigGetNoSensitiveFields(t *testing.T) {
 func TestConfigPutRejectsTLSDowngradeAndPublicURL(t *testing.T) {
 	s, _ := testServer(t)
 	// tls 显式 false → 400。
-	downgrade := `{"WakeWord":"你好小李","MusicFolder":"/volume1/music","Devices":{"lx06-1":{"Model":"lx06","IP":"192.168.1.2"}},"Hub":{"TLS":false}}`
+	downgrade := `{"hub":{"tls":false}}`
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, authedReq(http.MethodPut, "/api/config", []byte(downgrade)))
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "hub.tls") {
 		t.Fatalf("TLS 降级 PUT 应 400 且提示 hub.tls，实际 %d: %s", rec.Code, rec.Body.String())
 	}
 	// 公网 agent 地址 → 400。
-	public := `{"WakeWord":"你好小李","MusicFolder":"/volume1/music","Devices":{"lx06-1":{"Model":"lx06","IP":"192.168.1.2"}},"Agents":{"hermes":{"BaseURL":"https://api.example.com/v1","Model":"deepseek-chat"}}}`
+	public := `{"agents":{"hermes":{"base_url":"https://api.example.com/v1","model":"deepseek-chat"}}}`
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, authedReq(http.MethodPut, "/api/config", []byte(public)))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("公网下游地址 PUT 应 400，实际 %d: %s", rec.Code, rec.Body.String())
 	}
 	// file:// 网易云 → 400。
-	fileURL := `{"WakeWord":"你好小李","MusicFolder":"/volume1/music","Devices":{"lx06-1":{"Model":"lx06","IP":"192.168.1.2"}},"Netease":{"API":"file:///etc/passwd"}}`
+	fileURL := `{"netease":{"api":"file:///etc/passwd"}}`
 	rec = httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, authedReq(http.MethodPut, "/api/config", []byte(fileURL)))
 	if rec.Code != http.StatusBadRequest {

@@ -35,6 +35,7 @@ import os
 import re
 import secrets
 import sys
+import tempfile
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -94,8 +95,44 @@ def _read(path: Path) -> str:
         raise PatchError(f"缺文件：{path}")
 
 
+def _write_bytes(path: Path, data: bytes, mode: int | None = None) -> None:
+    """原子写（P1-30）：同目录临时文件 → 写盘 + fsync → os.replace。
+
+    mode 为 None 时保留原文件权限（不存在则 0644）；显式给 mode 时按它来。
+    临时文件失败即删，不留半成品；os.replace 是同文件系统内的原子改名，
+    读方要么看到旧文件全文、要么看到新文件全文，永不看到一半内容。
+    """
+    dir_path = path.parent
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
+                                    dir=str(dir_path))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is None:
+            mode = path.stat().st_mode & 0o7777 if path.exists() else 0o644
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        try:  # fsync 目录，让改名落盘（best-effort，失败不报错）
+            dfd = os.open(str(dir_path), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _write(path: Path, text: str) -> None:
-    path.write_text(text, errors="surrogateescape")
+    _write_bytes(path, text.encode("utf-8", errors="surrogateescape"))
 
 
 def _require(path: Path, what: str) -> Path:
@@ -349,15 +386,23 @@ def check_login(rootfs: Path) -> None:
     _require_in(_read(inittab), "ttyS0::askfirst:/bin/login", inittab)
     pam = _require(rootfs / "etc/pam.d/common-auth", "PAM 配置")
     pam_text = _read(pam)
-    _require_in(pam_text, "auth sufficient libmico-pam.so", pam)
-    _require_in(pam_text, "account sufficient libmico-pam.so", pam)
-    if not re.search(r"^#\s*auth\s+\[success=1 default=ignore\]\s+pam_unix\.so",
+    # 接受两种状态：原厂（libmico 未注释、pam_unix 被注释）与已打过本补丁
+    # （libmico 已注释、pam_unix 已启用）；其他状态一律拒绝。
+    # （2026-11-17：旧版只认原厂状态，已打过补丁的 rootfs 重跑 patch_login
+    # 必在这里失败；见 test_patch_login_twice_on_sha512_shadow。）
+    for line in (r"auth sufficient libmico-pam\.so",
+                 r"account sufficient libmico-pam\.so"):
+        if not re.search(r"^#?\s*" + line + r"\s*$",
+                         pam_text, re.MULTILINE):
+            raise PatchError(f"前置条件不满足：{pam} 里找不到 {line} 行")
+    if not re.search(r"^#?\s*auth\s+\[success=1 default=ignore\]\s+pam_unix\.so",
                      pam_text, re.MULTILINE):
-        raise PatchError(f"前置条件不满足：{pam} 里找不到被注释的 pam_unix.so 行")
+        raise PatchError(f"前置条件不满足：{pam} 里找不到 pam_unix.so 行")
 
 
 def patch_login(rootfs: Path) -> str:
-    """换 root 密码 hash；串口改 ash 登录；PAM 去 libmico、启用 pam_unix。
+    """换 root 密码 hash；串口仍走 /bin/login（需 root 密码，P1-36：
+    原先改成 /bin/ash --login 是拆机串口即免密 root）；PAM 去 libmico、启用 pam_unix。
 
     密码只从环境变量 SSH_PASSWORD 或交互式 getpass 读（见 _password），
     hash 为 sha512crypt（$6$）+ 每次随机盐。返回实际写入的 hash，
@@ -371,29 +416,29 @@ def patch_login(rootfs: Path) -> str:
     text = _read(shadow)
     text, n = re.subn(r"^root:\$[156]\$[^:]+:", f"root:{new_hash}:", text,
                       count=1, flags=re.MULTILINE)
-
-    shadow = rootfs / "etc/shadow"
-    text = _read(shadow)
-    text, n = re.subn(r"^root:\$1\$[^:]+:", f"root:{new_hash}:", text,
-                      count=1, flags=re.MULTILINE)
     if n != 1:
         raise PatchError(f"root 密码行替换失败：{shadow}")
     _write(shadow, text)
 
+    # P1-36：inittab 不动——串口仍走 ttyS0::askfirst:/bin/login，登录要输
+    # root 密码（打补丁时设的强密码）。串口恢复仍可用（有密码就能进），
+    # 只是不再是拆机即免密 root。
     inittab = rootfs / "etc/inittab"
-    text = _read(inittab).replace("ttyS0::askfirst:/bin/login",
-                                  "ttyS0::askfirst:/bin/ash --login", 1)
-    _write(inittab, text)
 
     pam = rootfs / "etc/pam.d/common-auth"
     text = _read(pam)
-    text = text.replace("auth sufficient libmico-pam.so",
-                        "# auth sufficient libmico-pam.so", 1)
-    text = text.replace("account sufficient libmico-pam.so",
-                        "# account sufficient libmico-pam.so", 1)
+    # 只注释尚未注释的行（已打过补丁时跳过，避免 "# # " 双重注释）。
+    text = re.sub(r"^auth sufficient libmico-pam\.so\s*$",
+                  "# auth sufficient libmico-pam.so", text,
+                  count=1, flags=re.MULTILINE)
+    text = re.sub(r"^account sufficient libmico-pam\.so\s*$",
+                  "# account sufficient libmico-pam.so", text,
+                  count=1, flags=re.MULTILINE)
+    # 只启用仍被注释的 pam_unix 行（已启用时跳过）。
     text, n = re.subn(r"^#\s*auth(\s+\[success=1 default=ignore\]\s+pam_unix\.so.*)$",
                       r"auth\1", text, count=1, flags=re.MULTILINE)
-    if n != 1:
+    if n == 0 and not re.search(r"^auth\s+\[success=1 default=ignore\]\s+pam_unix\.so",
+                                text, re.MULTILINE):
         raise PatchError(f"pam_unix.so 行启用失败：{pam}")
     _write(pam, text)
 
@@ -401,8 +446,8 @@ def patch_login(rootfs: Path) -> str:
     after = _read(shadow)
     _require_in(after, f"root:{new_hash}:", shadow)
     after = _read(inittab)
-    _require_in(after, "ttyS0::askfirst:/bin/ash --login", inittab)
-    _require_not_in(after, "ttyS0::askfirst:/bin/login", inittab)
+    _require_in(after, "ttyS0::askfirst:/bin/login", inittab)
+    _require_not_in(after, "ttyS0::askfirst:/bin/ash --login", inittab)
     after = _read(pam)
     _require_not_in(after, "\nauth sufficient libmico-pam.so", pam)
     _require_not_in(after, "\naccount sufficient libmico-pam.so", pam)
@@ -597,7 +642,7 @@ def patch_libxaudio(rootfs: Path) -> int:
     p = rootfs / "usr/lib/libxaudio_engine.so"
     data = bytearray(p.read_bytes())
     data[offset:offset + len(LIBXAUDIO_TARGET)] = LIBXAUDIO_REPLACEMENT
-    p.write_bytes(bytes(data))
+    _write_bytes(p, bytes(data))  # 原子写（P1-30），保留原文件权限
     after = p.read_bytes()
     if after[offset:offset + len(LIBXAUDIO_REPLACEMENT)] != LIBXAUDIO_REPLACEMENT:
         raise PatchError(f"校验失败：{p} 偏移 {offset} 处不是 noop")
@@ -650,8 +695,9 @@ def patch_certs(rootfs: Path, cert_dir: Path) -> list[str]:
     for name in CERT_FILES:
         src = cert_dir / name
         dst = dest / name
-        dst.write_bytes(src.read_bytes())
-        os.chmod(dst, 0o600 if name.endswith(".key") else 0o644)
+        # 原子写（P1-30）：证书 0644、私钥 0600。
+        _write_bytes(dst, src.read_bytes(),
+                     0o600 if name.endswith(".key") else 0o644)
         installed.append(f"{CERT_DEST_DIR}/{name}")
     # 校验：文件都在、PEM 头对、私钥权限 0600。
     for name in CERT_FILES:
@@ -687,19 +733,88 @@ def preflight(rootfs: Path, model: str, cert_dir: Path | None = None) -> None:
         check_certs(rootfs, cert_dir)
 
 
+# patch_all 可能改动的文件（P1-30 回滚快照用；新增文件记为不存在）。
+_PATCHED_FILES = (
+    "etc/init.d/dropbear",
+    "etc/shadow",
+    "etc/inittab",
+    "etc/pam.d/common-auth",
+    "bin/ota",
+    "bin/flash.sh",
+    "etc/init.d/wireless",
+    "etc/rc.local",
+    "etc/asound.conf",
+    "etc/asound.conf.dts",
+    "usr/lib/libxaudio_engine.so",
+)
+
+
+def _snapshot(rootfs: Path, model: str,
+              cert_dir: Path | None) -> dict[str, tuple[bytes | None, int | None]]:
+    """记下全部可能被改文件的原内容与权限；不存在记 (None, None)。"""
+    rels = list(_PATCHED_FILES)
+    if model != "lx06":
+        rels.remove("usr/lib/libxaudio_engine.so")
+    if cert_dir is not None:
+        rels += [f"{CERT_DEST_DIR}/{name}" for name in CERT_FILES]
+    snap: dict[str, tuple[bytes | None, int | None]] = {}
+    for rel in rels:
+        p = rootfs / rel
+        if p.is_file():
+            snap[rel] = (p.read_bytes(), p.stat().st_mode & 0o7777)
+        else:
+            snap[rel] = (None, None)
+    return snap
+
+
+def _restore(rootfs: Path, snap: dict[str, tuple[bytes | None, int | None]],
+             cert_dir: Path | None) -> None:
+    """把快照原样写回（原子写、恢复权限）；快照里不存在的文件删掉。"""
+    for rel, (data, mode) in snap.items():
+        p = rootfs / rel
+        if data is None:
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+        else:
+            _write_bytes(p, data, mode)
+    if cert_dir is not None:
+        # 证书目录是 patch_certs 新建的：快照前不存在且现已空就删掉。
+        try:
+            (rootfs / CERT_DEST_DIR).rmdir()
+        except OSError:
+            pass
+
+
 def patch_all(rootfs: Path, model: str, cert_dir: Path | None = None) -> dict:
     """先 preflight 再逐项应用。OH2P 跳过 libxaudio。返回每步的结果摘要。
 
     注意：返回里不含密码 hash（P0-2：hash 永不打印）；cert_dir 给出时
     另装 mTLS 客户端证书。
+    P1-30：任一步失败即把已改文件按快照恢复原样再抛错——失败的 patch_all
+    不留半打状态的 rootfs，重跑 patch.sh（或 patch_firmware.py）可直接重试。
     """
     model = model.lower()
     preflight(rootfs, model, cert_dir)
+    snap = _snapshot(rootfs, model, cert_dir)
+    try:
+        return _patch_all_apply(rootfs, model, cert_dir)
+    except Exception:
+        try:
+            _restore(rootfs, snap, cert_dir)
+        except Exception:
+            pass
+        raise
+
+
+def _patch_all_apply(rootfs: Path, model: str,
+                     cert_dir: Path | None = None) -> dict:
     result: dict = {}
     patch_ssh(rootfs)
     result["ssh"] = "dropbear 始终启动"
     patch_login(rootfs)
-    result["login"] = "root 密码已换 sha512crypt（$6$，随机盐）+ 串口 ash + PAM pam_unix"
+    result["login"] = "root 密码已换 sha512crypt（$6$，随机盐）+ 串口仍走密码登录 + PAM pam_unix"
     patch_disable_ota(rootfs)
     result["disable_ota"] = "bin/ota + flash.sh + wireless ota() 已禁"
     patch_start(rootfs)

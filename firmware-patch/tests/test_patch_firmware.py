@@ -2,6 +2,7 @@
 断言每个被改文件的改后内容；另断言前置条件不满足时失败且不写输出。
 """
 import hashlib
+import io
 import os
 import re
 import shutil
@@ -32,6 +33,8 @@ from patch_firmware import (
     patch_ssh,
     patch_start,
     sha512_crypt,
+    _write,
+    _write_bytes,
 )
 from conftest import FIRMWARE_ROOTFS, SCRIPTS, require_firmware_rootfs
 
@@ -158,8 +161,9 @@ def test_patch_login(patched_rootfs):
     assert hash_matches_password(TEST_SSH_PASSWORD, root_hash)
     assert "daemon:*:0:0:99999:7:::" in shadow  # 其他用户未动
     inittab = (patched_rootfs / "etc/inittab").read_text()
-    assert "ttyS0::askfirst:/bin/ash --login" in inittab
-    assert "ttyS0::askfirst:/bin/login" not in inittab
+    # P1-36：串口仍走 /bin/login（需 root 密码），不再是免密 ash。
+    assert "ttyS0::askfirst:/bin/login" in inittab
+    assert "ttyS0::askfirst:/bin/ash --login" not in inittab
     pam = (patched_rootfs / "etc/pam.d/common-auth").read_text()
     assert "# auth sufficient libmico-pam.so" in pam
     assert "# account sufficient libmico-pam.so" in pam
@@ -184,6 +188,26 @@ def test_patch_login_same_password_random_salt(tmp_path):
     h2 = patch_login(root2)
     assert h1 != h2
     assert h1.split("$")[2] != h2.split("$")[2]
+
+
+def test_patch_login_twice_on_sha512_shadow(tmp_path):
+    # 已打过补丁的 rootfs 重跑 patch_login 必须成功（幂等）。
+    # 旧代码两处失败：(1) shadow 第一次 subn（$[156]$ 全覆盖）的结果被紧接着的
+    # 重读文件丢弃，第二次 subn 只处理 $1$，$6$ 行必抛错；(2) check_login 只认
+    # 原厂 PAM 状态，已打过补丁的 rootfs 在前置检查就失败。latent bug，2026-11-17 修。
+    root = copy_rootfs(tmp_path / "rootfs")
+    h1 = patch_login(root)
+    assert h1.startswith("$6$")
+    h2 = patch_login(root)
+    assert h2.startswith("$6$")
+    assert h2 != h1  # 新盐、新 hash
+    assert f"root:{h2}:" in (root / "etc/shadow").read_text()
+    assert hash_matches_password(TEST_SSH_PASSWORD, h2)
+    # PAM 两次打补丁后仍是恰好一次注释、无双重注释。
+    pam = (root / "etc/pam.d/common-auth").read_text()
+    assert "# # auth sufficient" not in pam
+    assert "# # account sufficient" not in pam
+    assert "auth\t[success=1 default=ignore]\tpam_unix.so nullok_secure" in pam
 
 
 def test_patch_login_rejects_short_password(tmp_path, monkeypatch):
@@ -348,7 +372,9 @@ def test_patch_all_real_oh2p_rootfs(tmp_path):
     assert "period_size 480" not in dts
     assert "buffer_size 3840" not in dts
     inittab = (root / "etc/inittab").read_text()
-    assert inittab.count("ttyS0::askfirst:/bin/ash --login") == 1
+    # P1-36：串口仍走 /bin/login（需 root 密码），不再是免密 ash。
+    assert inittab.count("ttyS0::askfirst:/bin/login") == 1
+    assert "ttyS0::askfirst:/bin/ash --login" not in inittab
     shadow = (root / "etc/shadow").read_text()
     root_hash = shadow_root_hash(root)
     assert root_hash.startswith("$6$")
@@ -380,6 +406,59 @@ def test_patch_all_fails_on_missing_libxaudio_string(tmp_path):
     p.write_bytes(bytes(data))
     with pytest.raises(PatchError):
         patch_all(root, "lx06")
+
+
+# --- P1-30：patch_all 中途失败回滚 + _write 原子写 ---
+
+_PATCH_ALL_FILES = (
+    "etc/init.d/dropbear", "etc/shadow", "etc/inittab",
+    "etc/pam.d/common-auth", "bin/ota", "bin/flash.sh",
+    "etc/init.d/wireless", "etc/rc.local", "etc/asound.conf",
+    "etc/asound.conf.dts", "usr/lib/libxaudio_engine.so",
+)
+
+
+def test_patch_all_rolls_back_when_login_fails(tmp_path, monkeypatch):
+    """P1-30：patch_ssh 已写、patch_login 因缺密码失败时，全部文件恢复原样。
+
+    patch_login 在 patch_ssh 之后读密码：SSH_PASSWORD 未设且 stdin 非终端
+    时抛 PatchError；此时 dropbear 已被改过——回滚必须把它（及全部文件）
+    恢复成补丁前字节与权限，否则 rootfs 留在半打状态、重跑必失败。
+    """
+    root = copy_rootfs(tmp_path / "rootfs")
+    monkeypatch.delenv("SSH_PASSWORD", raising=False)
+    monkeypatch.setattr(sys, "stdin", io.StringIO())  # 保底：非终端
+    before = {rel: ((root / rel).read_bytes(), (root / rel).stat().st_mode)
+              for rel in _PATCH_ALL_FILES}
+    with pytest.raises(PatchError):
+        patch_all(root, "lx06")
+    after = {rel: ((root / rel).read_bytes(), (root / rel).stat().st_mode)
+             for rel in _PATCH_ALL_FILES}
+    assert after == before, "中途失败后文件未恢复原样（字节或权限变了）"
+    assert list(root.rglob("*.tmp")) == [], "回滚后不应残留临时文件"
+    # 回滚后可直接重跑（不再是半打状态）：补上密码即成功。
+    monkeypatch.setenv("SSH_PASSWORD", TEST_SSH_PASSWORD)
+    result = patch_all(root, "lx06")
+    assert result["libxaudio_offset"] == LIBXAUDIO_OFFSET
+
+
+def test_write_is_atomic_and_preserves_mode(tmp_path):
+    """P1-30：_write 经临时文件 + rename，不留 .tmp；原文件权限不变。"""
+    p = tmp_path / "dropbear"
+    p.write_bytes(b"original\n")
+    p.chmod(0o755)
+    _write(p, "patched\n")
+    assert p.read_bytes() == b"patched\n"
+    assert p.stat().st_mode & 0o777 == 0o755
+    assert list(tmp_path.glob("*.tmp")) == []
+    # 二进制写同样保留权限（libxaudio_engine.so 是 0664）。
+    q = tmp_path / "lib.so"
+    q.write_bytes(b"\x00\x01")
+    q.chmod(0o664)
+    _write_bytes(q, b"\x02\x03")
+    assert q.read_bytes() == b"\x02\x03"
+    assert q.stat().st_mode & 0o777 == 0o664
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
 def test_check_functions_raise_on_missing_rootfs(tmp_path):

@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"testing"
+	"time"
 )
 
 // FramePCM 与 Frame 走同一条 VAD/结算链路：已解码的 PCM 帧直接喂管线，
@@ -41,7 +42,8 @@ func TestFramePCMSameAsFrame(t *testing.T) {
 		if len(frames) != 50 {
 			t.Fatalf("onReply 应收到 50 帧 Opus，实际 %d 帧", len(frames))
 		}
-	default:
+	case <-time.After(2 * time.Second):
+		// P1-29：回答改为异步结算，这里等一等再断言。
 		t.Fatal("VAD 800ms 静音后未触发回答")
 	}
 }

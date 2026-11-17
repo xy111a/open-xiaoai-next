@@ -6,7 +6,7 @@ UGREEN DXP6800 Pro（UGOS + Docker）上跑 Hub + Whisper + Piper + Snapcast + M
 
 ```bash
 cd deploy
-cp .env.example .env   # 填 NAS_IP / HASS_TOKEN / LLM_API_KEY / OPEN_XIAOAI_TOKEN
+cp .env.example .env   # 填 NAS_IP / HASS_TOKEN / LLM_API_KEY / OPEN_XIAOAI_TOKEN / OPEN_XIAOAI_WEB_TOKEN
 docker compose up -d
 docker compose logs -f hub
 ```
@@ -22,7 +22,6 @@ NAS 上实际运行未验证）。
 | hub | 本地构建（deploy/Dockerfile.hub + 预编译二进制 deploy/hub-linux-amd64） | host | 唯一常驻服务，管仲裁/语音/音乐/HA/OTA |
 | whisper | rhasspy/wyoming-whisper | 10300 | small-int8，中文，beam-size 1 |
 | piper | rhasspy/wyoming-piper | 10200 | zh_CN-huayan-medium，流式合成 |
-| mosquitto | eclipse-mosquitto | 1883 | 预留：设备注册表 + HA 发现（Hub 当前代码里没有 MQTT 引用，不影响运行） |
 | snapserver | ivdata/snapserver | host | 多房间同步播放服务端 |
 | mpd | vimagick/mpd | host | 读 /volume1/music，写 snapfifo |
 | music-assistant | ghcr.io/music-assistant/server | 8095 | 网易云 provider；官方要求 host 网络做 mDNS 发现，见下文已知问题 |
@@ -47,9 +46,10 @@ NAS 上实际运行未验证）。
   3. netease-api 原来写 `binarytorch/neteasecloudmusicapi`，Docker Hub 查无此仓库（404）→
      改为官方镜像 `binaryify/netease_cloud_music_api`。
 - **镜像核实**（2026-11-17 逐个查 Docker Hub 页面 / 官方文档，见 `NAS_CHECKLIST.md` 末尾的表）：
-  存在：rhasspy/wyoming-whisper、rhasspy/wyoming-piper、eclipse-mosquitto（官方镜像，
-  latest = 2.1.2-alpine）、ivdata/snapserver、vimagick/mpd、ghcr.io/music-assistant/server、
+  存在：rhasspy/wyoming-whisper、rhasspy/wyoming-piper、
+  ivdata/snapserver、vimagick/mpd、ghcr.io/music-assistant/server、
   binaryify/netease_cloud_music_api；不存在：binarytorch/neteasecloudmusicapi（404）。
+  （eclipse-mosquitto 已删，见下文 2026-11-17 晚 P1 修复。）
 - **已知问题 / 未核实项**（NAS 上首次 `up` 时重点看）：
   - Hub 跑在 host 网络下，`hub/config.yaml` 里 netease 的 `music-assistant:8095` /
     `netease-api:3000` 这两个容器名解析不到；`nas-install.sh` 会在 NAS 副本上改成

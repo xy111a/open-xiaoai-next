@@ -232,8 +232,8 @@ ssh root@<音箱IP> 'echo "wss://<NAS_IP>:4399" > /data/open-xiaoai/server.txt'
 | 路径 | 内容 | 状态 |
 |---|---|---|
 | `client` | 客户端二进制（gnueabihf 默认产物，见上） | ✅ 已构建（2,444,332 字节，SHA256 e33dd0e575f15c1d61ae33a2d2679ef88284ff136535b268d1ca7f48e20ebd19，服务端唤醒模式后重编） |
-| `lib/libsherpa-onnx-c-api.so` | sherpa-onnx C API（KWS 后端，`$ORIGIN/lib` rpath 指向这里） | ⏳ 待定：**server 模式不需要**（默认部署可不装）；local 模式才需要。待 P1-40 的 .so 落定后补（官方预编译版要求 GLIBC_2.29，音箱只有 2.25，**不能直接用**；从源码重编是另一路的工作） |
-| `lib/libonnxruntime.so` | ONNX Runtime（sherpa 的依赖，只要求 GLIBC_2.4） | ⏳ 待定：**server 模式不需要**；local 模式才需要，待 P1-40 的 .so 落定后补 |
+| `lib/libsherpa-onnx-c-api.so` | sherpa-onnx C API（KWS 后端，`$ORIGIN/lib` rpath 指向这里） | ⏳ 待定：**server 模式不需要**（默认部署可不装）；local 模式才需要。待 P1-40 的 .so 落定后补（官方预编译版要求 GLIBC 最高 2.34，音箱只有 2.25，**不能直接用**；从源码重编是另一路的工作） |
+| `lib/libonnxruntime.so` | ONNX Runtime（sherpa 的依赖，**同样要求 GLIBC 最高 2.34**，不是早先写的 GLIBC_2.4） | ⏳ 待定：**server 模式不需要**；local 模式才需要，待 P1-40 的 .so 落定后补 |
 | `kws/<模型文件>` | kws-zipformer 模型（见 `kws/README.md` 下载脚本，模型文件不进仓库） | ⏳ **server 模式不需要**；local 模式部署时按脚本下载后拷贝 |
 | `client.toml` | 配置（见下示例） | 部署时写 |
 

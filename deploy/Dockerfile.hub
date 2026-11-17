@@ -7,10 +7,14 @@
 # 故不加 :ro；只读挂载下 Save 必然失败）。
 # 运行时依赖：二进制为动态链接 glibc（ldd 实测只依赖 libc/libm，Opus 已静态编入），
 # 不需要 libopus；但 LLM 走 HTTPS，需要 ca-certificates。
+# P1-4：FROM 未钉 digest——本机到 registry-1.docker.io 的 manifest 接口超时，
+# 无法可信解析 bookworm-slim 的 digest；钉死前先在能访问 Docker Hub 的机器上取。
 FROM debian:bookworm-slim
 
+# tzdata（P1-46）：compose 传 TZ=Asia/Shanghai，没有 zoneinfo 文件时 TZ 不生效、
+# 容器仍是 UTC；tzdata 让 Hub 容器真正用北京时间。
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 COPY hub-linux-amd64 /usr/local/bin/hub

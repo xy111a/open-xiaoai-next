@@ -41,8 +41,9 @@ devices:
 music_folder: /volume1/music
 
 # Home Assistant：Token 走环境变量 HASS_TOKEN，不要写进文件。
+# P1-5：用 wss（HA 须配 TLS）；若 bai 的 HA 未配 TLS，需改回 ws（见汇报）。
 home_assistant:
-  url: "ws://192.168.1.10:8123"
+  url: "wss://192.168.1.10:8123"
 
 # Agent（OpenAI 兼容 /v1/chat/completions）。密钥走环境变量，不要写进文件。
 agents:
@@ -84,9 +85,13 @@ hub:
   # P0-1：Web 面板只绑回环地址，远程管理走 SSH 隧道（不要改回 ":8080"）。
   web_listen: "127.0.0.1:8080"
   # scan_cidr 为空时自动取本机网段；本地测试可写 "127.0.0.1/32"
+  # （P1-44：自动扫描已删除，scan_cidr 保留但不再被使用，
+  # 设备改由 WS register 主动注册）。
   scan_cidr: ""
-  # 自动发现默认关闭（P0-4）：只有显式写 scan_enabled: true 才在启动时扫一次；
-  # 还须配 discovery_fingerprints（设备证书 SHA-256 指纹白名单），否则不发 Token。
+  # P1-44 注册制：设备在已有 WS 连接上发 register 主动注册，
+  # Hub 按 discovery_fingerprints（设备证书 SHA-256 指纹白名单）
+  # 校验后记为在线；白名单为空时注册一律拒绝。自动扫描已删除，
+  # scan_enabled 保留但不再触发任何扫描。
   # scan_enabled: false
   # discovery_fingerprints: []
   # 勿扰时段（FR-10 主动播报跳过该时段）

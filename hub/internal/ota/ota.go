@@ -54,11 +54,22 @@ type Manager struct {
 	jobs map[string]*Job // key 是设备 ID
 	// VerifyTimeout 是等新版本 hello 的超时（默认 30s）。
 	VerifyTimeout time.Duration
+	// PushTimeout 是 pushing 状态的最长停留（默认 10 分钟，P1-9）：
+	// 推送后设备一直不重启、不 hello，任务不能永远停在 pushing，
+	// Sweep 到期即标失败（回滚由设备端 boot1 保证，Hub 只记状态）。
+	PushTimeout time.Duration
 }
 
 // New 新建 Manager。
 func New() *Manager {
-	return &Manager{jobs: map[string]*Job{}, VerifyTimeout: 30 * time.Second}
+	return &Manager{jobs: map[string]*Job{}, VerifyTimeout: 30 * time.Second, PushTimeout: 10 * time.Minute}
+}
+
+func (m *Manager) pushTimeout() time.Duration {
+	if m.PushTimeout <= 0 {
+		return 10 * time.Minute
+	}
+	return m.PushTimeout
 }
 
 // Push 开始一次 OTA：校验参数并记录任务。
@@ -117,6 +128,8 @@ func (m *Manager) ConfirmHello(deviceID, version string) bool {
 }
 
 // Sweep 超时未验证的任务标记失败（回滚由设备端 boot1 保证，Hub 只记状态）。
+// P1-9：除 verifying 超时外，pushing 超过 PushTimeout 仍无进展的任务
+// 也标失败，不再永远停在 pushing。
 func (m *Manager) Sweep(now time.Time) []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -126,9 +139,26 @@ func (m *Manager) Sweep(now time.Time) []string {
 			j.Status = StatusFailed
 			j.Updated = now
 			failed = append(failed, id)
+			continue
+		}
+		if j.Status == StatusPushing && now.Sub(j.Started) > m.pushTimeout() {
+			j.Status = StatusFailed
+			j.Updated = now
+			failed = append(failed, id)
 		}
 	}
 	return failed
+}
+
+// List 返回全部任务的快照（P1-9：Web 面板 GET /api/ota 用）。
+func (m *Manager) List() []Job {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Job, 0, len(m.jobs))
+	for _, j := range m.jobs {
+		out = append(out, *j)
+	}
+	return out
 }
 
 // Get 取任务状态。

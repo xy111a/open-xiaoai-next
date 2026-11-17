@@ -1,23 +1,26 @@
-// Package discovery 是设备自动发现：Hub 启动时扫描局域网，
-// 找到音箱的 IP 和型号，写入 Device Registry。不用手填 IP。
+// Package discovery 是设备指纹验证工具：手动验证一台候选设备的
+// 证书指纹与型号，不做自动扫描。
 //
-// P0-4 安全模型（重做后）：
-//   - 扫描默认关闭：Scanner.Enabled 为 false 时 Scan 直接拒绝，
-//     需调用方显式开启并传入限定的 scan_cidr。
-//   - 先匿名探测、后发 Token：ProbeFingerprint 只做 TLS 握手，
-//     不发任何应用层数据、更不发 Token；对端证书的 SHA-256 指纹
-//     必须在 Scanner.ExpectedFingerprints 白名单内，才建 wss 连接
-//     发 hello + Token。指纹不匹配、未配置白名单、一律不发 Token。
-//   - 全程 wss + 指纹校验：不用 InsecureSkipVerify。探测分两步：
-//     (1) 原始 TLS 握手拿对端证书（自签证书会以
-//     CertificateVerificationError 形式带回未验证证书），算指纹比对；
-//     (2) 指纹匹配后，用该证书建 RootCAs 池、取证书 SAN 作 ServerName
-//     重新拨号，做完整链验证后再发 hello。
-//   - Token 永不进日志与错误信息。
+// P1-44 安全模型（注册制，2026-11-17）：自动扫描已删除——Hub 不再主动
+// 扫网段找音箱，改由音箱在已有 WS 连接上发 register 主动注册，Hub 按
+// 指纹白名单校验后记为在线。本包只保留手动验证工具：
+//   - ProbeFingerprint：匿名探测一台指定 IP 的证书指纹，不发 Token；
+//   - ProbeModel：指纹在白名单内时建 wss 连接发 hello，确认型号。
+//
+// 先匿名探测、后发 Token：对端证书的 SHA-256 指纹必须在
+// Scanner.ExpectedFingerprints 白名单内，才建 wss 连接发 hello + Token。
+// 指纹不匹配、未配置白名单，一律不发 Token。
+// 全程 wss + 指纹校验：不用 InsecureSkipVerify。探测分两步：
+//
+//	(1) 原始 TLS 握手拿对端证书（自签证书会以
+//	CertificateVerificationError 形式带回未验证证书），算指纹比对；
+//	(2) 指纹匹配后，用该证书建 RootCAs 池、取证书 SAN 作 ServerName
+//	重新拨号，做完整链验证后再发 hello。
+//
+// Token 永不进日志与错误信息。
 package discovery
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -27,21 +30,19 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-// Device 是扫描到的一台候选设备。
+// Device 是一台手动确认的候选设备。
 type Device struct {
 	IP    string
 	Model string // lx06 / oh2p
 }
 
-// Scanner 是扫描器。
+// Scanner 是手动指纹验证器（P1-44：不再是扫描器）。
 type Scanner struct {
 	// Port 是 Client 接入端口，默认 4399；调用方应取 cfg.Hub.Listen 的端口，
 	// 不要写死（见 P0-4：端口取 cfg.Hub.Listen）。
@@ -53,15 +54,12 @@ type Scanner struct {
 	// TLS 为 true 时用 wss 握手。必须为 true；false 时拒绝探测
 	// （明文扫描不发送 Token，也不做身份校验）。
 	TLS bool
-	// Enabled 是扫描总开关，默认 false：Scan 未显式开启即拒绝。
-	Enabled bool
 	// ExpectedFingerprints 是允许的设备证书 SHA-256 指纹白名单
 	// （小写 hex，冒号可有可无）。为空时拒绝发 Token。
 	ExpectedFingerprints []string
 }
 
-// New 新建 Scanner。注意：扫描默认关闭（Enabled=false），
-// 调用方需显式置 Enabled=true 并配好 ExpectedFingerprints 才能扫描。
+// New 新建 Scanner（手动验证用，不扫描）。
 func New(port int, token string) *Scanner {
 	return &Scanner{Port: port, Token: token, Timeout: 2 * time.Second}
 }
@@ -207,117 +205,4 @@ func (s *Scanner) ProbeModel(ctx context.Context, ip, model string) (string, err
 		return "", fmt.Errorf("rejected: %s", resp.Reason)
 	}
 	return resp.DeviceID, nil
-}
-
-// arpNeighbors 读 /proc/net/arp 的邻居 IP。
-func arpNeighbors() []string {
-	f, err := os.Open("/proc/net/arp")
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-	var out []string
-	sc := bufio.NewScanner(f)
-	sc.Scan() // 表头
-	for sc.Scan() {
-		fields := strings.Fields(sc.Text())
-		if len(fields) >= 1 {
-			if ip := net.ParseIP(fields[0]); ip != nil {
-				out = append(out, fields[0])
-			}
-		}
-	}
-	return out
-}
-
-// hostsInCIDR 展开一个网段内的全部主机 IP（/24 约 254 个；更大网段只取前 1024 个）。
-func hostsInCIDR(cidr string) []string {
-	_, ipnet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return nil
-	}
-	var out []string
-	ip := ipnet.IP.Mask(ipnet.Mask)
-	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
-		out = append(out, ip.String())
-		if len(out) >= 1024 {
-			break
-		}
-	}
-	return out
-}
-
-func inc(ip net.IP) {
-	for j := len(ip) - 1; j >= 0; j-- {
-		ip[j]++
-		if ip[j] > 0 {
-			break
-		}
-	}
-}
-
-// Scan 扫一遍：ARP 邻居 + 网段展开，去重后并发握手，返回确认的设备。
-// 默认关闭：Enabled=false 或 cidr 为空/非内网网段时直接拒绝。
-// ctx 超时即停止。每个 IP 先试 lx06 再试 oh2p。
-func (s *Scanner) Scan(ctx context.Context, cidr string) ([]Device, error) {
-	if !s.Enabled {
-		return nil, fmt.Errorf("discovery: 扫描默认关闭，需显式开启（Scanner.Enabled=true）")
-	}
-	if cidr == "" {
-		return nil, fmt.Errorf("discovery: 扫描需显式限定 scan_cidr")
-	}
-	if _, ipnet, err := net.ParseCIDR(cidr); err != nil {
-		return nil, fmt.Errorf("discovery: scan_cidr 不是合法 CIDR：%q", cidr)
-	} else if ip := ipnet.IP; !(ip.IsPrivate() || ip.IsLoopback()) {
-		return nil, fmt.Errorf("discovery: scan_cidr 必须是内网网段，实际是 %q", cidr)
-	}
-	candidates := map[string]bool{}
-	for _, ip := range arpNeighbors() {
-		candidates[ip] = true
-	}
-	for _, ip := range hostsInCIDR(cidr) {
-		candidates[ip] = true
-	}
-	// 自己的 IP 不扫。
-	if addrs, err := net.InterfaceAddrs(); err == nil {
-		for _, a := range addrs {
-			if ipnet, ok := a.(*net.IPNet); ok {
-				delete(candidates, ipnet.IP.String())
-			}
-		}
-	}
-	var (
-		mu    sync.Mutex
-		found []Device
-		sem   = make(chan struct{}, 32)
-		wg    sync.WaitGroup
-	)
-	for ip := range candidates {
-		ip := ip
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				return
-			}
-			for _, model := range []string{"lx06", "oh2p"} {
-				if _, err := s.ProbeModel(ctx, ip, model); err == nil {
-					mu.Lock()
-					found = append(found, Device{IP: ip, Model: model})
-					mu.Unlock()
-					return
-				}
-			}
-		}()
-	}
-	done := make(chan struct{})
-	go func() { wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-ctx.Done():
-	}
-	return found, nil
 }

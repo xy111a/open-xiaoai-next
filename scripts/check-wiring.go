@@ -64,10 +64,8 @@ var table = []entry{
 	{"arbitration.New", `arbitration\.New\s*\(`, "", `arbitration\.New\s*\(`, `New\s*\(`, "internal/arbitration", "仲裁器接线"},
 	{"reminders.New", `reminders\.New\s*\(`, "", `reminders\.New\s*\(`, `New\s*\(`, "internal/reminders", "提醒存储接线"},
 	{"registry.New", `registry\.New\s*\(`, "", `registry\.New\s*\(`, `New\s*\(`, "internal/registry", "设备注册表接线"},
-	{"discovery.New", `discovery\.New\s*\(`, "", `discovery\.New\s*\(`, `New\s*\(`, "internal/discovery", "自动发现接线"},
-	{"discovery Scan 调用", `\.Scan\s*\(`, "internal/discovery", `Scan\s*\(`, `Scan\s*\(`, "internal/discovery", "AUDIT P0-4：启动扫描须真实调用"},
 	{"ha.Dial", `ha\.Dial\s*\(`, "", `Dial\s*\(`, `Dial\s*\(`, "internal/ha", "HA 连接"},
-	{"wyoming.Dial (STT/TTS)", `wyoming\.Dial\s*\(`, "", `Dial\s*\(`, `Dial\s*\(`, "internal/wyoming", "AUDIT P1-2：STT/TTS 拨号"},
+	{"wyoming.NewDialer (STT/TTS 懒拨号)", `wyoming\.NewDialer\s*\(`, "", `NewDialer\s*\(`, `NewDialer\s*\(`, "internal/wyoming", "AUDIT P1-2/P1-27：STT/TTS 懒拨号接线（旧 wyoming.Dial 已随 P1-27 改为 NewDialer）"},
 	{"agent.New", `agent\.New\s*\(`, "", `agent\.New\s*\(`, `New\s*\(`, "internal/agent", "Agent 客户端"},
 	{"music.NewMA", `music\.NewMA\s*\(`, "", `NewMA\s*\(`, `NewMA\s*\(`, "internal/music", "Music Assistant 客户端"},
 	{"music.NewNetease", `music\.NewNetease\s*\(`, "", `NewNetease\s*\(`, `NewNetease\s*\(`, "internal/music", "网易云客户端"},
@@ -77,7 +75,7 @@ var table = []entry{
 	{"ota.ConfirmHello 调用", `ConfirmHello\s*\(`, "internal/ota", `ConfirmHello\s*\(`, `ConfirmHello\s*\(`, "internal/ota", "AUDIT P1-9：hello 成功后必须调 ConfirmHello，否则 OTA 永远 pushing"},
 	{"ota.MarkRebooted 调用", `MarkRebooted\s*\(`, "internal/ota", `MarkRebooted\s*\(`, `MarkRebooted\s*\(`, "internal/ota", "AUDIT P1-9：OTA 下发后须标记重启"},
 	{"ota.Sweep 定时调用", `otaMgr\.Sweep\s*\(`, "internal/ota", `Sweep\s*\(`, `Sweep\s*\(`, "internal/ota", "AUDIT P1-9：须有定时器调 otaMgr.Sweep，否则超时任务永不失败"},
-	{"intercom.Start 触发", `intercom\.Start\s*\(`, "internal/intercom", `Start\s*\(`, `Start\s*\(`, "internal/intercom", "AUDIT P1-15：须有 Router 分支/入口调 intercom.Start，否则对讲零触发"},
+	{"intercom.Start 触发", `Intercom\.Start\s*\(`, "internal/intercom", `Start\s*\(`, `Start\s*\(`, "internal/intercom", "AUDIT P1-15：须有 Router 分支/入口调 Intercom.Start，否则对讲零触发（Router 经 r.deps.Intercom 接口调用，故匹配大写 Intercom.Start）"},
 	{"intercom.Sweep 定时调用", `intercom\.Sweep\s*\(`, "internal/intercom", `Sweep\s*\(`, `Sweep\s*\(`, "internal/intercom", "AUDIT P1-15：须有定时器调 intercom.Sweep，否则空闲会话永不超时"},
 }
 
@@ -85,13 +83,11 @@ var table = []entry{
 // bai 2026-11-17 批复）：生产代码里目前确实没有这些调用，检查时跳过
 // FAIL、只打印 DEFERRED 提醒。条目保留在上面的检查表里（不要删），
 // 第一关口后接线完成再从本表摘掉，检查即恢复为 FAIL。
-var deferredWiring = map[string]string{
-	"ota.ConfirmHello 调用": "P1-9：hello 成功后调 ConfirmHello（OTA 状态机闭环）",
-	"ota.MarkRebooted 调用": "P1-9：OTA 下发后标记重启",
-	"ota.Sweep 定时调用":      "P1-9：定时调 otaMgr.Sweep，超时任务才失败",
-	"intercom.Start 触发":   "P1-15：Router 分支/入口调 intercom.Start（对讲触发）",
-	"intercom.Sweep 定时调用": "P1-15：定时调 intercom.Sweep，空闲会话才超时清理",
-}
+//
+// 2026-11-17 P1 全量修复后本表已空：P1-9（ota.ConfirmHello/MarkRebooted/Sweep）
+// 与 P1-15（intercom.Start/Sweep）的接线均已落地，5 个旧条目随之摘掉。
+// 机制保留，供将来再有暂缓接线时使用。
+var deferredWiring = map[string]string{}
 
 func main() {
 	hubDir := flag.String("hub", "hub", "hub 目录（相对仓库根或绝对路径）")

@@ -12,6 +12,7 @@
 package alerts
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -187,6 +188,10 @@ type Watcher struct {
 	dnd    string
 	speak  func(text string)
 
+	// mu 保护 client/started：看门狗 Rebind 与事件读循环并发访问。
+	mu      sync.Mutex
+	started bool
+
 	// nowMu 保护时钟：读循环 goroutine 读 Now，调用方可能随后换时钟，
 	// 直接读写字段会数据竞争，所以经 SetNow/now 加锁访问。
 	nowMu sync.RWMutex
@@ -214,11 +219,40 @@ func (w *Watcher) now() time.Time {
 	return time.Now()
 }
 
-// Start 订阅 state_changed，开始监听。
-func (w *Watcher) Start() error {
-	return w.client.SubscribeEvents("state_changed", func(ev map[string]any) {
+// handler 是 state_changed 事件处理闭包（Start 与 Rebind 共用）。
+func (w *Watcher) handler() func(ev map[string]any) {
+	return func(ev map[string]any) {
 		if text, ok := ShouldAnnounce(ev, w.dnd, w.now()); ok && w.speak != nil {
 			w.speak(text)
 		}
-	})
+	}
+}
+
+// Start 订阅 state_changed，开始监听。
+func (w *Watcher) Start() error {
+	w.mu.Lock()
+	w.started = true
+	c := w.client
+	w.mu.Unlock()
+	if c == nil {
+		return fmt.Errorf("alerts: HA 未连接，无法订阅")
+	}
+	return c.SubscribeEvents("state_changed", w.handler())
+}
+
+// Rebind 在 HA 断线重连后换客户端并重新订阅（P1-27：看门狗调）。
+// 旧客户端的订阅随其连接关闭而失效，必须在新客户端上重订，
+// 否则 HA 重连后摄像头监视就静默失效了。未 Start 过时只换客户端。
+func (w *Watcher) Rebind(c *ha.Client) error {
+	if c == nil {
+		return fmt.Errorf("alerts: Rebind 的 HA 客户端为 nil")
+	}
+	w.mu.Lock()
+	w.client = c
+	started := w.started
+	w.mu.Unlock()
+	if !started {
+		return nil
+	}
+	return c.SubscribeEvents("state_changed", w.handler())
 }

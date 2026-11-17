@@ -12,6 +12,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -35,9 +36,13 @@ var (
 )
 
 // Client 是一个 Wyoming 连接。
+// P1-20：同一连接上的读写必须串行——两台设备 + 提醒 goroutine 并发调
+// 同一 STT/TTS 连接时，旧代码读写交错（写事件 A 头 + 写事件 B 头再读
+// 回复，回复与请求错配）。mu 串行化整轮 Transcribe/Synthesize/Describe。
 type Client struct {
 	conn   net.Conn
 	reader *bufio.Reader
+	mu     sync.Mutex
 }
 
 // Dial 连上 Wyoming 服务（STT :10300 / TTS :10200）。
@@ -160,6 +165,12 @@ func (c *Client) writeEvent(header map[string]any, payload []byte) error {
 
 // Describe 拿服务信息（模型、语言等），用于连通性检查。
 func (c *Client) Describe() (map[string]any, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.describeLocked()
+}
+
+func (c *Client) describeLocked() (map[string]any, error) {
 	if err := writeWithDeadline(c.conn, 5*time.Second, func() error {
 		return c.writeEvent(map[string]any{"type": "describe"}, nil)
 	}); err != nil {
@@ -179,6 +190,8 @@ func (c *Client) Describe() (map[string]any, error) {
 // pcm 是小端 int16 字节流；name/language 按 faster-whisper 约定。
 // P1-1：整轮设 transcribeTimeout 上限；panic 转错误（不崩 Hub）。
 func (c *Client) Transcribe(pcm []byte, language string) (text string, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	defer func() {
 		if r := recover(); r != nil {
 			text = ""
@@ -231,6 +244,8 @@ func (c *Client) Transcribe(pcm []byte, language string) (text string, err error
 // P1-1：整轮设 synthesizeTimeout 上限；累积 PCM 超 MaxSynthesizeTotal 即
 // 报错（防服务端无限发 chunk 打满内存）；panic 转错误。
 func (c *Client) Synthesize(text, voice string) (pcm []byte, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	defer func() {
 		if r := recover(); r != nil {
 			pcm = nil
@@ -283,6 +298,121 @@ func Int16ToPCM(pcm []int16) []byte {
 		binary.LittleEndian.PutUint16(out[2*i:], uint16(v))
 	}
 	return out
+}
+
+// Dialer 是可重连的 Wyoming 客户端（P1-27）：
+// STT/TTS 断线后不再永久 nil——下次调用自动重拨，出错时丢弃旧连接
+// 再重拨重试一次。实现 voice.STT 与 voice.TTS 两个接口，main.go 用它
+// 代替直连的 *Client，Pipeline 与 speakText 不用改。
+// 注意：Dialer 不缓存“服务不可用”状态；下游一直挂时每次调用都试拨
+// 一次（拨号超时由 timeout 控制，默认 3s）。
+type Dialer struct {
+	addr    string
+	timeout time.Duration
+	mu      sync.Mutex
+	client  *Client
+}
+
+// NewDialer 新建 Dialer（只记地址，不拨号；首次调用时懒拨号）。
+func NewDialer(addr string, timeout time.Duration) *Dialer {
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	return &Dialer{addr: addr, timeout: timeout}
+}
+
+func (d *Dialer) get() (*Client, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.client != nil {
+		return d.client, nil
+	}
+	c, err := Dial(d.addr, d.timeout)
+	if err != nil {
+		return nil, err
+	}
+	d.client = c
+	return c, nil
+}
+
+// drop 丢弃指定的旧连接（只在它仍是当前连接时），下次调用重拨。
+func (d *Dialer) drop(c *Client) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.client == c {
+		_ = c.Close()
+		d.client = nil
+	}
+}
+
+// Close 关闭当前连接（下次调用重拨）。
+func (d *Dialer) Close() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.client == nil {
+		return nil
+	}
+	err := d.client.Close()
+	d.client = nil
+	return err
+}
+
+// Transcribe 识别：出错时丢旧连接、重拨重试一次。
+// 失败时错误带“STT 不可用”前缀（P1-27：语音管线的降级播报靠此识别）。
+func (d *Dialer) Transcribe(pcm []byte, language string) (string, error) {
+	c, err := d.get()
+	if err != nil {
+		return "", fmt.Errorf("STT 不可用（Wyoming 未连接）: %w", err)
+	}
+	if c == nil {
+		return "", fmt.Errorf("STT 不可用（Wyoming 未连接）: 连接为空")
+	}
+	text, err := c.Transcribe(pcm, language)
+	if err == nil {
+		return text, nil
+	}
+	d.drop(c)
+	c2, err := d.get()
+	if err != nil {
+		return "", fmt.Errorf("STT 不可用（Wyoming 未连接）: %w", err)
+	}
+	if c2 == nil {
+		return "", fmt.Errorf("STT 不可用（Wyoming 未连接）: 连接为空")
+	}
+	text, err = c2.Transcribe(pcm, language)
+	if err != nil {
+		return "", fmt.Errorf("STT 不可用: %w", err)
+	}
+	return text, nil
+}
+
+// Synthesize 合成：出错时丢旧连接、重拨重试一次。
+// 失败时错误带“TTS 不可用”前缀（P1-27：语音管线的降级播报靠此识别）。
+func (d *Dialer) Synthesize(text, voice string) ([]byte, error) {
+	c, err := d.get()
+	if err != nil {
+		return nil, fmt.Errorf("TTS 不可用（Wyoming 未连接）: %w", err)
+	}
+	if c == nil {
+		return nil, fmt.Errorf("TTS 不可用（Wyoming 未连接）: 连接为空")
+	}
+	out, err := c.Synthesize(text, voice)
+	if err == nil {
+		return out, nil
+	}
+	d.drop(c)
+	c2, err := d.get()
+	if err != nil {
+		return nil, fmt.Errorf("TTS 不可用（Wyoming 未连接）: %w", err)
+	}
+	if c2 == nil {
+		return nil, fmt.Errorf("TTS 不可用（Wyoming 未连接）: 连接为空")
+	}
+	out, err = c2.Synthesize(text, voice)
+	if err != nil {
+		return nil, fmt.Errorf("TTS 不可用: %w", err)
+	}
+	return out, nil
 }
 
 func writeWithDeadline(conn net.Conn, d time.Duration, fn func() error) error {

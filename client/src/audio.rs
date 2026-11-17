@@ -162,6 +162,14 @@ pub trait AudioDevice: Send {
     fn play(&mut self, pcm: &[i16]) -> Result<()>;
     /// 一行状态描述（设备名 + 打开结果），供日志/诊断用。
     fn describe(&self) -> String;
+    /// 设置播放音量（0–100）。默认实现返回明确错误（该设备不支持调音量）；
+    /// P1-N1：`set_volume` RPC 绝不谎报成功——混音器调不到就必须让调用方
+    /// 收到 Err，而不是静默接受。真实 ALSA 设备见 `AlsaAudioDevice`。
+    fn set_volume(&mut self, _volume: u8) -> Result<()> {
+        Err(anyhow!(
+            "volume control not supported by this audio device (no ALSA mixer)"
+        ))
+    }
 }
 
 /// 无可用音频硬件（或编译时未开 `alsa` feature）：采集/播放一律返回
@@ -202,6 +210,15 @@ impl AudioDevice for NoAudioDevice {
 /// 记下原因，`capture`/`play` 用到时才返回带设备名的明确错误。
 /// 构造器本身永不因缺硬件失败——`Audio::open()` 在无硬件机器上也成功，
 /// 保持 Phase 1 冒烟行为（录音任务记日志退出，主循环继续跑传输）。
+///
+/// P0-N1（2026-11-17）：`hw` PCM 设备是独占的——两个 `Audio` 实例各开一次
+/// `hw:0,0` + `hw:0,2` 时，第二路 `snd_pcm_open` 大概率 EBUSY，会话的
+/// `playback` 为 None，TTS/对讲/提醒全部静默丢弃。因此按需打开：
+/// `Audio::open_capture_only`（录音任务）与 `Audio::open_playback_only`
+/// （会话）各只打开自己用的方向（经由本结构的 `open_selected`），未请求
+/// 的方向在 `describe` 里标为 `not requested`，`capture`/`play` 调到它时
+/// 返回明确错误。`main.rs` 必须用这两个构造器，禁止录音任务
+/// 与会话各调一次 `open_devices`（见 `Audio::open_capture_only` 的文档）。
 #[cfg(feature = "alsa")]
 pub struct AlsaAudioDevice {
     capture: Option<alsa::pcm::PCM>,
@@ -210,34 +227,118 @@ pub struct AlsaAudioDevice {
     playback_err: Option<String>,
     capture_dev: String,
     playback_dev: String,
+    /// 本实例是否请求了采集方向（false = 根本没打开，见 P0-N1）。
+    want_capture: bool,
+    /// 本实例是否请求了播放方向（false = 根本没打开，见 P0-N1）。
+    want_playback: bool,
 }
 
 #[cfg(feature = "alsa")]
 impl AlsaAudioDevice {
     /// 打开采集 + 播放设备（各路失败只记录，不整体失败）。
+    /// 非测试构建里无生产调用（生产走 `Audio::open_*` → `open_selected`），
+    /// 但 `alsa_open_bogus_device_reports_clear_error` 测试用它；保留。
+    #[allow(dead_code)]
     pub fn open_devices(capture_dev: &str, playback_dev: &str) -> Self {
-        let (capture, capture_err) = match open_pcm(capture_dev, alsa::Direction::Capture) {
-            Ok(p) => (Some(p), None),
-            Err(e) => {
-                tracing::warn!("ALSA capture device {capture_dev} open failed: {e}");
-                (None, Some(e))
-            }
+        Self::open_selected(Some(capture_dev), Some(playback_dev))
+    }
+
+    /// 按需打开：`None` 的方向不打开（`want_* = false`，`describe` 标
+    /// `not requested`）；`Some` 的方向打开失败只记录、不整体失败。
+    fn open_selected(capture_dev: Option<&str>, playback_dev: Option<&str>) -> Self {
+        let (capture, capture_err) = match capture_dev {
+            Some(dev) => match open_pcm(dev, alsa::Direction::Capture) {
+                Ok(p) => (Some(p), None),
+                Err(e) => {
+                    tracing::warn!("ALSA capture device {dev} open failed: {e}");
+                    (None, Some(e))
+                }
+            },
+            None => (None, None),
         };
-        let (playback, playback_err) = match open_pcm(playback_dev, alsa::Direction::Playback) {
-            Ok(p) => (Some(p), None),
-            Err(e) => {
-                tracing::warn!("ALSA playback device {playback_dev} open failed: {e}");
-                (None, Some(e))
-            }
+        let (playback, playback_err) = match playback_dev {
+            Some(dev) => match open_pcm(dev, alsa::Direction::Playback) {
+                Ok(p) => (Some(p), None),
+                Err(e) => {
+                    tracing::warn!("ALSA playback device {dev} open failed: {e}");
+                    (None, Some(e))
+                }
+            },
+            None => (None, None),
         };
         Self {
             capture,
             capture_err,
             playback,
             playback_err,
-            capture_dev: capture_dev.to_string(),
-            playback_dev: playback_dev.to_string(),
+            capture_dev: capture_dev.unwrap_or(CAPTURE_DEVICE_DEFAULT).to_string(),
+            playback_dev: playback_dev.unwrap_or(PLAYBACK_DEVICE_DEFAULT).to_string(),
+            want_capture: capture_dev.is_some(),
+            want_playback: playback_dev.is_some(),
         }
+    }
+
+    /// 一路设备在 `describe` 里的状态词：未请求 / 已打开 / 打开失败（带原因）。
+    fn describe_side(open: bool, wanted: bool, err: &Option<String>) -> String {
+        if !wanted {
+            "not requested".to_string()
+        } else if open {
+            "open".to_string()
+        } else {
+            format!("FAILED: {}", err.as_deref().unwrap_or("?"))
+        }
+    }
+
+    /// P1-N1：真调 ALSA 混音器（`hw:0`，回退 `default`），按名找第一个
+    /// 带播放音量的混音元素（`Master` → `PCM` → `Speaker` → `Digital`），
+    /// 把 0–100 线性映射到该元素的音量范围并写进去；音量 >0 时若元素带
+    /// 播放开关且处于静音，一并取消静音（否则调了音量也听不出变化）。
+    /// 找不到可用混音器/元素时返回明确错误——调用方（`set_volume` RPC）
+    /// 必须把失败如实回给 Hub，绝不谎报成功。真机上哪个元素存在需实测
+    /// （BLOCKED：本 VM 无 /dev/snd，混音器名与元素名以真机为准）。
+    fn set_volume_via_mixer(&mut self, volume: u8) -> Result<()> {
+        const MIXER_NAMES: [&str; 2] = ["hw:0", "default"];
+        const ELEMENT_NAMES: [&str; 4] = ["Master", "PCM", "Speaker", "Digital"];
+        let mut tried: Vec<String> = Vec::new();
+        for mixer_name in MIXER_NAMES {
+            let mixer = match alsa::mixer::Mixer::new(mixer_name, false) {
+                Ok(m) => m,
+                Err(e) => {
+                    tried.push(format!("mixer {mixer_name}: open failed: {e}"));
+                    continue;
+                }
+            };
+            for elem_name in ELEMENT_NAMES {
+                let selem_id = alsa::mixer::SelemId::new(elem_name, 0);
+                let Some(selem) = mixer.find_selem(&selem_id) else {
+                    tried.push(format!("mixer {mixer_name}: no element {elem_name}"));
+                    continue;
+                };
+                if !selem.has_playback_volume() {
+                    tried.push(format!(
+                        "mixer {mixer_name}: element {elem_name} has no playback volume"
+                    ));
+                    continue;
+                }
+                let (min, max) = selem.get_playback_volume_range();
+                let target = min + (max - min) * i64::from(volume) / 100;
+                if volume > 0 && selem.has_playback_switch() {
+                    // 取消静音：失败也不致命（有的元素开关是只读的），忽略错误继续调音量。
+                    let _ = selem.set_playback_switch_all(1);
+                }
+                selem.set_playback_volume_all(target).map_err(|e| {
+                    anyhow!("ALSA mixer {mixer_name}/{elem_name}: set volume failed: {e}")
+                })?;
+                tracing::info!(
+                    "ALSA mixer: {mixer_name}/{elem_name} volume set to {volume}% (raw {target} in {min}..{max})"
+                );
+                return Ok(());
+            }
+        }
+        Err(anyhow!(
+            "ALSA mixer: no usable playback-volume element found (tried: {})",
+            tried.join("; ")
+        ))
     }
 }
 
@@ -282,6 +383,13 @@ fn open_pcm(device: &str, dir: alsa::Direction) -> std::result::Result<alsa::pcm
 #[cfg(feature = "alsa")]
 impl AudioDevice for AlsaAudioDevice {
     fn capture(&mut self) -> Result<[i16; FRAME_SAMPLES]> {
+        if !self.want_capture {
+            // P0-N1：本实例是 playback-only，未打开采集——不是硬件故障，
+            // 是调用方用错了实例（录音任务应用 capture-only 实例）。
+            return Err(anyhow!(
+                "ALSA capture not opened: this Audio instance was opened playback-only (P0-N1: use open_capture_only for recording)"
+            ));
+        }
         let pcm = self.capture.as_ref().ok_or_else(|| {
             anyhow!(
                 "ALSA capture unavailable: device {} open failed: {}",
@@ -329,6 +437,13 @@ impl AudioDevice for AlsaAudioDevice {
     }
 
     fn play(&mut self, pcm_samples: &[i16]) -> Result<()> {
+        if !self.want_playback {
+            // P0-N1：本实例是 capture-only，未打开播放——不是硬件故障，
+            // 是调用方用错了实例（会话应用 playback-only 实例）。
+            return Err(anyhow!(
+                "ALSA playback not opened: this Audio instance was opened capture-only (P0-N1: use open_playback_only for playback)"
+            ));
+        }
         let pcm = self.playback.as_ref().ok_or_else(|| {
             anyhow!(
                 "ALSA playback unavailable: device {} open failed: {}",
@@ -385,18 +500,20 @@ impl AudioDevice for AlsaAudioDevice {
         format!(
             "AlsaAudioDevice capture={} [{}] playback={} [{}]",
             self.capture_dev,
-            if self.capture.is_some() {
-                "open".to_string()
-            } else {
-                format!("FAILED: {}", self.capture_err.as_deref().unwrap_or("?"))
-            },
+            Self::describe_side(self.capture.is_some(), self.want_capture, &self.capture_err),
             self.playback_dev,
-            if self.playback.is_some() {
-                "open".to_string()
-            } else {
-                format!("FAILED: {}", self.playback_err.as_deref().unwrap_or("?"))
-            },
+            Self::describe_side(
+                self.playback.is_some(),
+                self.want_playback,
+                &self.playback_err
+            ),
         )
+    }
+
+    /// P1-N1：真调 ALSA 混音器（见 `set_volume_via_mixer`）。本 VM 无硬件时
+    /// 返回明确错误，调用方必须如实回给 Hub。
+    fn set_volume(&mut self, volume: u8) -> Result<()> {
+        self.set_volume_via_mixer(volume)
     }
 }
 
@@ -411,19 +528,43 @@ pub struct Audio {
 impl Audio {
     /// 打开默认设备（采集 `hw:0,0` / 播放 `hw:0,2`）。无硬件时仍成功，
     /// 只是 capture/play 会返回明确错误；Opus 初始化失败时才返回 Err。
+    /// P0-N1：禁止生产路径用本函数开两个实例（录音任务 + 会话各一次会
+    /// 双开 ALSA，第二路大概率 EBUSY）——录音任务用 `open_capture_only`，
+    /// 会话用 `open_playback_only`。本函数只保留给测试与单实例场景。
+    #[allow(dead_code)]
     pub fn open() -> Result<Self> {
         Self::open_devices(CAPTURE_DEVICE_DEFAULT, PLAYBACK_DEVICE_DEFAULT)
     }
 
+    /// 只打开采集设备（录音任务用，P0-N1）：不碰 `hw:0,2`，绝不与会话
+    /// 的播放实例抢设备。本实例调 `play`/`set_volume` 会返回明确错误
+    /// （未打开播放方向），不是硬件故障。
+    pub fn open_capture_only() -> Result<Self> {
+        Self::open_selected(Some(CAPTURE_DEVICE_DEFAULT), None)
+    }
+
+    /// 只打开播放设备（会话用，P0-N1）：不碰 `hw:0,0`，绝不与录音任务
+    /// 的采集实例抢设备。本实例调 `capture_pcm` 会返回明确错误（未打开
+    /// 采集方向），不是硬件故障。
+    pub fn open_playback_only() -> Result<Self> {
+        Self::open_selected(None, Some(PLAYBACK_DEVICE_DEFAULT))
+    }
+
     /// 打开指定设备名（供配置/测试覆盖默认设备名用）。两路各开各的，
-    /// 失败只记录、不整体失败。
+    /// 失败只记录、不整体失败。只被 `open()` 调用；测试与单实例场景保留。
+    #[allow(dead_code)]
     pub fn open_devices(capture_dev: &str, playback_dev: &str) -> Result<Self> {
+        Self::open_selected(Some(capture_dev), Some(playback_dev))
+    }
+
+    /// 按需打开：`None` 的方向根本不打开（见 P0-N1）。
+    fn open_selected(capture_dev: Option<&str>, playback_dev: Option<&str>) -> Result<Self> {
         #[cfg(feature = "alsa")]
         let device: Box<dyn AudioDevice> =
-            Box::new(AlsaAudioDevice::open_devices(capture_dev, playback_dev));
+            Box::new(AlsaAudioDevice::open_selected(capture_dev, playback_dev));
         #[cfg(not(feature = "alsa"))]
         let device: Box<dyn AudioDevice> = Box::new(NoAudioDevice::new(format!(
-            "binary built without the `alsa` feature (ARM cross build without musl libasound); requested capture={capture_dev} playback={playback_dev}"
+            "binary built without the `alsa` feature (ARM cross build without musl libasound); requested capture={capture_dev:?} playback={playback_dev:?}"
         )));
         let audio = Self {
             codec: OpusCodec::new()?,
@@ -472,6 +613,19 @@ impl Audio {
     #[allow(dead_code)]
     pub fn decode_opus(&mut self, opus: &[u8]) -> Result<Vec<i16>> {
         self.codec.decode_frame(opus)
+    }
+
+    /// 设置播放音量（0–100，P1-N1）：真调 ALSA 混音器；调不到时返回明确
+    /// 错误（无硬件/无可用混音元素/未打开播放方向），调用方必须如实回给 Hub。
+    pub fn set_volume(&mut self, volume: u8) -> Result<()> {
+        self.device.set_volume(volume)
+    }
+
+    /// 一行设备状态描述（供日志/诊断与 P0-N1 回归测试用）。
+    /// 只在测试里调用；生产日志走 `open_selected` 内的 `device.describe()`。
+    #[allow(dead_code)]
+    pub fn describe(&self) -> String {
+        self.device.describe()
     }
 }
 
@@ -633,6 +787,8 @@ mod tests {
     struct FakeAudioDevice {
         capture_queue: std::collections::VecDeque<[i16; FRAME_SAMPLES]>,
         played: Vec<i16>,
+        /// P1-N1：最近一次 set_volume 调用的值（None = 从未调过）。
+        last_volume: Option<u8>,
     }
 
     impl FakeAudioDevice {
@@ -640,6 +796,7 @@ mod tests {
             Self {
                 capture_queue: frames.into(),
                 played: Vec::new(),
+                last_volume: None,
             }
         }
     }
@@ -661,6 +818,11 @@ mod tests {
                 "FakeAudioDevice ({} frames queued)",
                 self.capture_queue.len()
             )
+        }
+
+        fn set_volume(&mut self, volume: u8) -> Result<()> {
+            self.last_volume = Some(volume);
+            Ok(())
         }
     }
 
@@ -728,5 +890,108 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("ALSA"), "unexpected error: {msg}");
         assert!(msg.contains("hw:0,0"), "error must name the device: {msg}");
+    }
+
+    // --- P0-N1：按需打开（录音任务只开采集、会话只开播放）---
+    //
+    // 本 VM 无 /dev/snd，真机 EBUSY 无法复现；这里断言的是结构级事实：
+    // 未请求的方向在 describe 里必须是 `not requested`（根本没调
+    // snd_pcm_open），而不是 `FAILED`（调了但打不开）或 `open`。
+    // 若有人把 main.rs 改回两路各调一次 Audio::open()，这两个测试即失败。
+    // EBUSY 本身是否在真机发生仍需真机确认（BLOCKED，见 AUDIT_ROUND2.md B1）。
+    #[test]
+    #[cfg(feature = "alsa")]
+    fn capture_only_audio_never_opens_playback_device() {
+        let audio = Audio::open_capture_only().unwrap();
+        let desc = audio.describe();
+        // 采集方向被请求过（本 VM 上打不开，FAILED 是预期的诚实结果）。
+        assert!(
+            desc.contains("capture=hw:0,0 [FAILED"),
+            "capture must have been attempted: {desc}"
+        );
+        // 播放方向根本没打开——不是 FAILED，是 not requested。
+        assert!(
+            desc.contains("playback=hw:0,2 [not requested]"),
+            "playback must never be opened by a capture-only instance: {desc}"
+        );
+        // 本实例调 play 应返回“未打开方向”的明确错误，而不是 EBUSY/硬件错。
+        let mut audio = audio;
+        let err = audio.play_frame(&[0u8; 4]).unwrap_err();
+        assert!(
+            err.to_string().contains("not opened"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "alsa")]
+    fn playback_only_audio_never_opens_capture_device() {
+        let audio = Audio::open_playback_only().unwrap();
+        let desc = audio.describe();
+        assert!(
+            desc.contains("capture=hw:0,0 [not requested]"),
+            "capture must never be opened by a playback-only instance: {desc}"
+        );
+        assert!(
+            desc.contains("playback=hw:0,2 [FAILED"),
+            "playback must have been attempted: {desc}"
+        );
+        let mut audio = audio;
+        let err = audio.capture_pcm().unwrap_err();
+        assert!(
+            err.to_string().contains("not opened"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "alsa")]
+    fn capture_only_and_playback_only_instances_coexist() {
+        // P0-N1 回归：录音任务（capture-only）与会话（playback-only）
+        // 共存时，两路各只打开自己用的方向，互不抢设备。
+        let cap = Audio::open_capture_only().unwrap();
+        let play = Audio::open_playback_only().unwrap();
+        assert!(cap.describe().contains("[not requested]"));
+        assert!(play.describe().contains("[not requested]"));
+        // 两实例共存本身不 panic、不互相影响各自的 describe。
+        assert!(cap.describe().contains("capture=hw:0,0 [FAILED"));
+        assert!(play.describe().contains("playback=hw:0,2 [FAILED"));
+    }
+
+    // --- P1-N1：set_volume 真调混音器，调不到就明确报错 ---
+    #[test]
+    fn set_volume_via_fake_device_records_value() {
+        // Fake 设备：set_volume 真正落到设备上（值被记录），不是只改内存数字。
+        let mut dev = FakeAudioDevice::with_frames(vec![]);
+        dev.set_volume(80).unwrap();
+        assert_eq!(dev.last_volume, Some(80));
+        // Audio 透传：Audio::set_volume 调到设备上（Ok 即证明未在 Audio 层短路）。
+        let mut audio = Audio::with_device(Box::new(FakeAudioDevice::with_frames(vec![]))).unwrap();
+        audio.set_volume(42).unwrap();
+    }
+
+    #[test]
+    fn set_volume_without_hardware_is_clear_error_not_fake_ok() {
+        // 无硬件（NoAudioDevice）：set_volume 必须返回明确错误，绝不能 Ok。
+        let mut audio = Audio::with_device(Box::new(NoAudioDevice::new(
+            "test: no hardware (NoAudioDevice)",
+        )))
+        .unwrap();
+        let err = audio.set_volume(80).unwrap_err();
+        assert!(
+            err.to_string().contains("not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "alsa")]
+    fn set_volume_without_hardware_reports_mixer_failure() {
+        // 本 VM 无 /dev/snd：混音器打不开，set_volume 必须返回带原因的
+        // 明确错误（真机上哪个混音元素存在需实测，BLOCKED）。
+        let mut audio = Audio::open_playback_only().unwrap();
+        let err = audio.set_volume(80).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ALSA mixer"), "unexpected error: {msg}");
     }
 }

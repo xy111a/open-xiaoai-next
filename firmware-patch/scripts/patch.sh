@@ -58,11 +58,29 @@ fail() {
 # 未经 fail() 的意外失败（set -e 触发）同样清理半成品镜像。
 trap 'rm -f "$OUT"; [ -n "$VERIFY_DIR" ] && rm -rf "$VERIFY_DIR"' ERR
 
+# P1-8：find 必须恰好命中一个；多个即失败（任选其一是任意的），
+# 零个也失败。只打印命中的唯一路径（与 unpack.sh 同款辅助函数）。
+find_exactly_one() {
+    local dir="$1" name="$2"
+    local -a hits
+    mapfile -t hits < <(find "$dir" -name "$name" 2>/dev/null)
+    if [ "${#hits[@]}" -eq 0 ]; then
+        return 1
+    fi
+    if [ "${#hits[@]}" -gt 1 ]; then
+        echo "找到多个 $name（${#hits[@]} 个），拒绝任选：" >&2
+        printf '  %s\n' "${hits[@]}" >&2
+        return 1
+    fi
+    printf '%s' "${hits[0]}"
+}
+
 # --- 前置：rootfs 与原始 root.squashfs 必须存在 ---
 [ -d "$SRC_ROOTFS" ] || fail "找不到 $SRC_ROOTFS，先跑 unpack.sh $MODEL $VERSION"
 ORIG_SQFS="$DIR/root.squashfs"
 if [ ! -f "$ORIG_SQFS" ]; then
-    ORIG_SQFS="$(find "$DIR"-extract -name 'root.squashfs' 2>/dev/null | head -1)"
+    ORIG_SQFS="$(find_exactly_one "$DIR-extract" 'root.squashfs')" \
+        || fail "找不到原始 root.squashfs（$DIR/root.squashfs 或 $DIR-extract 下恰好一个）"
 fi
 [ -n "$ORIG_SQFS" ] && [ -f "$ORIG_SQFS" ] || fail "找不到原始 root.squashfs（$DIR/root.squashfs 或 $DIR-extract 下）"
 
@@ -136,8 +154,8 @@ fi
 # 补丁标记抽查
 grep -q 'mkdir -p /data/etc/dropbear' "$VERIFY_DIR/rootfs/etc/init.d/dropbear" \
     || fail "验证失败：dropbear 未打补丁"
-grep -q 'ttyS0::askfirst:/bin/ash --login' "$VERIFY_DIR/rootfs/etc/inittab" \
-    || fail "验证失败：inittab 未打补丁"
+grep -q 'ttyS0::askfirst:/bin/login' "$VERIFY_DIR/rootfs/etc/inittab" \
+    || fail "验证失败：inittab 串口不是 /bin/login（P1-36：串口必须走密码登录）"
 grep -q 'slave.pcm Capture' "$VERIFY_DIR/rootfs/etc/asound.conf" \
     || fail "验证失败：asound.conf 未打补丁"
 if [ "$MODEL" = "lx06" ]; then

@@ -16,23 +16,6 @@ import (
 	"github.com/huajun/open-xiaoai-next/hub/internal/transport"
 )
 
-func TestHostsInCIDR(t *testing.T) {
-	got := hostsInCIDR("192.168.1.0/30")
-	if len(got) != 4 || got[0] != "192.168.1.0" || got[3] != "192.168.1.3" {
-		t.Fatalf("/30 应展开 4 个 IP，实际 %v", got)
-	}
-	if got := hostsInCIDR("192.168.1.5/32"); len(got) != 1 || got[0] != "192.168.1.5" {
-		t.Fatalf("/32 应只有自身，实际 %v", got)
-	}
-	if got := hostsInCIDR("not-a-cidr"); got != nil {
-		t.Fatalf("非法 CIDR 应返回 nil，实际 %v", got)
-	}
-	// /16 超大网段应截断到 1024。
-	if got := hostsInCIDR("10.0.0.0/16"); len(got) != 1024 {
-		t.Fatalf("/16 应截断到 1024 个，实际 %d", len(got))
-	}
-}
-
 // stubHandler 满足 transport.Handler（ProbeModel 只需要 hello 握手）。
 type stubHandler struct{}
 
@@ -198,65 +181,6 @@ func TestPlaintextRefused(t *testing.T) {
 	}
 	if n, _ := f.counts(); n != 0 {
 		t.Fatalf("明文模式不得建 WS 连接，实际 %d 次", n)
-	}
-}
-
-// P0-4：扫描默认关闭——未显式 Enabled 即拒绝。
-func TestScanDisabledByDefault(t *testing.T) {
-	port, fp := startFakeHubTLS(t, "secret")
-	sc := newScanner(port, "secret", fp)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if _, err := sc.Scan(ctx, "127.0.0.2/32"); err == nil {
-		t.Fatal("默认关闭的 Scan 应返回错误")
-	}
-	// 未限定 cidr 也拒绝（即使已开启）。
-	sc.Enabled = true
-	if _, err := sc.Scan(ctx, ""); err == nil {
-		t.Fatal("未限定 scan_cidr 的 Scan 应返回错误")
-	}
-	// 公网网段拒绝。
-	if _, err := sc.Scan(ctx, "8.8.8.0/24"); err == nil {
-		t.Fatal("公网 scan_cidr 的 Scan 应返回错误")
-	}
-}
-
-// Scan：127.0.0.2 不是本机接口 IP（lo 只有 127.0.0.1），
-// 假服务监听通配地址，所以连 127.0.0.2 能握手成功；
-// 而 127.0.0.1 是本机 IP 会被 Scan 主动跳过。
-func TestScanFindsLoopbackAliasWildcard(t *testing.T) {
-	cert, fp, err := tlscert.LoadOrCreate(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	reg := registry.New()
-	srv := transport.New("secret", reg, stubHandler{})
-	ln, err := net.Listen("tcp", ":0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	go func() { _ = srv.Serve(ln, &cert) }()
-	t.Cleanup(func() { ln.Close() })
-	port := ln.Addr().(*net.TCPAddr).Port
-
-	sc := newScanner(port, "secret", fp)
-	sc.Enabled = true
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	found, err := sc.Scan(ctx, "127.0.0.2/32")
-	if err != nil {
-		t.Fatalf("Scan: %v", err)
-	}
-	if len(found) != 1 || found[0].IP != "127.0.0.2" || found[0].Model != "lx06" {
-		t.Fatalf("Scan 应找到 127.0.0.2 的 lx06，实际 %+v", found)
-	}
-	// 本机 IP 被跳过：扫 127.0.0.1/32 应为空。
-	found, err = sc.Scan(ctx, "127.0.0.1/32")
-	if err != nil {
-		t.Fatalf("Scan 127.0.0.1: %v", err)
-	}
-	if len(found) != 0 {
-		t.Fatalf("Scan 本机 IP 应跳过，实际 %+v", found)
 	}
 }
 

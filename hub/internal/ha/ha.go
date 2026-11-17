@@ -14,6 +14,7 @@ package ha
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,18 +42,49 @@ type Client struct {
 	pending  map[int]chan resultMsg
 	handlers []func(event map[string]any)
 	done     chan struct{}
+
+	// writeMu 串行化同一连接上的所有写操作（P1-21）：gorilla websocket
+	// 禁止同一连接并发写；call() 与 SubscribeEvents() 分属不同 goroutine
+	// 时旧代码直接并发 WriteJSON，-race 下已复现竞态。
+	writeMu sync.Mutex
+}
+
+// writeJSON 是唯一写入口：持写锁 + 5 秒写 deadline。
+func (c *Client) writeJSON(v any) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return c.conn.WriteJSON(v)
 }
 
 // Dial 连上 HA（ws://host:8123/api/websocket），完成 auth 握手，并启动读循环。
+// P1-5：两次 ReadMessage 都带 timeout 上限（无 deadline 时对端只建连不说话
+// 即永久挂起）；空 token 直接报错，不发一次 auth 再失败。
 func Dial(url, token string, timeout time.Duration) (*Client, error) {
+	if strings.TrimSpace(token) == "" {
+		return nil, fmt.Errorf("ha: HASS_TOKEN 为空，拒绝无鉴权连接（HA 须配长期访问令牌）")
+	}
 	dialer := websocket.Dialer{HandshakeTimeout: timeout}
 	conn, _, err := dialer.Dial(url, nil)
 	if err != nil {
 		return nil, err
 	}
 	c := &Client{url: url, token: token, conn: conn, pending: map[int]chan resultMsg{}, done: make(chan struct{})}
-	// 等 auth_required，再发 auth。
+	// 等 auth_required，再发 auth。timeout<=0 表示不设读 deadline
+	//（测试调用 Dial(..., 0) 时沿用旧行为；生产传 5s）。
+	setHandshakeDeadline := func() {
+		if timeout > 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(timeout))
+		}
+	}
+	clearHandshakeDeadline := func() {
+		if timeout > 0 {
+			_ = conn.SetReadDeadline(time.Time{})
+		}
+	}
+	setHandshakeDeadline()
 	_, msg, err := conn.ReadMessage()
+	clearHandshakeDeadline()
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -64,11 +96,13 @@ func Dial(url, token string, timeout time.Duration) (*Client, error) {
 		conn.Close()
 		return nil, fmt.Errorf("ha: 期望 auth_required，实际 %s", string(msg))
 	}
-	if err := conn.WriteJSON(map[string]any{"type": "auth", "access_token": token}); err != nil {
+	if err := c.writeJSON(map[string]any{"type": "auth", "access_token": token}); err != nil {
 		conn.Close()
 		return nil, err
 	}
+	setHandshakeDeadline()
 	_, msg, err = conn.ReadMessage()
+	clearHandshakeDeadline()
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -152,7 +186,7 @@ func (c *Client) SubscribeEvents(eventType string, handler func(event map[string
 	c.seq++
 	id := c.seq
 	c.mu.Unlock()
-	if err := c.conn.WriteJSON(map[string]any{
+	if err := c.writeJSON(map[string]any{
 		"id": id, "type": "subscribe_events", "event_type": eventType,
 	}); err != nil {
 		return err
@@ -175,8 +209,12 @@ func (c *Client) call(msgType string, extra map[string]any) (json.RawMessage, er
 	for k, v := range extra {
 		m[k] = v
 	}
-	_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if err := c.conn.WriteJSON(m); err != nil {
+	if err := c.writeJSON(m); err != nil {
+		// P2-16（顺带）：写失败即删 pending，否则等待者永远等不到
+		// result、pending 表永久泄漏。
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
 		return nil, err
 	}
 	select {

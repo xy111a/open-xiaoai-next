@@ -35,13 +35,32 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 pub const STATUS_INTERVAL: Duration = Duration::from_secs(30);
 /// 重连退避：首次 100ms。
 pub const BACKOFF_INITIAL_MS: u64 = 100;
-/// 重连退避上限：1s。
-pub const BACKOFF_MAX_MS: u64 = 1000;
+/// 重连退避上限：30s（P1-43：旧上限 1s 让两台设备以 1 次/秒永重试，
+/// 无 jitter 还会同步成重连脉冲；30s 上限仍保证 Hub 恢复后 30s 内重连）。
+pub const BACKOFF_MAX_MS: u64 = 30_000;
 
-/// 指数退避：第 attempt 次重试（从 0 计）前等待的时长，100ms 起步翻倍，上限 1s。
+/// 指数退避：第 attempt 次重试（从 0 计）前等待的时长，100ms 起步翻倍，上限 30s，
+/// 再叠加 ±50% jitter（P1-43：用纳秒时钟取伪随机因子，避免两台设备同步
+/// 重连脉冲；无 rand 依赖，退避不需要密码学随机）。
+/// 返回值恒在 `[base/2, min(base*3/2, 30s)]` 内（base 为未抖动的翻倍值）。
 pub fn backoff_delay(attempt: u32) -> Duration {
-    let ms = BACKOFF_INITIAL_MS.saturating_mul(1u64 << attempt.min(10));
-    Duration::from_millis(ms.min(BACKOFF_MAX_MS))
+    let base_ms = BACKOFF_INITIAL_MS
+        .saturating_mul(1u64 << attempt.min(10))
+        .min(BACKOFF_MAX_MS);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let factor = 0.5 + (nanos % 1000) as f64 / 1000.0; // [0.5, 1.5)
+    Duration::from_millis((((base_ms as f64) * factor) as u64).min(BACKOFF_MAX_MS))
+}
+
+/// 鉴权失败是否属于“配置错，不应永重试”（P1-43）：Hub 明确拒绝 hello
+/// （Token 错）或本地弱 Token 检查失败。`connect_with_retry` 对这类错误
+/// 只重试 3 次，随后返回 Err、主循环非零退出。
+pub fn is_auth_rejection(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("hub rejected hello") || msg.contains("hub token is weak")
 }
 
 /// 一段 DER 证书的 SHA-256 指纹（小写 hex，不带冒号）。
@@ -216,6 +235,7 @@ pub fn validate_token(token: &str) -> Result<()> {
 ///   1. 环境变量 OPEN_XIAOAI_CLIENT_CERT / OPEN_XIAOAI_CLIENT_KEY（宿主机调试）；
 ///   2. /etc/open-xiaoai/tls/client.crt + client.key（固件补丁 --cert-dir 装入）；
 ///   3. /data/open-xiaoai/tls/client.crt + client.key（OTA/手动下发）。
+///
 /// 两文件必须同时存在才返回 Some；否则返回 None（无 mTLS 身份，
 /// 要求客户端证书的 Hub 会拒绝连接，见 build_tls_config 的警告）。
 pub fn client_identity_paths() -> Option<(PathBuf, PathBuf)> {
@@ -261,6 +281,7 @@ pub fn load_client_identity(
 ///   - 无指纹 → 系统根证书验证 + 警告（测试环境；生产 Hub 自签证书会验不过，
 ///     部署时必须配指纹）；
 ///   - 指纹格式非法 → 直接报错，拒绝用错指纹连接。
+///
 /// mTLS：找到客户端证书时带证书连接（Hub 开 RequireAndVerifyClientCert
 /// 才会放行）；找不到时不带证书并打警告（仅 Token 鉴权，见 P0-3）。
 pub fn build_tls_config(cfg: &Config) -> Result<Arc<ClientConfig>> {
@@ -311,7 +332,7 @@ pub fn build_tls_config_with_identity(
         }
         None => {
             warn!(
-                "tls: no hub_ca_fingerprint configured — skipping fingerprint check (test only!)"
+                "tls: no hub_ca_fingerprint configured — falling back to system root certificates (test only; a self-signed hub certificate will fail verification — production must set hub_ca_fingerprint, see P1-10)"
             );
             let mut roots = rustls::RootCertStore::empty();
             let native = rustls_native_certs::load_native_certs();
@@ -518,6 +539,37 @@ impl Transport {
         self.send_json(&text).await
     }
 
+    /// P1-44：向 Hub 注册本设备（连接建立后立即发，见 `connect_once`）。
+    /// 格式两边统一，不许擅自改：
+    /// `{"type":"register","device_id":"...","model":"lx06|oh2p","room":"...","fingerprint":"..."}`。
+    /// `device_id` 取 `hello_ok` 的分配值；`room` 未认领时填 `""`；
+    /// `fingerprint` 取 mTLS 客户端证书指纹，无证书时填 `""`。
+    pub async fn send_register(
+        &mut self,
+        device_id: &str,
+        model: &str,
+        room: Option<&str>,
+        fingerprint: &str,
+    ) -> Result<()> {
+        let text = json_text(
+            "register",
+            serde_json::json!({
+                "device_id": device_id,
+                "model": model,
+                "room": room.unwrap_or(""),
+                "fingerprint": fingerprint,
+            }),
+        );
+        self.send_json(&text).await
+    }
+
+    /// P1-44：心跳（每 30s 一次，与 `send_status` 同一节拍，见 run_session）。
+    /// 格式：`{"type":"heartbeat"}`。
+    pub async fn send_heartbeat(&mut self) -> Result<()> {
+        self.send_json(&json_text("heartbeat", serde_json::json!({})))
+            .await
+    }
+
     /// 回应 Hub 的 rpc。
     pub async fn send_rpc_result(&mut self, id: &str, ok: bool, error: Option<&str>) -> Result<()> {
         let mut body = serde_json::json!({ "id": id, "ok": ok });
@@ -614,6 +666,16 @@ pub enum RawFrame {
     Audio(Vec<u8>),
 }
 
+/// P1-44 register 的 `fingerprint`：mTLS 客户端证书 DER 的 SHA-256（小写 hex）。
+/// 无客户端证书时返回 None（register 里填 `""`，由 Hub 侧校验逻辑决定是否
+/// 接受；有证书的设备必须带指纹，Hub 可凭它把 `device_id` 与证书身份绑定）。
+/// 证书/私钥读失败时同样返回 None（不阻塞连接——指纹缺失由 Hub 侧判定）。
+pub fn client_cert_fingerprint() -> Option<String> {
+    let (cert_path, key_path) = client_identity_paths()?;
+    let (certs, _key) = load_client_identity(&cert_path, &key_path).ok()?;
+    certs.first().map(|c| sha256_fingerprint_hex(c.as_ref()))
+}
+
 /// 单次连接 + hello 握手（不重试）。鉴权失败（hello_reject）立即关闭并报错。
 /// 弱 Token（<16 位或常见值）在建连前直接拒绝，不发 hello。
 pub async fn connect_once(cfg: &Config) -> Result<Transport> {
@@ -684,11 +746,23 @@ pub async fn connect_once(cfg: &Config) -> Result<Transport> {
                 .and_then(|r| r.as_str())
                 .map(|s| s.to_string());
             info!("authenticated with hub, device_id={device_id}");
-            Ok(Transport {
+            let mut t = Transport {
                 ws,
-                device_id: Some(device_id),
-                room,
-            })
+                device_id: Some(device_id.clone()),
+                room: room.clone(),
+            };
+            // P1-44：连接建立后立即发 register（不在音箱上开新监听口，
+            // 只在已有 WS 连接上主动注册；之后每 30s 发 heartbeat，见
+            // run_session 的 status 节拍）。注册发送失败只记日志不断线
+            // （连接本身若已坏，下一次 IO 即会断线重连）。
+            let fingerprint = client_cert_fingerprint().unwrap_or_default();
+            if let Err(e) = t
+                .send_register(&device_id, &cfg.model, room.as_deref(), &fingerprint)
+                .await
+            {
+                warn!("send register failed: {e}");
+            }
+            Ok(t)
         }
         "hello_reject" => {
             let reason = v
@@ -705,14 +779,27 @@ pub async fn connect_once(cfg: &Config) -> Result<Transport> {
     }
 }
 
-/// 带指数退避重连的连接：一直重试直到握手成功（退避 100ms 起步，上限 1s）。
-/// 用于断线恢复；调用方应在 30s 内看到恢复（测试断言）。
+/// 带指数退避重连的连接：一直重试直到握手成功（退避 100ms 起步，上限 30s，
+/// ±50% jitter）。用于断线恢复；调用方应在 30s 内看到恢复（测试断言）。
+/// P1-43：鉴权失败（`hello_reject` / 弱 Token）只重试 3 次，随后返回 Err——
+/// Token 配错是配置错，不应 1 次/秒永重试刷屏；主循环收到该 Err 后非零退出。
+/// Ctrl-C 由主循环的 `select!` 监听（`connect_with_retry` 本身不监听信号，
+/// 主循环取消它即可中断退避等待）。
 pub async fn connect_with_retry(cfg: &Config) -> Result<Transport> {
     let mut attempt: u32 = 0;
+    let mut auth_failures: u32 = 0;
     loop {
         match connect_once(cfg).await {
             Ok(t) => return Ok(t),
             Err(e) => {
+                if is_auth_rejection(&e) {
+                    auth_failures += 1;
+                    if auth_failures >= 3 {
+                        return Err(anyhow!(
+                            "hub rejected authentication {auth_failures} times in a row, giving up (last: {e}); check the token in client.toml"
+                        ));
+                    }
+                }
                 let delay = backoff_delay(attempt);
                 warn!(
                     "connect attempt {} failed: {e} — retry in {delay:?}",
@@ -750,6 +837,7 @@ mod tests {
             model: "lx06".to_string(),
             ram_mb: 256,
             tls,
+            allow_insecure_ws: false,
             hub_ca_fingerprint: None,
             room: None,
         }
@@ -794,12 +882,21 @@ mod tests {
                         ))
                         .await;
                     // 保持连接：回显收到的文本帧，直到对端关闭或服务端停机。
+                    // register / heartbeat 是控制消息，真实 Hub 从不回显，
+                    // 这里也不回显（否则 connect_once 发的 register 回显会
+                    // 抢在 wake 回显前面，干扰鉴权测试）。
                     loop {
                         tokio::select! {
                             msg = ws.next() => {
                                 match msg {
                                     Some(Ok(Message::Text(t))) => {
-                                        let _ = ws.send(Message::Text(t)).await;
+                                        let kind = serde_json::from_str::<serde_json::Value>(&t)
+                                            .ok()
+                                            .and_then(|v| v.get("type").and_then(|x| x.as_str()).map(|s| s.to_string()))
+                                            .unwrap_or_default();
+                                        if kind != "register" && kind != "heartbeat" {
+                                            let _ = ws.send(Message::Text(t)).await;
+                                        }
                                     }
                                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                                     _ => {}
@@ -903,13 +1000,31 @@ mod tests {
     }
 
     #[test]
-    fn backoff_grows_then_caps_at_1s() {
-        assert_eq!(backoff_delay(0), Duration::from_millis(100));
-        assert_eq!(backoff_delay(1), Duration::from_millis(200));
-        assert_eq!(backoff_delay(2), Duration::from_millis(400));
-        assert_eq!(backoff_delay(3), Duration::from_millis(800));
-        assert_eq!(backoff_delay(4), Duration::from_millis(1000));
-        assert_eq!(backoff_delay(100), Duration::from_millis(1000));
+    fn backoff_grows_then_caps_at_30s_with_jitter() {
+        // P1-43：100ms 起步翻倍、上限 30s、±50% jitter。抖动用纳秒时钟取，
+        // 每次调用值不同，故断言区间而非精确值。
+        for _ in 0..20 {
+            let d0 = backoff_delay(0);
+            assert!(
+                d0 >= Duration::from_millis(50) && d0 <= Duration::from_millis(150),
+                "attempt 0 out of [50,150]ms: {d0:?}"
+            );
+            let d3 = backoff_delay(3);
+            assert!(
+                d3 >= Duration::from_millis(400) && d3 <= Duration::from_millis(1200),
+                "attempt 3 out of [400,1200]ms: {d3:?}"
+            );
+            let d100 = backoff_delay(100);
+            assert!(
+                d100 >= Duration::from_millis(15_000) && d100 <= Duration::from_millis(30_000),
+                "attempt 100 out of [15,30]s: {d100:?}"
+            );
+        }
+        // 上限：attempt 8 的基数 25.6s，抖动后仍 ≤30s；attempt 9 基数已超 30s。
+        for _ in 0..20 {
+            assert!(backoff_delay(8) <= Duration::from_millis(30_000));
+            assert!(backoff_delay(9) <= Duration::from_millis(30_000));
+        }
     }
 
     #[test]
@@ -1158,9 +1273,7 @@ mod tests {
         assert!(!is_weak_token("0123456789abcdef")); // 16 位
         assert!(!is_weak_token(TEST_TOKEN));
         assert!(validate_token(TEST_TOKEN).is_ok());
-        let err = validate_token("CHANGE_ME")
-            .err()
-            .expect("weak token must fail");
+        let err = validate_token("CHANGE_ME").expect_err("weak token must fail");
         assert!(err.to_string().contains("openssl rand -hex 16"));
     }
 
@@ -1310,6 +1423,168 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+        hub.abort();
+    }
+
+    // --- P1-11：客户端正确回 Pong（标准 WS Ping/Pong，不改协议）---
+    #[tokio::test]
+    async fn client_answers_server_ping_with_pong() {
+        use futures_util::{SinkExt, StreamExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        // Fake Hub：hello_ok 后先发 Ping，等客户端回 Pong（须带原 payload），
+        // 再发一条 wake_win 文本帧。
+        let hub = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let first = ws.next().await.unwrap().unwrap();
+            assert!(matches!(first, Message::Text(_)));
+            ws.send(txt(
+                serde_json::json!({"type": "hello_ok", "device_id": "ping-device", "room": "客厅"})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+            // register 是连接建立后立即发的第二条消息，先读掉它。
+            let second = ws.next().await.unwrap().unwrap();
+            assert!(matches!(second, Message::Text(_)));
+            ws.send(Message::Ping(b"ping-1".as_ref().into()))
+                .await
+                .unwrap();
+            let pong = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("client must answer Ping within 5s")
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(&pong, Message::Pong(p) if p.as_ref() == b"ping-1"),
+                "expected Pong with the Ping payload, got {pong:?}"
+            );
+            ws.send(txt(serde_json::json!({"type": "wake_win"}).to_string()))
+                .await
+                .unwrap();
+            // 保持连接，直到客户端关闭。
+            while let Some(msg) = ws.next().await {
+                if matches!(msg, Ok(Message::Close(_)) | Err(_)) {
+                    break;
+                }
+            }
+        });
+
+        let cfg = test_config(&format!("ws://{addr}"), TEST_TOKEN, false);
+        let mut t = connect_once(&cfg).await.expect("connect must pass");
+        // next_raw 内部消费 Ping 并回 Pong，返回的应是随后那条 wake_win。
+        let frame = tokio::time::timeout(Duration::from_secs(5), t.next_raw())
+            .await
+            .expect("next_raw must return within 5s")
+            .expect("next_raw must succeed");
+        match frame {
+            Some(RawFrame::Hub(HubMsg::WakeWin)) => {}
+            other => panic!("expected WakeWin after Ping, got {other:?}"),
+        }
+        t.close().await;
+        hub.abort();
+    }
+
+    // --- P1-44：register 立即发 + heartbeat 格式 ---
+    #[tokio::test]
+    async fn register_sent_immediately_after_hello_ok_and_heartbeat_shape() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let received_hub = received.clone();
+        let hub = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let first = ws.next().await.unwrap().unwrap();
+            assert!(matches!(first, Message::Text(_)));
+            // hello 里带 room=书房；hello_ok 分配 device_id。
+            ws.send(txt(
+                serde_json::json!({"type": "hello_ok", "device_id": "reg-device-1", "room": "书房"})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+            while let Some(msg) = ws.next().await {
+                match msg {
+                    Ok(Message::Text(t)) => {
+                        received_hub.lock().unwrap().push(t.to_string());
+                    }
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        let mut cfg = test_config(&format!("ws://{addr}"), TEST_TOKEN, false);
+        cfg.room = Some("书房".to_string());
+        let mut t = connect_once(&cfg).await.expect("connect must pass");
+        assert_eq!(t.device_id.as_deref(), Some("reg-device-1"));
+        // register 是 hello_ok 之后的第一条消息（格式两边统一，不许擅自改）。
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let got = received.lock().unwrap().clone();
+        assert!(
+            !got.is_empty(),
+            "hub must receive register right after hello_ok"
+        );
+        let reg: serde_json::Value = serde_json::from_str(&got[0]).unwrap();
+        assert_eq!(reg["type"], "register");
+        assert_eq!(reg["device_id"], "reg-device-1");
+        assert_eq!(reg["model"], "lx06");
+        assert_eq!(reg["room"], "书房");
+        assert!(
+            reg["fingerprint"].is_string(),
+            "register must carry a fingerprint field: {reg}"
+        );
+        // heartbeat 格式：{"type":"heartbeat"}。
+        t.send_heartbeat().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let got = received.lock().unwrap().clone();
+        assert!(
+            got.iter().any(|m| {
+                serde_json::from_str::<serde_json::Value>(m)
+                    .map(|v| v["type"] == "heartbeat")
+                    .unwrap_or(false)
+            }),
+            "hub must receive a heartbeat message; got: {got:?}"
+        );
+        t.close().await;
+        hub.abort();
+    }
+
+    // --- P1-43：鉴权失败重试 3 次后退出，不永重试 ---
+    #[tokio::test]
+    async fn connect_with_retry_gives_up_after_three_auth_rejections() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let hub = tokio::spawn(run_test_hub_ws(listener, TEST_TOKEN, shutdown_rx));
+        let _ = shutdown_tx;
+
+        // 强但错的 Token：每次都被 hello_reject，3 次后必须返回 Err
+        // （而不是 1 次/秒永重试）。
+        let bad = test_config(
+            &format!("ws://{addr}"),
+            "wrong-token-0123456789abcdef",
+            false,
+        );
+        let start = std::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(10), connect_with_retry(&bad))
+            .await
+            .expect("connect_with_retry must return within 10s")
+            .err()
+            .expect("bad token must give up after 3 rejections");
+        assert!(
+            is_auth_rejection(&err) || err.to_string().contains("3 times"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "gave up too slowly: {:?}",
+            start.elapsed()
+        );
         hub.abort();
     }
 }

@@ -31,6 +31,24 @@ WORK="${PATCH_WORK_DIR:-$HERE/work}"
 BIN="${OTA_BIN:-$WORK/${MODEL}_${VERSION}.bin}"
 OUT="$WORK/${MODEL}_${VERSION}"
 
+# P1-8：find 必须恰好命中一个；多个即失败（被篡改包 carve 出多个同名文件时
+# 任选其一是任意的），零个也失败。只打印命中的唯一路径。
+find_exactly_one() {
+    local dir="$1" name="$2"
+    local -a hits
+    mapfile -t hits < <(find "$dir" -name "$name" 2>/dev/null)
+    if [ "${#hits[@]}" -eq 0 ]; then
+        echo "解包失败：$dir 下没找到 $name" >&2
+        return 1
+    fi
+    if [ "${#hits[@]}" -gt 1 ]; then
+        echo "解包失败：$dir 下找到多个 $name（${#hits[@]} 个），拒绝任选：" >&2
+        printf '  %s\n' "${hits[@]}" >&2
+        return 1
+    fi
+    printf '%s' "${hits[0]}"
+}
+
 [ -f "$BIN" ] || { echo "找不到 $BIN，先跑 download-ota.py" >&2; exit 1; }
 mkdir -p "$WORK"
 
@@ -39,6 +57,11 @@ mkdir -p "$WORK"
 #    这里不另写一份哈希表（避免两处白名单漂移）。
 python3 "$HERE/scripts/download-ota.py" verify-bin "$MODEL" "$VERSION" "$BIN" \
     || { echo "拒绝解包：$BIN 未通过白名单校验（见上）" >&2; exit 1; }
+
+# P1-8：重跑先清旧产物——旧的 $OUT-extract / $OUT/rootfs / 已打好的
+# root-patched.squashfs 若残留，find 可能捡到旧包、unsquashfs -f 不删
+# 旧文件，旧版文件会混进新 rootfs；旧补丁镜像更不能留（会与新解包脱节）。
+rm -rf "$OUT-extract" "$OUT/rootfs" "$OUT/root-patched.squashfs"
 
 # 1. unblob 解固件（需要 REA_UNBLOB_COMMAND 或 PATH 里有 unblob）
 #    注意：unblob 26.6.4 的解包目录参数是 -e/--extract-dir，没有 -x。
@@ -54,14 +77,17 @@ command -v "$UNBLOB" >/dev/null 2>&1 || [ -x "$UNBLOB" ] \
     echo "警告：unblob 退出码 $?（缺 sasquatch/7z 等提取器是已知的；继续按产物校验）" >&2
 }
 
-# 2. 校验：解包后必须存在 root.squashfs 与 mico_version，否则失败退出
-SQFS="$(find "$OUT-extract" -name 'root.squashfs' | head -1)"
-[ -n "$SQFS" ] || { echo "解包失败：没找到 root.squashfs" >&2; exit 1; }
-MICOVER="$(find "$OUT-extract" -name 'mico_version' | head -1)"
-[ -n "$MICOVER" ] || { echo "解包失败：没找到 mico_version" >&2; exit 1; }
+# 2. 校验：解包后必须恰好存在一个 root.squashfs 与一个 mico_version，
+#    且 mico_version 含入参版本，否则失败退出
+SQFS="$(find_exactly_one "$OUT-extract" 'root.squashfs')" || exit 1
+MICOVER="$(find_exactly_one "$OUT-extract" 'mico_version')" || exit 1
 mkdir -p "$OUT"
 cp -f "$SQFS" "$OUT/root.squashfs"
 cp -f "$MICOVER" "$OUT/mico_version"
+# P1-8：mico_version 必须含入参版本（ROM 'x.y.z'），否则解出的包与要打的
+# 版本对不上，拒绝继续。
+grep -qF "$VERSION" "$OUT/mico_version" \
+    || { echo "解包失败：mico_version 里没有版本 $VERSION（包与入参版本不符）" >&2; exit 1; }
 echo "root.squashfs：$(stat -c %s "$OUT/root.squashfs") 字节"
 echo "mico_version："
 cat "$OUT/mico_version"

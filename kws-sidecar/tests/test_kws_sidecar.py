@@ -9,8 +9,10 @@
 """
 import asyncio
 import json
+import os
 import subprocess
 import sys
+import time
 import urllib.request
 import wave
 from pathlib import Path
@@ -18,7 +20,8 @@ from pathlib import Path
 import pytest
 import websockets
 
-from conftest import KEYWORDS_FILE, MODEL_DIR, SAMPLES_DIR, SIDECAR_DIR
+from conftest import (KEYWORDS_FILE, MODEL_DIR, SAMPLES_DIR, SIDECAR_DIR,
+                      TEST_TOKEN, _server_python)
 
 FRAME_BYTES = 640          # 20ms @ 16kHz int16 mono
 TRAILING_SILENCE_FRAMES = 50  # 1s 静音：模型需要关键词后的 trailing blanks
@@ -44,11 +47,15 @@ def load_wav_frames(path, limit_frames=None):
     return frames
 
 
-async def open_client(url, device_id, sample_rate=16000):
-    """hello 握手；返回 (ws, 首条响应 dict)。"""
+async def open_client(url, device_id, sample_rate=16000, token=TEST_TOKEN):
+    """hello 握手；返回 (ws, 首条响应 dict)。token=None 时 hello 不带 token
+    字段（用于测鉴权拒绝）。"""
     ws = await websockets.connect(url, max_size=1 << 20)
-    await ws.send(json.dumps({"type": "hello", "device_id": device_id,
-                              "sample_rate": sample_rate}))
+    hello = {"type": "hello", "device_id": device_id,
+             "sample_rate": sample_rate}
+    if token is not None:
+        hello["token"] = token
+    await ws.send(json.dumps(hello))
     first = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
     return ws, first
 
@@ -84,6 +91,14 @@ async def collect_for(ws, seconds):
             msgs.append(msg)
         except asyncio.TimeoutError:
             return msgs
+
+
+async def try_collect(ws, seconds):
+    """collect_for 的容错版：连接已关闭时返回已收到的消息（不再抛）。"""
+    try:
+        return await collect_for(ws, seconds)
+    except websockets.ConnectionClosed:
+        return []
 
 
 # ---------------- 正样本：合成“你好小李”应出 wake ----------------
@@ -221,11 +236,16 @@ def test_hello_wrong_sample_rate_gets_error_and_close(kws_server):
 
 
 def test_health_endpoint(kws_server):
-    """GET /health → 200 {"status":"ok","model_loaded":true}。"""
+    """GET /health → 200，含 model_loaded/keywords/devices 等真实健康字段。"""
     with urllib.request.urlopen(kws_server["health"], timeout=5) as r:
         assert r.status == 200
         body = json.loads(r.read())
-    assert body == {"status": "ok", "model_loaded": True}
+    assert body["status"] == "ok"
+    assert body["model_loaded"] is True
+    assert body["keywords"] == 1
+    assert isinstance(body["devices"], int) and body["devices"] >= 0
+    assert isinstance(body["total_wakes"], int) and body["total_wakes"] >= 0
+    assert isinstance(body["uptime_s"], (int, float)) and body["uptime_s"] >= 0
 
 
 def test_model_missing_exits_nonzero(tmp_path):
@@ -237,7 +257,225 @@ def test_model_missing_exits_nonzero(tmp_path):
            str(SIDECAR_DIR / "server.py"),
            "--host", "127.0.0.1", "--port", "10499",
            "--model-dir", str(empty_dir),
-           "--keywords-file", str(KEYWORDS_FILE)]
+           "--keywords-file", str(KEYWORDS_FILE),
+           "--token", TEST_TOKEN]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     assert proc.returncode != 0, "server must exit nonzero without a model"
     assert "FATAL" in proc.stderr or "FATAL" in proc.stdout
+
+
+# ---------------- SC-P1-1：重复 device_id 必须关闭旧连接 ----------------
+
+def test_duplicate_device_id_closes_old_connection(kws_server):
+    """SC-P1-1：同一 device_id 建第二条连接后，旧连接被关闭、旧流不再出
+    wake；新连接喂完整合成唤醒词恰好出一次 wake。"""
+    frames = load_wav_frames(SAMPLES_DIR / "pos1.wav")
+    half = len(frames) // 2
+    device_id = "dev-dup-close"
+
+    async def run():
+        ws_old, first_old = await open_client(kws_server["url"], device_id)
+        assert first_old.get("type") == "ready"
+        for f in frames[:half]:
+            await ws_old.send(f)
+        # 同 device_id 建第二条连接
+        ws_new, first_new = await open_client(kws_server["url"], device_id)
+        assert first_new.get("type") == "ready"
+        # 旧连接必须已被服务端关闭：读即 ConnectionClosed
+        with pytest.raises(websockets.ConnectionClosed):
+            await asyncio.wait_for(ws_old.recv(), timeout=5)
+        # 即使旧连接的发送端尚未来得及感知关闭而把后半句发了出去，
+        # 旧流也必须不再产生 wake
+        try:
+            await stream_frames(ws_old, frames[half:])
+        except websockets.ConnectionClosed:
+            pass
+        msgs_old = await try_collect(ws_old, 1.0)
+        assert [m for m in msgs_old if m.get("type") == "wake"] == [], \
+            "replaced old stream produced a wake event"
+        # 新连接喂完整合成唤醒词恰好出一次 wake
+        wake_task = asyncio.create_task(wait_for_wake(ws_new, timeout=10))
+        await stream_frames(ws_new, frames)
+        wake = await wake_task
+        await ws_new.close()
+        return wake
+
+    wake = asyncio.run(run())
+    assert wake is not None and wake["device_id"] == device_id
+    assert wake["keyword"] == KEYWORD
+
+
+# ---------------- SC-P1-2：空关键词表拒绝启动 ----------------
+
+@pytest.mark.parametrize("content", ["", "# only a comment\n\n"])
+def test_empty_keywords_file_exits_nonzero(tmp_path, content):
+    """SC-P1-2：空关键词表（0 字节 / 全注释）→ 进程明确报错、非零退出，
+    绝不带病上线（/health 200 但永不唤醒的 fail-open）。"""
+    kw_file = tmp_path / "keywords.txt"
+    kw_file.write_text(content, encoding="utf-8")
+    venv_python = SIDECAR_DIR / ".venv" / "bin" / "python"
+    cmd = [str(venv_python) if venv_python.exists() else sys.executable,
+           str(SIDECAR_DIR / "server.py"),
+           "--host", "127.0.0.1", "--port", "10498",
+           "--model-dir", str(MODEL_DIR),
+           "--keywords-file", str(kw_file),
+           "--token", TEST_TOKEN]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    assert proc.returncode != 0, \
+        "server must exit nonzero with an empty keyword table"
+    combined = proc.stderr + proc.stdout
+    assert "FATAL" in combined
+    assert "keyword" in combined.lower()
+
+
+# ---------------- SC-P1-3：WS 鉴权 + 连接数上限 ----------------
+
+@pytest.mark.parametrize("token", [None, "wrong-token-value-00"])
+def test_hello_bad_token_rejected(kws_server, token):
+    """SC-P1-3：hello 缺 token / token 错误 → error 后连接关闭（1008）。"""
+    async def run():
+        ws, first = await open_client(kws_server["url"], "dev-bad-token",
+                                      token=token)
+        assert first.get("type") == "error"
+        with pytest.raises(websockets.ConnectionClosed):
+            await asyncio.wait_for(ws.recv(), timeout=5)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("token_arg", [None, "short"])
+def test_server_refuses_to_start_without_token(tmp_path, token_arg):
+    """SC-P1-3：未配 Token / Token 太短（<16 位）→ 进程明确报错、非零退出。"""
+    venv_python = SIDECAR_DIR / ".venv" / "bin" / "python"
+    env = {k: v for k, v in os.environ.items()
+           if k != "OPEN_XIAOAI_TOKEN"}
+    cmd = [str(venv_python) if venv_python.exists() else sys.executable,
+           str(SIDECAR_DIR / "server.py"),
+           "--host", "127.0.0.1", "--port", "10497",
+           "--model-dir", str(MODEL_DIR),
+           "--keywords-file", str(KEYWORDS_FILE)]
+    if token_arg is not None:
+        cmd += ["--token", token_arg]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                          env=env)
+    assert proc.returncode != 0, "server must exit nonzero without a token"
+    assert "FATAL" in proc.stderr or "FATAL" in proc.stdout
+
+
+def _start_limited_server(port, max_connections):
+    """起一个带小连接上限的 server 子进程；返回 (proc, url)。"""
+    cmd = [_server_python(),
+           str(SIDECAR_DIR / "server.py"),
+           "--host", "127.0.0.1", "--port", str(port),
+           "--model-dir", str(MODEL_DIR),
+           "--keywords-file", str(KEYWORDS_FILE),
+           "--token", TEST_TOKEN,
+           "--max-connections", str(max_connections),
+           "--log-level", "WARNING"]
+    proc = subprocess.Popen(cmd, env=dict(os.environ),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    health = f"http://127.0.0.1:{port}/health"
+    deadline = time.time() + 90
+    try:
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"limited server exited early with {proc.returncode}")
+            try:
+                with urllib.request.urlopen(health, timeout=2) as r:
+                    if r.status == 200:
+                        return proc, f"ws://127.0.0.1:{port}/v1/kws"
+            except Exception:
+                time.sleep(0.5)
+        raise RuntimeError("limited server did not become healthy in time")
+    except Exception:
+        proc.terminate()
+        proc.wait(timeout=10)
+        raise
+
+
+def test_connection_limit_rejects_excess(kws_server):
+    """SC-P1-3：连接数达上限后新连接被拒绝（error + 关闭）；释放名额后
+    新连接又能正常建立。"""
+    proc, url = _start_limited_server(10403, 2)
+    try:
+        async def run():
+            ws1, f1 = await open_client(url, "dev-limit-1")
+            ws2, f2 = await open_client(url, "dev-limit-2")
+            assert f1.get("type") == "ready"
+            assert f2.get("type") == "ready"
+            # 第三条连接：超限，应被拒绝（error 或直接关闭）
+            ws3 = await websockets.connect(url, max_size=1 << 20)
+            try:
+                await ws3.send(json.dumps(
+                    {"type": "hello", "device_id": "dev-limit-3",
+                     "sample_rate": 16000, "token": TEST_TOKEN}))
+            except websockets.ConnectionClosed:
+                pass
+            rejected = False
+            try:
+                first = json.loads(
+                    await asyncio.wait_for(ws3.recv(), timeout=5))
+                assert first.get("type") == "error"
+                assert "too many" in first.get("message", "")
+                rejected = True
+            except websockets.ConnectionClosed:
+                rejected = True
+            assert rejected, "over-limit connection was not rejected"
+            with pytest.raises(websockets.ConnectionClosed):
+                await asyncio.wait_for(ws3.recv(), timeout=5)
+            # 释放一个名额后新连接应能正常建立
+            await ws1.close()
+            await asyncio.sleep(0.5)
+            ws4, f4 = await open_client(url, "dev-limit-4")
+            assert f4.get("type") == "ready"
+            await ws2.close()
+            await ws4.close()
+
+        asyncio.run(run())
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+
+# ---------------- SC-P1-4：/health 的 503 分支真实可达 ----------------
+
+def test_health_reports_503_when_unhealthy():
+    """SC-P1-4：503 分支不再是死代码——模型未加载 / 词表为空 /
+    推理连续失败时 /health 返回 503 + reason；健康时 200 含 keywords。"""
+    import types
+
+    sys.path.insert(0, str(SIDECAR_DIR))
+    import server as sidecar_server
+
+    async def get_health(srv):
+        resp = await srv.process_request(
+            None, types.SimpleNamespace(path="/health"))
+        return resp.status_code, json.loads(resp.body)
+
+    # 模型未加载
+    status, body = asyncio.run(get_health(
+        sidecar_server.Server(None, keywords_count=0)))
+    assert status == 503
+    assert body["status"] == "error"
+    assert body["reason"] == "model not loaded"
+    # 模型在但词表为空
+    status, body = asyncio.run(get_health(
+        sidecar_server.Server(object(), keywords_count=0)))
+    assert status == 503
+    assert body["reason"] == "keywords table is empty"
+    # 健康态
+    status, body = asyncio.run(get_health(
+        sidecar_server.Server(object(), keywords_count=1)))
+    assert status == 200
+    assert body["status"] == "ok" and body["keywords"] == 1
+    # 推理连续失败 5 次后转不健康（fail-closed，需重启恢复）
+    srv = sidecar_server.Server(object(), keywords_count=1)
+    for _ in range(4):
+        srv.note_feed_error()
+    assert srv.health_reason() is None
+    srv.note_feed_error()
+    status, body = asyncio.run(get_health(srv))
+    assert status == 503
+    assert "repeated stream errors" in body["reason"]

@@ -74,6 +74,18 @@ func (s *SnapClient) Close() error {
 	return s.conn.Close()
 }
 
+// maxSnapLineBytes 是 Snapcast 单行 JSON-RPC 的上限（N-P1-1）：
+// 服务端异步通知与正常响应都是一行 JSON；无界行可打满内存。
+const maxSnapLineBytes = 64 << 10
+
+// maxSnapNotifications 是单次 call() 最多跳过的异步通知行数：
+// 超过即报错，避免异常服务端用通知流把调用拖死。
+const maxSnapNotifications = 10
+
+// maxUpstreamBody 是 MA/网易云上游响应体的读取上限（P1-6/P2-7）：
+// 超过即截断，错误信息里只拼截断后的摘要，永不全文回显。
+const maxUpstreamBody = 1 << 20
+
 func (s *SnapClient) call(method string, params map[string]any) (json.RawMessage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -90,26 +102,60 @@ func (s *SnapClient) call(method string, params map[string]any) (json.RawMessage
 	if _, err := s.conn.Write(append(b, '\n')); err != nil {
 		return nil, err
 	}
-	_ = s.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	line, err := s.r.ReadBytes('\n')
-	if err != nil {
-		return nil, err
+	// N-P1-1：循环读行直到读到 id 与本次 seq 匹配的响应；
+	// Snapcast 服务端会主动推送无 id 的 JSON-RPC 通知（连接/断开、音量变化），
+	// 旧代码只读一行就把通知当成“ID 0、无错误、空结果”的正常响应返回，
+	// 真响应留在缓冲里被下一次 call() 读走，两次调用结果错配。
+	// 每轮都续期读 deadline，避免通知流把调用拖过超时。
+	for skipped := 0; ; skipped++ {
+		_ = s.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		line, err := readLimitedLine(s.r, maxSnapLineBytes)
+		if err != nil {
+			return nil, err
+		}
+		var resp struct {
+			ID     int             `json:"id"`
+			Result json.RawMessage `json:"result"`
+			Error  *struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(line, &resp); err != nil {
+			return nil, err
+		}
+		if resp.ID != s.seq {
+			// 异步通知行（或上一轮残留的错配响应）：丢弃，不报错不断开。
+			if skipped >= maxSnapNotifications {
+				return nil, fmt.Errorf("snapcast: 跳过 %d 条通知仍未等到 id=%d 的响应", skipped, s.seq)
+			}
+			continue
+		}
+		if resp.Error != nil {
+			return nil, fmt.Errorf("snapcast: %s", resp.Error.Message)
+		}
+		return resp.Result, nil
 	}
-	var resp struct {
-		ID     int             `json:"id"`
-		Result json.RawMessage `json:"result"`
-		Error  *struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
+}
+
+// readLimitedLine 限长读一行（含换行符）：超过上限即报错，
+// 不让异常服务端用无界长行打满内存。
+func readLimitedLine(r *bufio.Reader, maxBytes int) ([]byte, error) {
+	var line []byte
+	for {
+		frag, err := r.ReadSlice('\n')
+		line = append(line, frag...)
+		if len(line) > maxBytes {
+			return nil, fmt.Errorf("snapcast: 响应行超过 %d 字节上限", maxBytes)
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		return line, nil
 	}
-	if err := json.Unmarshal(line, &resp); err != nil {
-		return nil, err
-	}
-	if resp.Error != nil {
-		return nil, fmt.Errorf("snapcast: %s", resp.Error.Message)
-	}
-	return resp.Result, nil
 }
 
 // GetGroups 取全部分组（含设备与延迟）。
@@ -199,7 +245,7 @@ func (c *NeteaseClient) Search(ctx context.Context, keywords string, limit int) 
 			} `json:"songs"`
 		} `json:"result"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := cappedBodyDecoder(resp).Decode(&out); err != nil {
 		return nil, err
 	}
 	songs := make([]NeteaseSong, 0, len(out.Result.Songs))
@@ -233,7 +279,7 @@ func (c *NeteaseClient) SongURL(ctx context.Context, id int64) (string, error) {
 			URL string `json:"url"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := cappedBodyDecoder(resp).Decode(&out); err != nil {
 		return "", err
 	}
 	if len(out.Data) == 0 || out.Data[0].URL == "" {
@@ -262,7 +308,7 @@ func (c *NeteaseClient) Lyric(ctx context.Context, id int64) (string, error) {
 			Lyric string `json:"lyric"`
 		} `json:"lrc"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := cappedBodyDecoder(resp).Decode(&out); err != nil {
 		return "", err
 	}
 	return out.Lrc.Lyric, nil
@@ -310,12 +356,14 @@ func (c *MAClient) command(ctx context.Context, command string, args map[string]
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
+	// P1-6/P2-7：上游响应体限长读取，错误信息里只拼截断后的摘要，
+	// 永不把上游响应全文拼进错误（旧代码 io.ReadAll 无上限 + 全文回显）。
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBody))
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("ma: %s 返回 %d: %s", command, resp.StatusCode, strings.TrimSpace(string(raw)))
+		return nil, fmt.Errorf("ma: %s 返回 %d: %s", command, resp.StatusCode, truncateForError(string(raw), 512))
 	}
 	var out struct {
 		MessageID int             `json:"message_id"`
@@ -334,7 +382,20 @@ func (c *MAClient) command(ctx context.Context, command string, args map[string]
 	return out.Result, nil
 }
 
-// Player 是 MA 的一个播放器。
+// truncateForError 把上游错误摘要截到 n 字节（P1-6：错误里不回显全文）。
+func truncateForError(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > n {
+		return s[:n] + "…（已截断）"
+	}
+	return s
+}
+
+// cappedBodyDecoder 限长解 JSON（网易云上游响应体上限，P2-7 顺带）。
+func cappedBodyDecoder(resp *http.Response) *json.Decoder {
+	return json.NewDecoder(io.LimitReader(resp.Body, maxUpstreamBody))
+}
+
 type Player struct {
 	PlayerID string `json:"player_id"`
 	Name     string `json:"name"`
@@ -418,8 +479,12 @@ func DialMPD(addr string, timeout time.Duration) (*MPDClient, error) {
 		return nil, err
 	}
 	c := &MPDClient{addr: addr, conn: conn, r: bufio.NewReader(conn)}
-	// 读欢迎行 "OK MPD ...".
+	// N-P1-2：读欢迎行 "OK MPD ..." 之前先设读 deadline——timeout 参数
+	// 只管 TCP 建连，不管欢迎行；MPD 进程存活但卡住/不发问候时旧代码
+	// 在 ReadString 上永久阻塞，Hub 停在启动中途且无任何日志。
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
 	line, err := c.r.ReadString('\n')
+	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -459,7 +524,12 @@ func (c *MPDClient) cmd(format string, args ...any) error {
 }
 
 // PlayURL 清空队列、加入 URL 并播放。
+// P1-7：MPD 是行协议，URL 里的 \r/\n/控制字符会换行注入任意命令
+// （如 "x\nclear\n"），先校验再发。
 func (c *MPDClient) PlayURL(url string) error {
+	if err := validateMPDURL(url); err != nil {
+		return err
+	}
 	if err := c.cmd("clear"); err != nil {
 		return err
 	}
@@ -467,6 +537,24 @@ func (c *MPDClient) PlayURL(url string) error {
 		return err
 	}
 	return c.cmd("play")
+}
+
+// validateMPDURL 拒绝含换行/控制字符的 URL（MPD 换行注入防护）。
+func validateMPDURL(url string) error {
+	if url == "" {
+		return fmt.Errorf("mpd: URL 为空")
+	}
+	for _, r := range url {
+		if r == '\r' || r == '\n' || r < 0x20 || r == 0x7f {
+			return fmt.Errorf("mpd: URL 含非法控制字符 %q", r)
+		}
+	}
+	return nil
+}
+
+// Ping 探活（P1-27 看门狗用）：MPD 收到 "ping" 回 OK。
+func (c *MPDClient) Ping() error {
+	return c.cmd("ping")
 }
 
 // Pause 暂停（true）/继续（false）。

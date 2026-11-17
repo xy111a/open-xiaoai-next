@@ -23,8 +23,8 @@
 //! 宿主机测试与无唤醒场景用）。
 //!
 //! 过渡（TRANSITIONAL）：ARM .so 尚不能在音箱上加载前（原因见
-//! `kws/vendor-arm/SOURCE.md`：官方 .so 要求 GLIBC_2.29 / GLIBCXX_3.4.29，
-//! 音箱只有 2.25 / 3.4.22；且 musl 静态 Client 不能 dlopen），可跑参考
+//! `kws/vendor-arm/SOURCE.md`：官方 v2.0.1 两个 ARM .so 都要求 GLIBC_2.34 /
+//! GLIBCXX_3.4.29，音箱只有 2.25 / 3.4.22；且 musl 静态 Client 不能 dlopen），可跑参考
 //! kws 二进制 sidecar + 本文件的 `KwsLogMonitor` 尾随
 //! `/tmp/open-xiaoai/kws.log` 取唤醒事件。日志里没有 RMS，
 //! `KwsLogMonitor` 不编造 RMS——调用方必须用自己的采集帧提供
@@ -44,6 +44,65 @@ use crate::sherpa::SherpaSpotter;
 
 /// 静音下限（dBFS）：RMS 为 0 时返回该值而不是 -inf。
 pub const SILENCE_FLOOR_DB: f32 = -120.0;
+
+/// 最近 1s（50 帧）RMS 窗口（P1-14）：上报唤醒 RMS 时取窗口内各帧线性
+/// RMS 的均方根，与服务端边车同口径（`kws-sidecar/server.py` 的 50 帧
+/// deque）。单帧值的问题：sherpa 检出常发生在关键词结束后的若干帧，
+/// 此时已是词尾静音，单帧 RMS 可跌到 -120dB，近处设备反而输掉仲裁。
+///
+/// 注意（SC-P2-2 的残留形态，不修 P2 本身）：窗口含检出前的 trailing
+/// 静音帧——检出越晚、窗口里静音占比越高，上报值越小；仲裁比较的不再
+/// 是纯粹的“谁喊得响”。根治（窗口内峰值/回溯关键词时间窗）属 SC-P2-2，
+/// 见边车面；这里只做到与服务端一致的 1s 均值。
+pub struct RmsWindow {
+    frames: std::collections::VecDeque<f32>,
+}
+
+/// RMS 窗口长度：50 帧 × 20ms = 1s。
+pub const RMS_WINDOW_FRAMES: usize = 50;
+
+impl RmsWindow {
+    pub fn new() -> Self {
+        Self {
+            frames: std::collections::VecDeque::with_capacity(RMS_WINDOW_FRAMES),
+        }
+    }
+
+    /// 推入一帧的线性 RMS（满刻度 1.0）；窗口满时丢最旧帧。
+    pub fn push(&mut self, linear_rms: f32) {
+        if self.frames.len() == RMS_WINDOW_FRAMES {
+            self.frames.pop_front();
+        }
+        self.frames.push_back(linear_rms);
+    }
+
+    /// 窗口内各帧 RMS 的均方根（dBFS）；窗口为空时返回静音下限。
+    /// 默认构建（无 sherpa 后端）里只被 `wake_rms_db` 与测试调用；
+    /// sherpa 构建里 `feed` 命中时经 `wake_rms_db` 用到。
+    #[allow(dead_code)]
+    pub fn rms_db(&self) -> f32 {
+        if self.frames.is_empty() {
+            return SILENCE_FLOOR_DB;
+        }
+        let mean_sq: f64 = self
+            .frames
+            .iter()
+            .map(|x| (*x as f64) * (*x as f64))
+            .sum::<f64>()
+            / self.frames.len() as f64;
+        let lin = mean_sq.sqrt() as f32;
+        if lin <= 0.0 {
+            SILENCE_FLOOR_DB
+        } else {
+            (20.0 * lin.log10()).max(SILENCE_FLOOR_DB)
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+}
 
 /// 一帧 PCM 的 RMS（dBFS，满刻度 0dB）。空输入返回静音下限。
 /// 例：恒定 16384（半满刻度）→ 20*log10(0.5) ≈ -6.02 dB。
@@ -101,6 +160,9 @@ pub struct Kws {
     pub frames_seen: u64,
     /// 最近一帧的 RMS（dBFS）。
     last_rms_db: f32,
+    /// 最近 1s（50 帧）的 RMS 窗口（P1-14）：命中时上报它的均方根，
+    /// 而不是命中帧的单帧值。
+    rms_window: RmsWindow,
     /// Sherpa-ONNX 后端（feature `sherpa-kws` 且模型加载成功时 Some）。
     #[cfg(feature = "sherpa-kws")]
     sherpa: Option<SherpaSpotter>,
@@ -156,6 +218,7 @@ impl Kws {
             pending: Vec::new(),
             frames_seen: 0,
             last_rms_db: SILENCE_FLOOR_DB,
+            rms_window: RmsWindow::new(),
             #[cfg(feature = "sherpa-kws")]
             sherpa: None,
         })
@@ -183,6 +246,7 @@ impl Kws {
             pending: Vec::new(),
             frames_seen: 0,
             last_rms_db: SILENCE_FLOOR_DB,
+            rms_window: RmsWindow::new(),
             sherpa: Some(spotter),
         })
     }
@@ -196,6 +260,15 @@ impl Kws {
         self.last_rms_db
     }
 
+    /// 唤醒上报用的 RMS（P1-14）：最近 1s 窗口的均方根（dBFS），不是命中
+    /// 帧的单帧值。`feed` 命中时用本值填 `WakeEvent.rms_db`。
+    /// 默认构建（无 sherpa 后端）里无 WakeEvent 产出，调用方只有测试；
+    /// sherpa 构建里 `feed` 的命中分支调用本函数。
+    #[allow(dead_code)]
+    pub fn wake_rms_db(&self) -> f32 {
+        self.rms_window.rms_db()
+    }
+
     /// 对一段 16kHz PCM 做帧处理：按 320 采样点切帧，逐帧算 RMS。
     /// 有 sherpa 后端时每帧还过模型推理，命中返回 Some(WakeEvent)；
     /// 无模型时恒返回 None（但 RMS 与帧计数真实更新，供仲裁/调试用）。
@@ -205,6 +278,8 @@ impl Kws {
         while self.pending.len() >= FRAME_SAMPLES {
             let frame: Vec<i16> = self.pending.drain(..FRAME_SAMPLES).collect();
             self.last_rms_db = rms_db(&frame);
+            // P1-14：每帧的线性 RMS 都进 1s 窗口（命中时上报窗口均方根）。
+            self.rms_window.push(rms_linear(&frame));
             self.frames_seen += 1;
             #[cfg(feature = "sherpa-kws")]
             if let Some(spotter) = self.sherpa.as_mut() {
@@ -214,7 +289,7 @@ impl Kws {
                     Ok(Some(keyword)) => {
                         return Ok(Some(WakeEvent {
                             wake_word: keyword,
-                            rms_db: self.last_rms_db,
+                            rms_db: self.wake_rms_db(),
                             ts_ms: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_millis() as u64)
@@ -414,6 +489,65 @@ mod tests {
             "got {}",
             kws.last_rms_db()
         );
+    }
+
+    // --- P1-14：唤醒 RMS 取最近 1s 窗口均方根，不是命中帧单帧值 ---
+    #[test]
+    fn rms_window_mean_of_loud_frames() {
+        // 50 帧恒定半满刻度（线性 0.5）→ 窗口均方根 -6.02dB。
+        let mut w = RmsWindow::new();
+        assert_eq!(
+            w.rms_db(),
+            SILENCE_FLOOR_DB,
+            "empty window is silence floor"
+        );
+        for _ in 0..RMS_WINDOW_FRAMES {
+            w.push(0.5);
+        }
+        assert!((w.rms_db() - (-6.0206)).abs() < 0.05, "got {}", w.rms_db());
+    }
+
+    #[test]
+    fn rms_window_drops_with_trailing_silence() {
+        // SC-P2-2 的稀释是真实存在的（不藏）：50 帧响声后喂 25 帧静音，
+        // 窗口里一半是静音，能量减半，均方根跌 3dB。再喂满 50 帧静音后
+        // 响声帧全部滑出窗口，值跌到静音下限。本项只做到与服务端一致的
+        // 1s 均值，根治（峰值/回溯）属 SC-P2-2，见边车面。
+        let mut w = RmsWindow::new();
+        for _ in 0..RMS_WINDOW_FRAMES {
+            w.push(0.5);
+        }
+        for _ in 0..RMS_WINDOW_FRAMES / 2 {
+            w.push(0.0);
+        }
+        assert!(
+            (w.rms_db() - (-9.0309)).abs() < 0.05,
+            "half a window of trailing silence must dilute the RMS to about -9.03dB, got {}",
+            w.rms_db()
+        );
+    }
+
+    #[test]
+    fn feed_updates_wake_rms_window() {
+        // feed 的每帧都进窗口：50 帧响声后 wake_rms_db ≈ -6.02dB；
+        // 再喂 25 帧静音（窗口一半静音）后跌到约 -9.03dB（与 RmsWindow 单测一致）。
+        let mut kws = Kws::new_rms_only("/tmp/no-such-model.onnx", "你好小李").unwrap();
+        let loud = vec![16384i16; 320 * RMS_WINDOW_FRAMES];
+        assert!(kws.feed(&loud).unwrap().is_none());
+        assert!(
+            (kws.wake_rms_db() - (-6.0206)).abs() < 0.05,
+            "got {}",
+            kws.wake_rms_db()
+        );
+        let silence = vec![0i16; 320 * (RMS_WINDOW_FRAMES / 2)];
+        assert!(kws.feed(&silence).unwrap().is_none());
+        assert!(
+            (kws.wake_rms_db() - (-9.0309)).abs() < 0.05,
+            "got {}",
+            kws.wake_rms_db()
+        );
+        // 单帧值仍跟踪最近一帧（静音 → 下限），与窗口值分开。
+        assert_eq!(kws.last_rms_db(), SILENCE_FLOOR_DB);
     }
 
     #[test]

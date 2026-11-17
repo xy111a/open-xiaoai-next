@@ -28,6 +28,10 @@ TEST_PORT = 10401
 TEST_URL = f"ws://127.0.0.1:{TEST_PORT}/v1/kws"
 HEALTH_URL = f"http://127.0.0.1:{TEST_PORT}/health"
 
+# 仅供测试的 Token（非真实机密）：与边车要求的 >=16 位规则一致，
+# 由固件以 --token 显式传给 server 子进程；生产 Token 来自部署环境变量。
+TEST_TOKEN = "test-kws-token-16ch"
+
 
 def _server_python():
     venv_python = SIDECAR_DIR / ".venv" / "bin" / "python"
@@ -45,6 +49,7 @@ def _wait_healthy(proc, timeout=90):
                 if r.status == 200:
                     body = json.loads(r.read())
                     assert body.get("model_loaded") is True
+                    assert body.get("keywords") == 1
                     return
         except Exception:
             time.sleep(0.5)
@@ -59,6 +64,8 @@ def kws_server():
     补不齐会直接报错，不会走到这里）。
     """
     env = dict(os.environ)
+    # 固件显式传测试 Token；若调用方环境里恰好有 OPEN_XIAOAI_TOKEN，
+    # --token 命令行参数优先于环境变量，行为仍是确定的。
     cmd = [
         _server_python(),
         str(SIDECAR_DIR / "server.py"),
@@ -66,6 +73,8 @@ def kws_server():
         "--port", str(TEST_PORT),
         "--model-dir", str(MODEL_DIR),
         "--keywords-file", str(KEYWORDS_FILE),
+        "--token", TEST_TOKEN,
+        "--max-connections", "16",
         "--log-level", "WARNING",
     ]
     proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
