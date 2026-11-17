@@ -463,3 +463,17 @@ prosody/停顿的差异让 transducer 的关键词路径丢了；另 6 次同文
 - **跨句拼接是否算误唤醒**：见上文观察项——“你好”停 1s 再喊“小李”会被拼成唤醒；真人场景下的误唤醒率需真机验证。
 - **kws_status 显示滞后**：边车恢复后 `/api/status` 的 `kws_status` 最多滞后一个 30s 健康检查周期才回 `ok`（唤醒本身恢复即时）；只是状态显示问题，未改行为（改健康检查间隔是可选优化，未做）。
 - 其余关口（刷机、NAS 部署、HA 联调、网易云扫码等）见“硬件关口检查清单”，状态不变。
+
+## CI 修复（2026-11-17，第二轮审计，分支 `audit-round2-ci-fix`，PR #1）
+
+CI 首次实跑（run 44063914126）：Rust ✓、Semgrep ✓；Go ✗、Python ✗。
+
+- **Go 失败原因**：`go vet` 编译 `gopkg.in/hraban/opus.v2` 时报 `Package opusfile was not found in the pkg-config search path`；`opusfile.pc` 由 `libopusfile-dev` 提供，ci.yml 只装了 `libopus-dev`。**修复**：apt 安装行加上 `libopusfile-dev`。
+- **Python 失败原因**：firmware-patch 的测试依赖仓库外的固件 rootfs（本地在 `speaker-open-xiaoai-rebuild/firmware/rootfs/`，9.7GB，不进仓库），CI 环境里没有，setup 直接 FileNotFoundError；且固件步骤先失败、job 中止，kws-sidecar 测试一步从未执行。**修复**：依赖 fixture 的测试在缺失时 `pytest.skip` 带明确理由（不删测试、不静默跳过、不把 rootfs 塞进仓库）；原 `python` job 拆为 `python-firmware` + `python-sidecar` 两个 job，边车测试独立跑、独立出结果。
+- **本地预验证**：CI 条件模拟（干净 checkout，无固件材料）24 passed / 37 skipped，0 failed；本地有 fixture 时 61 passed；kws-sidecar 16 passed；YAML 校验通过。
+- **PR 首跑结果（run 44084093818）**：Go ✓、Rust ✓、Python（固件）✓、Semgrep ✓；**Python（kws-sidecar）✗**——边车 job 冷启动失败：bootstrap 调 `download-model.sh` 下载模型（SHA 校验通过），随后 `sherpa-onnx-cli text2token` 生成 keywords.txt 时报 `ModuleNotFoundError: No module named 'click'`。根因：`sherpa-onnx==2.0.1` 只声明依赖 `sherpa-onnx-core`，不声明 `click`，但其 `sherpa-onnx-cli` 在 import 时就要 click；本地此前只跑过暖缓存（`~/workspace/.kws-exp` 已有模型 + keywords.txt，`download-model.sh` 从未执行），冷启动路径从未被实际跑过。**修复**：`kws-sidecar/requirements.txt` 加 `click==8.5.1`（带注释）。同一行同时修掉 NAS 首次部署的同款隐患：容器 entrypoint 在模型缺失时也调 `download-model.sh`，缺 click 同样会 FATAL 退出。
+- **click 修复的冷验证（第一次，走了 fallback 分支）**：全新 venv（只装 requirements + requirements-dev + piper-tts）+ 空 `KWS_TEST_ASSETS`：模型下载、11 个样本生成，`16 passed in 15.24s`。但事后复核发现这次验证并不忠实：pytest 是用 venv 的 python 绝对路径跑的，venv 的 bin 不在 PATH 里，`command -v sherpa-onnx-cli` 找不到，`download-model.sh` 走了“写已验证 token 行”的 fallback 分支，text2token 根本没跑——所以它没能发现缺 `sentencepiece`。
+- **PR 第二跑结果（run 44085140541）**：Go ✓、Rust ✓、Python（固件）✓、Semgrep ✓；**Python（kws-sidecar）仍 ✗（35s）**——click 已修好（CLI 跑起来了），但 text2token 接下来又缺 `sentencepiece`（`sherpa_onnx/utils.py:41`）。根因同款：`sherpa-onnx-cli text2token`（`--tokens-type ppinyin`）还要 `sentencepiece` 与 `pypinyin`，三者都不在 sherpa-onnx 的声明依赖里；`download-model.sh` 的注释（L31-32）与报错提示（L89）其实写明了要装这三样，只是 requirements 里一个都没写。**修复**：requirements.txt 再加 `sentencepiece==0.2.3`、`pypinyin==0.55.0`。
+- **真正的冷验证（第二次，text2token 实跑）**：同一全新 venv 补装 sentencepiece + pypinyin，`PATH` 加上 venv 的 bin（与 CI 一致，`sherpa-onnx-cli` 在 PATH 上，强制走 text2token 分支）+ 空 `KWS_TEST_ASSETS`：模型下载、text2token 生成 keywords.txt、11 个样本生成，`16 passed in 14.89s`。`download-model.sh` 有 `set -euo pipefail`，text2token 失败即脚本 exit 1、bootstrap 抛错，所以 16 passed 即证明 text2token 真跑通了。
+- **PR 第三跑结果（run 44085962471）**：Rust ✓、Python（边车）✓（58s，text2token 真跑通了）、Python（固件）✓、Semgrep ✓；**Go ✗**——`TestSubscribeEventsReceivesPush` 出现 `panic: concurrent write to websocket connection`（`fakeHA.pushEvent` 与 handler goroutine 并发写同一条 WS 连接）。这是本轮审计 N-P2-1 点名的测试替身竞态，前两跑没炸是时序运气。**修复**（只改两个测试文件，不动生产代码）：`fakeHA` 与 `fakeSidecar` 各加 `writeMu` + 唯一 `writeJSON` 写入口；本地 `go test -count=1 -race ./...` 22 个包全 ok（此前 ha、kws 两包在 `-race` 下 FAIL），`go test -count=10` 两包全过。生产代码的同款问题 P1-21 仍开，未动。
+- **最终 CI 结果（run 44086824940，2026-11-17 12:53 UTC，提交 2f52c8e）**：Go ✓（1m7s）、Rust ✓（1m43s）、Python（固件）✓（8s）、Python（kws-sidecar）✓（1m3s）、Semgrep ✓（28s）——**5 个 job 全绿**。PR #1：https://github.com/xy111a/open-xiaoai-next/pull/1（未合并，待 bai 看审计报告后定）。

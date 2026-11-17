@@ -6,3 +6,13 @@
 sherpa-onnx==2.0.1
 websockets==17.4
 numpy==2.5.5
+# click==8.5.1、sentencepiece==0.2.3、pypinyin==0.55.0：sherpa-onnx-cli
+# 在 import 时就要 click（sherpa_onnx/cli.py），text2token（--tokens-type
+# ppinyin）还要 sentencepiece 与 pypinyin，但 sherpa-onnx==2.0.1 只声明
+# 依赖 sherpa-onnx-core，三者都不声明。scripts/download-model.sh 的
+# text2token 步骤要用到它们（CI bootstrap 冷启动与 NAS 容器首次启动的
+# entrypoint 都会跑）；缺了任一个冷启动必失败（2026-11-17 PR #1 的 CI
+# 实跑：先缺 click，补上后又缺 sentencepiece）。
+click==8.5.1
+sentencepiece==0.2.3
+pypinyin==0.55.0

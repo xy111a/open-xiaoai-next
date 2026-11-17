@@ -11,7 +11,14 @@ import subprocess
 
 import pytest
 
-from conftest import FIRMWARE_BIN, FIRMWARE_PATCH, FIRMWARE_ROOTFS, SCRIPTS
+from conftest import (
+    FIRMWARE_BIN,
+    FIRMWARE_PATCH,
+    FIRMWARE_ROOTFS,
+    SCRIPTS,
+    require_firmware_bin,
+    require_patched_work,
+)
 
 MAX_IMAGE_SIZE = 0x02800000  # 40MB
 EXPECTED_SQFS_SIZE = 37500699  # REA_ANALYSIS.md：root.squashfs 字节数
@@ -30,6 +37,7 @@ def run(cmd, env_extra=None, timeout=900):
 @pytest.fixture(scope="module")
 def unpacked_work(tmp_path_factory):
     """在 /tmp 临时 work 目录里用真实 .bin 跑 unpack.sh（模块级，只跑一次）。"""
+    require_firmware_bin()  # CI 干净 checkout 里无官方 .bin：依赖测试跳过
     work = tmp_path_factory.mktemp("work")
     shutil.copyfile(FIRMWARE_BIN, work / "lx06_1.94.13.bin")
     env = {"PATCH_WORK_DIR": str(work)}
@@ -100,6 +108,7 @@ def test_unpack_fails_without_bin(tmp_path):
 
 def test_unpack_with_ota_bin_env(tmp_path):
     """OTA_BIN 可直接指定已有的官方包路径，不必先拷进 work 目录。"""
+    require_firmware_bin()  # CI 干净 checkout 里无官方 .bin：跳过
     work = tmp_path / "work2"
     work.mkdir()
     env = {"PATCH_WORK_DIR": str(work), "OTA_BIN": str(FIRMWARE_BIN)}
@@ -217,6 +226,7 @@ def test_unpack_rejects_unknown_version(tmp_path):
 
 def test_unpack_rejects_tampered_bin(tmp_path):
     """P0-5：.bin 被改过一个字节就拒绝解包，且不产出 rootfs。"""
+    require_firmware_bin()  # CI 干净 checkout 里无官方 .bin：跳过
     work = tmp_path / "work"
     work.mkdir()
     shutil.copyfile(FIRMWARE_BIN, work / "lx06_1.94.13.bin")
@@ -268,6 +278,7 @@ def test_patch_rejects_tampered_sqfs_when_bin_absent(unpacked_work, tmp_path):
 
 def test_flash_check_ok_on_real_work():
     """P0-6：真实 work 目录干跑检查通过（lx06 与 oh2p）。"""
+    require_patched_work()  # work/ 是 gitignore 的本地构建产物：CI 里跳过
     for model, version in (("lx06", "1.94.13"), ("oh2p", "1.58.6")):
         r = run(["bash", str(SCRIPTS / "flash-check.sh"), model, version])
         assert r.returncode == 0, f"flash-check.sh {model} 失败：\n{r.stdout}\n{r.stderr}"
@@ -277,6 +288,7 @@ def test_flash_check_ok_on_real_work():
 
 def test_flash_check_rejects_tampered_image(tmp_path):
     """P0-6：补丁镜像首字节被改，干跑检查失败（魔数 + 超块解析）。"""
+    require_patched_work()  # work/ 是 gitignore 的本地构建产物：CI 里跳过
     work = tmp_path / "work"
     (work / "lx06_1.94.13").mkdir(parents=True)
     for name in ("root.squashfs", "mico_version"):

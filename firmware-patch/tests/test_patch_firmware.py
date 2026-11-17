@@ -33,7 +33,7 @@ from patch_firmware import (
     patch_start,
     sha512_crypt,
 )
-from conftest import FIRMWARE_ROOTFS, SCRIPTS
+from conftest import FIRMWARE_ROOTFS, SCRIPTS, require_firmware_rootfs
 
 # 测试专用 root 密码（≥16 位，仅测试用；生产密码必须现场随机生成，
 # 永不写进仓库——本常量只出现在测试里）。
@@ -70,6 +70,9 @@ def shadow_root_hash(rootfs: Path) -> str:
 
 
 def copy_rootfs(dst):
+    # 单一卡口：固件 rootfs 不在（CI 干净 checkout）时整批依赖测试跳过，
+    # 理由见 conftest.require_firmware_rootfs；本地有材料时照常复制执行。
+    require_firmware_rootfs()
     shutil.copytree(FIRMWARE_ROOTFS, dst, symlinks=True)
     return dst
 

@@ -20,6 +20,7 @@ type fakeSidecar struct {
 	srv *http.Server
 
 	mu       sync.Mutex
+	writeMu  sync.Mutex // gorilla websocket 要求同一连接最多一个并发写者；handleWS goroutine 与 sendWake/测试 goroutine 会并发写
 	conns    map[string]*websocket.Conn
 	hellos   map[string]map[string]any
 	pcmBytes map[string]int // 每设备收到的 PCM 字节数
@@ -55,6 +56,13 @@ func (f *fakeSidecar) url() string {
 	return "ws://" + f.ln.Addr().String() + "/v1/kws"
 }
 
+// writeJSON 是本替身唯一的写入口（持 writeMu），防并发写 panic。
+func (f *fakeSidecar) writeJSON(conn *websocket.Conn, v any) error {
+	f.writeMu.Lock()
+	defer f.writeMu.Unlock()
+	return conn.WriteJSON(v)
+}
+
 func (f *fakeSidecar) handleWS(w http.ResponseWriter, r *http.Request) {
 	up := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 	conn, err := up.Upgrade(w, r, nil)
@@ -80,7 +88,7 @@ func (f *fakeSidecar) handleWS(w http.ResponseWriter, r *http.Request) {
 	f.conns[deviceID] = conn
 	f.hellos[deviceID] = hello
 	f.mu.Unlock()
-	_ = conn.WriteJSON(map[string]string{"type": "ready"})
+	_ = f.writeJSON(conn, map[string]string{"type": "ready"})
 	for {
 		mt, data, err := conn.ReadMessage()
 		if err != nil {
@@ -139,7 +147,7 @@ func (f *fakeSidecar) sendWake(t *testing.T, deviceID, keyword string, rms float
 	if !ok {
 		t.Fatalf("假边车没有设备 %s 的连接，无法发 wake", deviceID)
 	}
-	if err := conn.WriteJSON(map[string]any{
+	if err := f.writeJSON(conn, map[string]any{
 		"type": "wake", "device_id": deviceID, "keyword": keyword,
 		"rms": rms, "timestamp_ms": time.Now().UnixMilli(),
 	}); err != nil {
@@ -282,7 +290,7 @@ func TestErrorMessageDoesNotBreakStream(t *testing.T) {
 	f.mu.Lock()
 	conn := f.conns["lx06-1"]
 	f.mu.Unlock()
-	if err := conn.WriteJSON(map[string]string{"type": "error", "message": "model not loaded"}); err != nil {
+	if err := f.writeJSON(conn, map[string]string{"type": "error", "message": "model not loaded"}); err != nil {
 		t.Fatal(err)
 	}
 	// error 之后流不断：再发 wake 仍能收到。
