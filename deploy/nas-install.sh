@@ -45,6 +45,17 @@ if [ -z "$NAS_IP" ] && [ -f deploy/.env ]; then
   NAS_IP="$(grep -E '^NAS_IP=' deploy/.env | cut -d= -f2 | tr -d '[:space:]')"
 fi
 [ -n "$NAS_IP" ] || { echo "FAIL: NAS_IP 未设置（环境变量或 deploy/.env 里的 NAS_IP）"; exit 1; }
+# P2-24：NAS_IP / NAS_DIR / NAS_SSH 未校验即拼进 `$SSH "…"`——注入面。
+# 只允许安全字符集，含 shell 元字符（; $ ` \ " ' ( ) < > | & 空格等）即拒绝。
+if ! [[ "$NAS_IP" =~ ^[A-Za-z0-9.-]+$ ]]; then
+  echo "FAIL: NAS_IP 格式不对：$NAS_IP（只允许字母/数字/./-，如 192.168.1.10）"; exit 1
+fi
+if ! [[ "$NAS_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]] || [[ "$NAS_DIR" =~ \.\. ]]; then
+  echo "FAIL: NAS_DIR 格式不对：$NAS_DIR（只允许绝对路径安全字符，不含 ..）"; exit 1
+fi
+if ! [[ "$NAS_SSH" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+$ ]]; then
+  echo "FAIL: NAS_SSH 格式不对：$NAS_SSH（应为 user@host，如 root@192.168.1.10）"; exit 1
+fi
 
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 $NAS_SSH"
 SCP="scp -o BatchMode=yes -o ConnectTimeout=10"
@@ -52,6 +63,23 @@ SCP="scp -o BatchMode=yes -o ConnectTimeout=10"
 # ---------- 0. 本机预检查 ----------
 info "0. 本机预检查"
 [ -f deploy/hub-linux-amd64 ]        && ok "Hub 二进制存在 deploy/hub-linux-amd64" || bad "缺 deploy/hub-linux-amd64，先在 hub/ 下 go build"
+# P2-55：Hub 二进制悄悄过期——清单 deploy/hub-linux-amd64.sha256 在时
+# 比对 SHA256 与大小，不一致即 FAIL（重编后忘更新清单，或二进制被换过）；
+# 清单不存在时只警告（无记录可核对）。清单格式（由重编步骤生成）：
+#   <sha256>  deploy/hub-linux-amd64
+#   size: <字节数>
+if [ -f deploy/hub-linux-amd64 ] && [ -f deploy/hub-linux-amd64.sha256 ]; then
+  _hub_sha="$(sha256sum deploy/hub-linux-amd64 | cut -d' ' -f1)"
+  _hub_size="$(stat -L -c %s deploy/hub-linux-amd64)"
+  if grep -qx "$_hub_sha  deploy/hub-linux-amd64" deploy/hub-linux-amd64.sha256 \
+     && grep -qx "size: $_hub_size" deploy/hub-linux-amd64.sha256; then
+    ok "Hub 二进制与 deploy/hub-linux-amd64.sha256 清单一致（$_hub_size 字节）"
+  else
+    bad "Hub 二进制与 deploy/hub-linux-amd64.sha256 清单不符（重编后忘更新清单，或二进制被换过）"
+  fi
+elif [ -f deploy/hub-linux-amd64 ]; then
+  echo "WARN: 无 deploy/hub-linux-amd64.sha256 清单，无法核对 Hub 二进制是否最新（重编后用 sha256sum 生成清单，见 docs/RELEASE.md）"
+fi
 [ -f deploy/docker-compose.yml ]     && ok "docker-compose.yml 存在" || bad "缺 deploy/docker-compose.yml"
 [ -f deploy/Dockerfile.hub ]          && ok "Dockerfile.hub 存在" || bad "缺 deploy/Dockerfile.hub"
 [ -f deploy/snapserver.conf ]         && ok "snapserver.conf 存在" || bad "缺 deploy/snapserver.conf"
@@ -109,6 +137,25 @@ $SSH "mkdir -p $NAS_DIR/deploy $NAS_DIR/hub" \
 $SCP deploy/docker-compose.yml deploy/Dockerfile.hub deploy/hub-linux-amd64 \
       deploy/snapserver.conf deploy/.env "$NAS_SSH:$NAS_DIR/deploy/" \
   && ok "部署文件已传到 $NAS_DIR/deploy/" || { bad "scp 传部署文件失败"; exit 1; }
+# P2-55：kws-sidecar 的构建上下文不在 deploy/ 里——compose 里它是
+# build: ../kws-sidecar，且无 image:，只传 deploy/ 的话 NAS 上
+# docker compose up 会因构建上下文缺失而失败。只传构建所需文件
+# （Dockerfile、server.py、entrypoint.sh、requirements.txt、scripts/；
+# tests/ 与 .venv 不传）到 $NAS_DIR/kws-sidecar。
+if [ -d kws-sidecar ]; then
+  tar -czf /tmp/kws-sidecar-src.tar.gz -C . \
+      kws-sidecar/Dockerfile kws-sidecar/server.py kws-sidecar/entrypoint.sh \
+      kws-sidecar/requirements.txt kws-sidecar/scripts \
+    || { bad "打包 kws-sidecar 构建源文件失败"; exit 1; }
+  $SCP /tmp/kws-sidecar-src.tar.gz "$NAS_SSH:$NAS_DIR/" \
+    && $SSH "mkdir -p $NAS_DIR/kws-sidecar && tar -xzf $NAS_DIR/kws-sidecar-src.tar.gz -C $NAS_DIR && rm -f $NAS_DIR/kws-sidecar-src.tar.gz" \
+    && ok "kws-sidecar 构建源文件已传到 $NAS_DIR/kws-sidecar/" \
+    || { bad "传 kws-sidecar 构建源文件失败"; exit 1; }
+  rm -f /tmp/kws-sidecar-src.tar.gz
+else
+  bad "缺 kws-sidecar/ 目录（compose 里边车是 build: ../kws-sidecar，缺了 up 会失败）"
+  exit 1
+fi
 # P1-33：种子配置只在首次部署写。NAS 上已有 config.yaml 时不覆盖——NAS 端经
 # 语音认领的房间与 Web 面板改的配置都在这个文件里，重传本机旧副本会全部丢掉。
 # 已有文件先在 NAS 端做带时间戳的备份（.bak.YYYYMMDDHHMMSS），再跳过传文件。
@@ -122,6 +169,11 @@ else
     && ok "hub/config.yaml 已传到 $NAS_DIR/hub/（首次部署，种子配置）" \
     || { bad "scp 传 config.yaml 失败"; exit 1; }
 fi
+# P1-4：Hub 容器以 uid 1000（appuser）运行，config.yaml 须属主 1000，
+# 否则 Hub 读不到配置。每次部署都 chown（幂等）。
+$SSH "chown 1000:1000 $NAS_DIR/hub/config.yaml" \
+  && ok "config.yaml 属主已设为 1000:1000（Hub 容器 appuser 可读）" \
+  || { bad "chown config.yaml 失败"; exit 1; }
 
 # ---------- 3. NAS 端 config 调整 ----------
 # Hub 跑在 host 网络下，Docker 容器名（netease-api / kws-sidecar）解析不到，
@@ -158,9 +210,34 @@ $SSH "sed -i 's#http://netease-api:3000#http://127.0.0.1:3000#' $NAS_DIR/hub/con
 info "4. docker compose pull + up"
 $SSH "cd $NAS_DIR/deploy && docker compose pull" \
   && ok "镜像拉取完成" || bad "镜像拉取失败（看是哪一个镜像报错；netease-api 已改为 binaryify/netease_cloud_music_api）"
+# P1-4：先构建 hub 与 kws-sidecar（两者都是 build:，pull 拉不到），
+# 再做卷属主迁移——已存在的数据卷属主还是 root（旧版容器以 root 跑过），
+# 新版容器以 uid 1000 运行会写不进卷。up 之前用 root 一次性 chown
+# 两个具名卷的挂载点（只改属主，不动数据；首次部署卷是空的，这一步
+# 是空操作；新卷的首次 copy-up 由 Dockerfile 里的 mkdir + chown 负责）。
+$SSH "cd $NAS_DIR/deploy && docker compose build hub kws-sidecar" \
+  && ok "Hub 与 kws-sidecar 镜像已构建" || { bad "构建 hub/kws-sidecar 镜像失败"; exit 1; }
+$SSH "cd $NAS_DIR/deploy && docker compose run --rm --user root --no-deps --entrypoint /bin/chown hub -R 1000:1000 /app/hub-data" \
+  && ok "hub-data 卷属主已设为 1000:1000" || { bad "hub-data 卷 chown 失败"; exit 1; }
+$SSH "cd $NAS_DIR/deploy && docker compose run --rm --user root --no-deps --entrypoint /bin/chown kws-sidecar -R 1000:1000 /data/kws/models" \
+  && ok "kws models 卷属主已设为 1000:1000" || { bad "kws models 卷 chown 失败"; exit 1; }
 $SSH "cd $NAS_DIR/deploy && docker compose up -d" \
   && ok "docker compose up -d 已执行" || { bad "up 失败，把报错贴回来"; exit 1; }
 sleep 15   # 等 Whisper 首次加载模型、Hub 启动
+
+# P2-24：带 Web Token 的检查不用本地拼命令——token 经本地 shell 拼进
+# `$SSH "…"` 会被远端 shell 再解析一次，token 里的特殊字符会破环命令，
+# 且 token 会出现在本机进程参数里。remote_curl_api 把检查脚本用带引号
+# 的 heredoc（不展开）喂给 NAS 端 bash -s，NAS_DIR 与 API 路径作 $1/$2
+# 传进去；token 在 NAS 端从已传过去的 deploy/.env 里读（与
+# NAS_CHECKLIST.md §3 的写法一致）。本机只收到响应体 + HTTP 码，不
+# 打印 token、不把 token 写进日志。
+remote_curl_api() { # $1=API 路径，如 /api/status
+  $SSH "bash -s -- $NAS_DIR $1" <<'REMOTE_EOF'
+tok="$(grep -E '^OPEN_XIAOAI_WEB_TOKEN=' "$1/deploy/.env" | cut -d= -f2-)"
+curl -s -m 5 -w ' %{http_code}' -H "Authorization: Bearer $tok" "http://127.0.0.1:8080$2"
+REMOTE_EOF
+}
 
 # ---------- 5. 逐项检查 ----------
 info "5. 逐项检查"
@@ -190,13 +267,8 @@ $SSH "ss -tln 2>/dev/null | grep -q ':1704 '" \
 $SSH "curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/" | grep -q 200 \
   && ok "NeteaseCloudMusicApi 正常（http://127.0.0.1:3000/ 返回 200）" || bad "netease-api 不正常（/ 返回的不是 200）"
 # 融合 B 新增：Hub 网易云登录态检查（GET /api/netease/status，带 Web Token）。
-# Web Token 取环境变量 OPEN_XIAOAI_WEB_TOKEN，优先于 .env（与 §0 预检查同规则）；
-# 该变量下面 /api/status 检查也复用，不再重复赋值。
-_web_tok="${OPEN_XIAOAI_WEB_TOKEN:-$(grep -E '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env 2>/dev/null | cut -d= -f2- || true)}"
-# 未登录只警告、不记 FAIL（首次部署本来就是未登录，去 Web 面板扫码即可）；
-# 404 也只警告：该路由由 Hub 面新接，若 Hub 二进制还没带上，部署本身不受影响。
-# 注意：只判断 HTTP 码与 logged_in 字段，不打印响应体（不把 Cookie/登录态细节写进日志）。
-_netease_status="$($SSH "curl -s -m 5 -w ' %{http_code}' -H 'Authorization: Bearer $_web_tok' http://127.0.0.1:8080/api/netease/status" 2>/dev/null)"
+# Token 由 remote_curl_api 在 NAS 端从 deploy/.env 读，不经本地 shell（P2-24）。
+_netease_status="$(remote_curl_api /api/netease/status 2>/dev/null)"
 case "$_netease_status" in
   *'"logged_in":true'*200|*'"logged_in": true'*200) ok "网易云已登录（/api/netease/status 返回 200，logged_in:true）" ;;
   *'"logged_in":false'*200|*'"logged_in": false'*200) echo "WARN: 网易云未登录（/api/netease/status 返回 200，logged_in:false；首次部署是正常的，去 Hub Web 面板扫码登录，见 NAS_CHECKLIST.md §5）" ;;
@@ -214,8 +286,8 @@ $SSH "curl -s -m 5 http://127.0.0.1:10400/health" | grep -q '"model_loaded":true
   || bad "KWS 边车 /health 不正常（应为 200 + model_loaded:true；看 docker compose logs kws-sidecar，首次启动下载模型失败会明确报错退出）"
 # FW-P1-1：带 Web Token 调 /api/status，断言 HTTP 200 且响应含 wake_word。
 # 以前无 token 的 curl 对 401 也 exit 0、恒 PASS；现在 401 即 FAIL。
-# Token 即上文 _web_tok（环境变量优先于 .env，与 §0 预检查同规则）。
-_status="$($SSH "curl -s -m 5 -w ' %{http_code}' -H 'Authorization: Bearer $_web_tok' http://127.0.0.1:8080/api/status" 2>/dev/null)"
+# Token 由 remote_curl_api 在 NAS 端从 deploy/.env 读，不经本地 shell（P2-24）。
+_status="$(remote_curl_api /api/status 2>/dev/null)"
 case "$_status" in
   *wake_word*200) ok "Hub Web 面板正常（/api/status 返回 200，含 wake_word 你好小李）" ;;
   *) bad "Hub /api/status 不正常（应为 200 + wake_word；401 说明 OPEN_XIAOAI_WEB_TOKEN 不对或没传进容器，见 .env 与 compose；实际：${_status:-无响应}）" ;;
@@ -225,8 +297,10 @@ $SSH "cd $NAS_DIR/deploy && docker compose logs --tail=50 hub 2>&1 | grep -q '�
 $SSH "cd $NAS_DIR/deploy && docker compose logs --tail=50 hub 2>&1 | grep -q 'KWS 边车健康检查通过'" \
   && ok "Hub 日志出现“KWS 边车健康检查通过”（Hub 已连上 127.0.0.1:10400 的边车，语音唤醒可用）" \
   || bad "Hub 日志里没有“KWS 边车健康检查通过”（看 docker compose logs hub + logs kws-sidecar；/api/status 的 kws_status 也会是 down）"
-$SSH "cd $NAS_DIR/deploy && docker compose logs --tail=30 hub 2>&1 | grep -qi '自动发现\|扫描\|discover'" \
-  && ok "Hub 日志出现自动发现相关行" || echo "WARN: Hub 日志里没看到自动发现关键词（可能还没扫到设备，先看完整日志）"
+# P1-44：自动发现扫描已删，改为注册制——设备在 WS 上发 register 主动注册，
+# Hub 启动时必打一行“设备注册制：…”日志。查这行，不再查“自动发现/扫描”。
+$SSH "cd $NAS_DIR/deploy && docker compose logs --tail=30 hub 2>&1 | grep -q '设备注册制'" \
+  && ok "Hub 日志出现“设备注册制”行（P1-44 注册制已启用）" || echo "WARN: Hub 日志里没看到“设备注册制”行（看完整日志；旧版 Hub 才没有这行）"
 $SSH "cd $NAS_DIR/deploy && docker compose logs --tail=100 2>&1 | grep -qiE 'fatal|panic'" \
   && bad "有容器日志出现 FATAL/PANIC，看 docker compose logs" || ok "无 FATAL/PANIC 日志"
 
