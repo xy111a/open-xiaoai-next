@@ -4,12 +4,9 @@ package music
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -162,25 +159,5 @@ func TestPlayURLRejectsControlChars(t *testing.T) {
 	}
 	if err := c.Ping(); err != nil {
 		t.Fatalf("Ping: %v", err)
-	}
-}
-
-func TestMAErrorBodyTruncated(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(strings.Repeat("E", 100000)))
-	}))
-	defer srv.Close()
-	c := NewMA(srv.URL, "ma-token")
-	_, err := c.Players(context.Background())
-	if err == nil {
-		t.Fatal("上游 500 时 Players 应返回错误")
-	}
-	if len(err.Error()) > 700 {
-		t.Fatalf("错误信息应截断到 512 字节摘要，实际 %d 字节", len(err.Error()))
-	}
-	if strings.Contains(err.Error(), strings.Repeat("E", 1000)) {
-		t.Fatal("错误信息不应含上游响应全文")
 	}
 }

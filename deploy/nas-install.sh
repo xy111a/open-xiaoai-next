@@ -84,13 +84,17 @@ info "1. NAS 连通与环境检查"
 $SSH true && ok "SSH 连通 $NAS_SSH" || { bad "SSH 连不上 $NAS_SSH（检查 NAS 是否开 SSH、IP 对不对）"; exit 1; }
 $SSH "docker --version && docker compose version" \
   && ok "NAS 上 docker + docker compose 可用" || bad "NAS 上 docker / docker compose 不可用"
+# 2026-11-18 融合 B：music_folder 是可选本地兜底，不存在只警告、
+# 不记 FAIL、不退出（网易云直连是主路；Hub 侧 ValidateStartup 的
+# Fatal 也要由 Hub 面改掉，见 MUSIC_FUSION.md“待 Hub 面确认”）。
 $SSH "[ -d /volume1/music ]" \
-  && ok "/volume1/music 存在" || bad "/volume1/music 不存在（先在 UGOS 文件管理里建，并放几首歌）"
+  && ok "/volume1/music 存在" || echo "WARN: /volume1/music 不存在（可选本地兜底，缺了只警告；想放本地歌时在 UGOS 文件管理里建，并放几首歌）"
 $SSH "[ \"\$(ls -A /volume1/music 2>/dev/null | head -1)\" ]" \
-  && ok "/volume1/music 非空" || echo "WARN: /volume1/music 是空的（MPD 库会是空的，先放几首歌）"
+  && ok "/volume1/music 非空" || echo "WARN: /volume1/music 是空的（MPD 库会是空的，先放几首歌；不影响网易云直连）"
 # P1-4：1883 已随 mosquitto 删除而去掉；4399（Hub 主端口）与 1704/1705
 # （Snapcast 流/控制）补上——之前漏 4399 时 Hub 绑定失败脚本还报全部空闲。
-for p in 10300 10200 10400 4399 1704 1705 8095 3000 8080; do
+# 2026-11-18 融合 B：8095 已随 Music Assistant 删除而去掉（不再占用）。
+for p in 10300 10200 10400 4399 1704 1705 3000 8080; do
   if $SSH "ss -tln 2>/dev/null | grep -q \":$p \""; then
     echo "WARN: 端口 $p 已被占用（up 之后对应服务可能起不来，先查谁占了：ss -tlnp | grep $p）"
   else
@@ -120,8 +124,12 @@ else
 fi
 
 # ---------- 3. NAS 端 config 调整 ----------
-# Hub 跑在 host 网络下，Docker 容器名（music-assistant / netease-api / kws-sidecar）解析不到，
+# Hub 跑在 host 网络下，Docker 容器名（netease-api / kws-sidecar）解析不到，
 # 改成 127.0.0.1（这些服务都把端口映射到了宿主机，或与 Hub 一样走 host 网络）；HA 地址改成真实 NAS_IP。
+# 2026-11-18 融合 B：music-assistant 已砍，不再改写 8095 地址；
+# hub/config.yaml 里 netease.music_assistant 一行由 Hub 面删除（种子配置已删）；
+# 但 NAS 上旧副本可能还留着该行——新 Hub 读到它会直接拒绝启动（config.go 的
+# checkDeprecatedMusicAssistant），所以第 3 步用 sed 删掉该行并断言已删。
 # kws.url 那行是防旧副本：随仓库发的 config.yaml 已是 ws://127.0.0.1:10400/v1/kws，
 # 旧副本若还是 ws://kws-sidecar:10400 也会在这里被改过来（否则 Hub 启动即报“唤醒服务暂不可用”）。
 info "3. NAS 端 config 调整（只改 NAS 上的副本，不动本机 hub/config.yaml）"
@@ -129,17 +137,17 @@ info "3. NAS 端 config 调整（只改 NAS 上的副本，不动本机 hub/conf
 # 以前这里 cp 的是刚传上去的本机文件，备错了文件）。
 # FW-P1-2：sed 后逐项断言结果——以前 sed 静默无操作、grep 只打印不比对，
 # HA 地址没改也会照常 ok。
-$SSH "sed -i 's#http://music-assistant:8095#http://127.0.0.1:8095#' $NAS_DIR/hub/config.yaml
-  sed -i 's#http://netease-api:3000#http://127.0.0.1:3000#' $NAS_DIR/hub/config.yaml
+$SSH "sed -i 's#http://netease-api:3000#http://127.0.0.1:3000#' $NAS_DIR/hub/config.yaml
   sed -i 's#ws://kws-sidecar:10400#ws://127.0.0.1:10400#' $NAS_DIR/hub/config.yaml
   sed -i \"s#192.168.1.10:8123#$NAS_IP:8123#\" $NAS_DIR/hub/config.yaml
-  grep -q 'http://127.0.0.1:8095' $NAS_DIR/hub/config.yaml \
-    && grep -q 'http://127.0.0.1:3000' $NAS_DIR/hub/config.yaml \
+  sed -i '/^[[:space:]]*music_assistant:/d' $NAS_DIR/hub/config.yaml
+  grep -q 'http://127.0.0.1:3000' $NAS_DIR/hub/config.yaml \
     && grep -q 'ws://127.0.0.1:10400' $NAS_DIR/hub/config.yaml \
     && grep -q \"://$NAS_IP:8123\" $NAS_DIR/hub/config.yaml \
-    && grep -E 'music_assistant:|api:|url:|kws:|  url:' $NAS_DIR/hub/config.yaml" \
-  && ok "config.yaml 已改：netease 走 127.0.0.1，kws 走 ws://127.0.0.1:10400/v1/kws，HA 走 $NAS_IP:8123（保持原有 ws/wss 协议，四处改写均已断言）" \
-  || bad "config.yaml 调整失败（sed 后断言不通过：HA 地址或 127.0.0.1 改写未生效，见上）"
+    && ! grep -q 'music_assistant:' $NAS_DIR/hub/config.yaml \
+    && grep -E 'api:|url:|kws:|  url:' $NAS_DIR/hub/config.yaml" \
+  && ok "config.yaml 已改：netease.api 走 127.0.0.1:3000，kws 走 ws://127.0.0.1:10400/v1/kws，HA 走 $NAS_IP:8123（保持原有 ws/wss 协议，三处改写均已断言；已废弃的 music_assistant 行如有也已删——新 Hub 读到该行会直接拒绝启动）" \
+  || bad "config.yaml 调整失败（sed 后断言不通过：HA 地址或 127.0.0.1 改写未生效，或 music_assistant 行没删掉，见上）"
 
 [ "$DO_UP" != "up" ] && {
   echo; echo "文件已传好，未执行 up。如需启动：NAS_SSH=$NAS_SSH $0 up"
@@ -157,18 +165,19 @@ sleep 15   # 等 Whisper 首次加载模型、Hub 启动
 # ---------- 5. 逐项检查 ----------
 info "5. 逐项检查"
 # FW-P1-2 / FW-P2-7：以前只打印 ps、不数数，ps 成功即 ok；现在数 Up 的容器数，
-# 必须为 8 个（mosquitto 已删，P1-37）。
+# 必须为 7 个（mosquitto 已删，P1-37；Music Assistant 已删，2026-11-18 融合 B）。
 $SSH "cd $NAS_DIR/deploy && docker compose ps --format '{{.Name}} {{.Status}}'" \
   || bad "docker compose ps 失败"
 _up="$($SSH "cd $NAS_DIR/deploy && docker compose ps --format '{{.Status}}' | grep -c '^Up'" 2>/dev/null)"
-if [ "$_up" = "8" ]; then
-  ok "8 个容器都 Up（hub/whisper/piper/kws-sidecar/snapserver/mpd/music-assistant/netease-api；kws-sidecar 首次启动要下载约 5.6MB 唤醒模型，Up 之前会多等一阵）"
+if [ "$_up" = "7" ]; then
+  ok "7 个容器都 Up（hub/whisper/piper/kws-sidecar/snapserver/mpd/netease-api；kws-sidecar 首次启动要下载约 5.6MB 唤醒模型，Up 之前会多等一阵）"
 else
-  bad "Up 的容器是 ${_up:-?} 个，不是 8 个（见上 ps 输出，查哪个容器没起来）"
+  bad "Up 的容器是 ${_up:-?} 个，不是 7 个（见上 ps 输出，查哪个容器没起来）"
 fi
 # FW-P1-2：端口表与 checklist §3 对齐——补 4399（Hub 主端口）与 10400（边车），
-# 1883 随 mosquitto 删除而去掉；8080 走下面的 HTTP 检查，不在这里测 TCP。
-for p in 10300 10200 10400 4399 8095 3000; do
+# 1883 随 mosquitto 删除而去掉，8095 随 Music Assistant 删除而去掉（融合 B）；
+# 8080 走下面的 HTTP 检查，不在这里测 TCP。
+for p in 10300 10200 10400 4399 3000; do
   $SSH "timeout 3 bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/$p'" 2>/dev/null \
     && ok "端口 $p 通" || bad "端口 $p 不通"
 done
@@ -176,11 +185,26 @@ $SSH "ss -tln 2>/dev/null | grep -q ':1705 '" \
   && ok "Snapcast 控制端口 1705 在监听（host 网络）" || bad "1705 不在监听（snapserver 没起来）"
 $SSH "ss -tln 2>/dev/null | grep -q ':1704 '" \
   && ok "Snapcast 流端口 1704 在监听" || bad "1704 不在监听"
-$SSH "curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8095" | grep -q 200 \
-  && ok "Music Assistant Web 正常（http://$NAS_IP:8095 返回 200）" || bad "MA Web 不正常"
+# 2026-11-18 融合 B：MA Web 检查已删（Music Assistant 容器已砍，8095 不再存在）。
 # P1-34：以前 curl 只要连上（哪怕 404/500）即 ok；现在断言 HTTP 200。
 $SSH "curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/" | grep -q 200 \
   && ok "NeteaseCloudMusicApi 正常（http://127.0.0.1:3000/ 返回 200）" || bad "netease-api 不正常（/ 返回的不是 200）"
+# 融合 B 新增：Hub 网易云登录态检查（GET /api/netease/status，带 Web Token）。
+# Web Token 取环境变量 OPEN_XIAOAI_WEB_TOKEN，优先于 .env（与 §0 预检查同规则）；
+# 该变量下面 /api/status 检查也复用，不再重复赋值。
+_web_tok="${OPEN_XIAOAI_WEB_TOKEN:-$(grep -E '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env 2>/dev/null | cut -d= -f2- || true)}"
+# 未登录只警告、不记 FAIL（首次部署本来就是未登录，去 Web 面板扫码即可）；
+# 404 也只警告：该路由由 Hub 面新接，若 Hub 二进制还没带上，部署本身不受影响。
+# 注意：只判断 HTTP 码与 logged_in 字段，不打印响应体（不把 Cookie/登录态细节写进日志）。
+_netease_status="$($SSH "curl -s -m 5 -w ' %{http_code}' -H 'Authorization: Bearer $_web_tok' http://127.0.0.1:8080/api/netease/status" 2>/dev/null)"
+case "$_netease_status" in
+  *'"logged_in":true'*200|*'"logged_in": true'*200) ok "网易云已登录（/api/netease/status 返回 200，logged_in:true）" ;;
+  *'"logged_in":false'*200|*'"logged_in": false'*200) echo "WARN: 网易云未登录（/api/netease/status 返回 200，logged_in:false；首次部署是正常的，去 Hub Web 面板扫码登录，见 NAS_CHECKLIST.md §5）" ;;
+  *200) ok "Hub 网易云状态接口可达（/api/netease/status 返回 200；登录态以 Hub Web 面板为准，未登录时去面板扫码）" ;;
+  *404) echo "WARN: Hub 还没接 /api/netease/status（返回 404，Hub 面待确认）；登录态改去 Hub Web 面板看，部署继续" ;;
+  *401) bad "Hub /api/netease/status 返回 401（OPEN_XIAOAI_WEB_TOKEN 不对或没传进容器，见 .env 与 compose）" ;;
+  *) echo "WARN: Hub /api/netease/status 未返回预期结果（实际：${_netease_status:-无响应}）；先看 Hub 日志，登录态改去 Hub Web 面板确认" ;;
+esac
 # KWS 边车健康检查：模型加载好才返回 200（模型缺失/下载失败时容器报错退出，
 # 这里会直接不通；见 deploy/NAS_CHECKLIST.md §3 的 10400 行）。
 # FW-P1-2：以前只看 curl 退出码——/health 返回 503 时 curl 照样 exit 0；
@@ -190,8 +214,7 @@ $SSH "curl -s -m 5 http://127.0.0.1:10400/health" | grep -q '"model_loaded":true
   || bad "KWS 边车 /health 不正常（应为 200 + model_loaded:true；看 docker compose logs kws-sidecar，首次启动下载模型失败会明确报错退出）"
 # FW-P1-1：带 Web Token 调 /api/status，断言 HTTP 200 且响应含 wake_word。
 # 以前无 token 的 curl 对 401 也 exit 0、恒 PASS；现在 401 即 FAIL。
-# Token 取环境变量 OPEN_XIAOAI_WEB_TOKEN，优先于 .env（与 §0 预检查同规则）。
-_web_tok="${OPEN_XIAOAI_WEB_TOKEN:-$(grep -E '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env 2>/dev/null | cut -d= -f2- || true)}"
+# Token 即上文 _web_tok（环境变量优先于 .env，与 §0 预检查同规则）。
 _status="$($SSH "curl -s -m 5 -w ' %{http_code}' -H 'Authorization: Bearer $_web_tok' http://127.0.0.1:8080/api/status" 2>/dev/null)"
 case "$_status" in
   *wake_word*200) ok "Hub Web 面板正常（/api/status 返回 200，含 wake_word 你好小李）" ;;
@@ -213,4 +236,4 @@ if [ "$FAIL" -gt 0 ]; then
   echo "有 FAIL 项：先看 deploy/NAS_CHECKLIST.md 的故障速查，再把对应日志贴回来。"
   exit 1
 fi
-echo "全部检查通过。下一步：按 deploy/NAS_CHECKLIST.md 做网易云扫码登录（MA 界面点 QR Login）。"
+echo "全部检查通过。下一步：去 Hub Web 面板扫码登录网易云（见 deploy/NAS_CHECKLIST.md §5；Music Assistant 界面已废弃）。"

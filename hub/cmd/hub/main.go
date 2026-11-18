@@ -1,5 +1,5 @@
 // Command hub 是 open-xiaoai-next 的入口：NAS 上唯一常驻的服务。
-// 启动顺序：读配置 → 建注册表 → 接 HA/MA/网易云（失败不致命，记日志继续跑）
+// 启动顺序：读配置 → 建注册表 → 接 HA/网易云（失败不致命，记日志继续跑）
 // → 建语音管线 → 起 wss :4399 → 起 Web 面板 → 自动发现扫描 → 提醒调度 → 摄像头监视。
 package main
 
@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -407,9 +408,13 @@ func main() {
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("config 无效: %v", err)
 	}
-	// P1-45：启动检查 music_folder 必须存在且为目录（Web PUT 不做此检查）。
+	// P1-45：启动检查 music_folder（融合 B：不存在只警告，不再 Fatal；
+	// 本地曲库兜底不可用，点歌仍走网易云直连）。
 	if err := cfg.ValidateStartup(); err != nil {
 		log.Fatalf("config 启动检查失败: %v", err)
+	}
+	if w := cfg.MusicFolderWarning(); w != "" {
+		log.Printf("警告：%s", w)
 	}
 	token := config.Token()
 	// P0-3：启动时拒绝弱 Token（空 / <16 位 / CHANGE_ME 等常见弱值），
@@ -445,17 +450,17 @@ func main() {
 			log.Printf("HA 已连接: %s", cfg.HomeAssistant.URL)
 		}
 	}
-	var maClient *music.MAClient
-	if cfg.Netease.MusicAssistant != "" {
-		// P1-6：MA_TOKEN 为空即拒绝启用 MA（空 Token 等于无认证），
-		// 点歌走 MPD 降级；配好 Token 后重启 Hub 启用。
-		if os.Getenv("MA_TOKEN") == "" {
-			log.Printf("MA_TOKEN 未配置：Music Assistant 不启用，点歌走 MPD 降级")
-		} else {
-			maClient = music.NewMA(cfg.Netease.MusicAssistant, os.Getenv("MA_TOKEN"))
-		}
-	}
 	netease := music.NewNetease(cfg.Netease.API)
+	// 网易云扫码登录（融合 B）：cookie 存在 Hub 数据卷
+	// <data_dir>/netease-cookie.json（0600），只供 SongURL 取 VIP 歌用；
+	// 没登录也能放免费歌。文件不存在表示从未登录过，不报错。
+	neteaseAuth := music.NewNeteaseAuth(cfg.Netease.API, filepath.Join(cfg.Hub.DataDir, "netease-cookie.json"))
+	if ok, err := neteaseAuth.Load(); err != nil {
+		log.Printf("网易云登录 cookie 加载失败（VIP 歌可能放不了，需在 Web 面板重新扫码）: %v", err)
+	} else if ok {
+		netease.SetCookie(neteaseAuth.Cookie())
+		log.Printf("网易云登录 cookie 已加载（VIP 歌可用）")
+	}
 
 	// Agent：全量建表供 Router 按唤醒词路由（P1-38）；默认大脑取
 	// 唤醒词路由指向的 Agent，未配时按 Agent 名排序取首个（确定性，
@@ -528,22 +533,9 @@ func main() {
 		return c.SendBinary(opusFrame)
 	})
 
-	// 路由器。P1-26：启动时查 MA Players() 取默认 player_id 作 QueueID；
-	// 查不到记日志，点歌走 MPD 降级（MA 恢复后需重启 Hub，见 P1-27）。
-	// MPD 与 Snapcast 在启动时 Dial，失败记日志并后台每 30s 重试，晚到
-	// 时经 rt.SetMPD/SetSnap 补接。
-	queueID := ""
-	if maClient != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		q, err := router.DefaultQueueID(ctx, maClient)
-		cancel()
-		if err != nil {
-			log.Printf("MA 播放器未就绪（点歌将走 MPD 降级，MA 恢复后需重启 Hub）: %v", err)
-		} else {
-			queueID = q
-			log.Printf("MA 默认播放器：%s", q)
-		}
-	}
+	// 路由器（融合 B：点歌直连网易云 → MPD，不再经 MA；MPD 与 Snapcast
+	// 在启动时 Dial，失败记日志并后台每 30s 重试，晚到时经
+	// rt.SetMPD/SetSnap 补接）。
 	var mpdClient *music.MPDClient
 	if cfg.Hub.MPD != "" {
 		if c, err := music.DialMPD(cfg.Hub.MPD, 3*time.Second); err != nil {
@@ -564,10 +556,11 @@ func main() {
 	// 而 rt 在下面才赋值：先声明变量，闭包调用时再读。
 	var rt *router.Router
 	rt = router.New(router.Deps{
-		HA: haClient, MA: maClient, Netease: netease, Agent: agentClient,
+		HA: haClient, Netease: netease, Agent: agentClient,
 		Agents: agentClients, WakeWordRoutes: cfg.WakeWordRoutes,
-		Reminders: remStore, Memory: memory, QueueID: queueID,
-		MPD: mpdClient, Snap: snapClient,
+		Reminders: remStore, Memory: memory,
+		MusicFolder: cfg.MusicFolder,
+		MPD:         mpdClient, Snap: snapClient,
 		SnapLatencies: cfg.Hub.SnapcastLatencies,
 		SnapGroupID:   cfg.Hub.SnapcastGroup,
 		SnapStreamID:  cfg.Hub.SnapcastStream,
@@ -607,19 +600,6 @@ func main() {
 	var watcher *alerts.Watcher
 	go func() {
 		for range time.Tick(30 * time.Second) {
-			// MA：恢复后取默认播放器 ID 热更新 QueueID（P1-27 核心）。
-			if maClient != nil {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				players, err := maClient.Players(ctx)
-				cancel()
-				if err != nil {
-					log.Printf("看门狗：MA 探活失败: %v", err)
-				} else if len(players) > 0 && players[0].PlayerID != queueID {
-					queueID = players[0].PlayerID
-					rt.SetQueueID(queueID)
-					log.Printf("看门狗：MA 默认播放器更新为 %s", queueID)
-				}
-			}
 			// MPD：Ping 失败即断开、Router 清空，下轮重拨。
 			if cfg.Hub.MPD != "" {
 				if mpdClient == nil {
@@ -906,6 +886,11 @@ func main() {
 		}
 		return "ok"
 	}
+	// 融合 B：音乐端点与网易云登录端点的后端——Router（MPD 队列 +
+	// Hub 内存当前曲）、网易云客户端、扫码登录管理器。
+	webServer.Music = rt
+	webServer.Netease = netease
+	webServer.NeteaseAuth = neteaseAuth
 	webServer.PushOTA = func(deviceID, version, url, sha256 string) error {
 		c, ok := server.Conn(deviceID)
 		if !ok {

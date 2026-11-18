@@ -103,7 +103,6 @@ func TestValidateDownstreamURLs(t *testing.T) {
 	c = base()
 	c.HomeAssistant.URL = "ws://192.168.1.10:8123"
 	c.Agents = map[string]Agent{"hermes": {BaseURL: "http://hermes:8642/v1", Model: "deepseek-chat"}}
-	c.Netease.MusicAssistant = "http://music-assistant:8095"
 	c.Netease.API = "http://netease-api:3000"
 	c.Hub.ScanCIDR = "192.168.1.0/24"
 	if err := c.Validate(); err != nil {

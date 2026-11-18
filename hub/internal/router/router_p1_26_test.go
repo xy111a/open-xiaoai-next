@@ -1,7 +1,7 @@
 package router
 
-// P1-26 回归测试：DefaultQueueID、MA 未就绪明说、用 main 同款 Deps 构造
-// Router 后点歌走通且 Snapcast 延迟/切流被调到。
+// P1-26 回归测试（融合 B：MA 已移除）：用 main 同款 Deps 构造 Router
+// 后直连点歌走通且 Snapcast 延迟/切流被调到。
 
 import (
 	"bufio"
@@ -115,88 +115,14 @@ func (f *fakeSnapP1) sawParam(method, key string, want any) bool {
 	return false
 }
 
-// ---- 假 MA（players/all + track_by_name + play_media）----
-
-func fakeMAP1(t *testing.T, playersJSON string) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		var body map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		switch body["command"] {
-		case "players/all":
-			fmt.Fprintf(w, `{"message_id":1,"result":%s}`, playersJSON)
-		case "music/track_by_name":
-			fmt.Fprint(w, `{"message_id":2,"result":{"uri":"library://track/12345"}}`)
-		case "player_queues/play_media":
-			fmt.Fprint(w, `{"message_id":3,"result":{}}`)
-		default:
-			fmt.Fprint(w, `{"message_id":0,"error":{"code":"unknown","message":"no such command"}}`)
-		}
-	}))
-}
-
-func TestDefaultQueueID(t *testing.T) {
-	ctx := context.Background()
-	// 有播放器：取第一个。
-	srv := fakeMAP1(t, `[{"player_id":"p1","name":"客厅"},{"player_id":"p2","name":"卧室"}]`)
-	defer srv.Close()
-	q, err := DefaultQueueID(ctx, music.NewMA(srv.URL, ""))
-	if err != nil {
-		t.Fatalf("DefaultQueueID: %v", err)
-	}
-	if q != "p1" {
-		t.Fatalf("默认 QueueID 应为第一个播放器 p1，实际 %q", q)
-	}
-	// 一个播放器都没有：明确报 MA 未就绪。
-	empty := fakeMAP1(t, `[]`)
-	defer empty.Close()
-	if _, err := DefaultQueueID(ctx, music.NewMA(empty.URL, "")); err == nil {
-		t.Fatal("没有播放器时 DefaultQueueID 应报错")
-	} else if !strings.Contains(err.Error(), "MA 未就绪") {
-		t.Fatalf("错误应明说 MA 未就绪，实际: %v", err)
-	}
-	// MA 未配置：同样报 MA 未就绪。
-	if _, err := DefaultQueueID(ctx, nil); err == nil || !strings.Contains(err.Error(), "MA 未就绪") {
-		t.Fatalf("MA 为 nil 时应报 MA 未就绪，实际: %v", err)
-	}
-}
-
-func TestMusicMANotReadyMessage(t *testing.T) {
-	deps, _, _, _ := testDeps(t)
-	// MA 已配（客户端存在）但 QueueID 为空、MPD 也没有：点歌应明确报 MA 未就绪，
-	// 而不是含糊的“播放器未配置”或静默走 Agent。
-	srv := fakeMAP1(t, `[]`)
-	defer srv.Close()
-	deps.MA = music.NewMA(srv.URL, "")
-	deps.QueueID = ""
-	deps.MPD = nil
-	deps.Netease = nil
-	r := New(deps, nil)
-	reply, err := r.Route(context.Background(), "lx06-1", "播放青花瓷")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(reply, "MA 未就绪") {
-		t.Fatalf("点歌应明确报 MA 未就绪，实际 %q", reply)
-	}
-}
-
 // TestMainStyleDepsMusicIntegration：用 main.go 同款 Deps 构造 Router
-// （MA → Players 取 QueueID、Netease、MPD、Snapcast 全接上），点歌应走通，
+// （Netease、MPD、Snapcast 全接上，不再经 MA），点歌应走通，
 // 且 Snapcast 延迟校准与分组切流都被真实调到。
 func TestMainStyleDepsMusicIntegration(t *testing.T) {
 	ctx := context.Background()
 	deps, _, _, _ := testDeps(t)
 
-	// --- 与 cmd/hub/main.go 同款的接线顺序 ---
-	maSrv := fakeMAP1(t, `[{"player_id":"p1","name":"客厅"}]`)
-	defer maSrv.Close()
-	maClient := music.NewMA(maSrv.URL, "")
-	queueID, err := DefaultQueueID(ctx, maClient)
-	if err != nil {
-		t.Fatalf("启动时查 MA 播放器失败: %v", err)
-	}
+	// --- 与 cmd/hub/main.go 同款的接线顺序（融合 B：直连，无 MA）---
 	ne := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasPrefix(r.URL.Path, "/search") {
@@ -214,8 +140,6 @@ func TestMainStyleDepsMusicIntegration(t *testing.T) {
 	}
 	defer snapClient.Close()
 
-	deps.MA = maClient
-	deps.QueueID = queueID
 	deps.Netease = music.NewNetease(ne.URL)
 	deps.MPD = mpdFake.client(t)
 	deps.Snap = snapClient
@@ -228,7 +152,7 @@ func TestMainStyleDepsMusicIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(reply, "正在播放青花瓷") {
+	if !strings.Contains(reply, "正在播放周杰伦的青花瓷") {
 		t.Fatalf("main 同款 Deps 下点歌应走通，实际 %q", reply)
 	}
 	// Snapcast 接线：应调过延迟校准与分组切流。
@@ -247,9 +171,9 @@ func TestMainStyleDepsMusicIntegration(t *testing.T) {
 	}
 }
 
-// MPD 降级路径同样要调 Snapcast：MA 无播放器时走网易云 + MPD，点歌成功
-// 后延迟/切流仍应执行；且 SetMPD/SetSnap 晚到补接后应生效。
-func TestMainStyleDepsMusicFallbackAppliesSnapcast(t *testing.T) {
+// 直连点歌同样要调 Snapcast：MPD 未接时点歌应明说播放器未配置；
+// SetMPD/SetSnap 晚到补接后应走通，延迟/切流仍应执行。
+func TestMainStyleDepsMusicDirectAppliesSnapcast(t *testing.T) {
 	ctx := context.Background()
 	deps, _, _, _ := testDeps(t)
 	ne := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -261,19 +185,15 @@ func TestMainStyleDepsMusicFallbackAppliesSnapcast(t *testing.T) {
 		fmt.Fprint(w, `{"code":200,"data":[{"id":12345,"url":"http://music.example.com/12345.mp3"}]}`)
 	}))
 	defer ne.Close()
-	maSrv := fakeMAP1(t, `[]`)
-	defer maSrv.Close()
-	deps.MA = music.NewMA(maSrv.URL, "")
-	deps.QueueID = "" // 启动时 Players() 为空
 	deps.Netease = music.NewNetease(ne.URL)
 	deps.SnapLatencies = map[string]int{"卧室": 15} // 按显示名匹配
 	deps.SnapGroupID = "g1"
 	deps.SnapStreamID = "NAS音乐"
 	r := New(deps, nil)
 
-	// 启动时 MPD/Snap 都没接上：MA 无播放器且 MPD 为 nil，点歌应明确报 MA 未就绪。
-	if reply, err := r.Route(ctx, "lx06-1", "播放青花瓷"); err != nil || !strings.Contains(reply, "MA 未就绪") {
-		t.Fatalf("MPD 未接时应报 MA 未就绪，实际 reply=%q err=%v", reply, err)
+	// 启动时 MPD/Snap 都没接上：点歌应明确报播放器未配置，而不是含糊地落到 Agent。
+	if reply, err := r.Route(ctx, "lx06-1", "播放青花瓷"); err != nil || !strings.Contains(reply, "播放器未配置") {
+		t.Fatalf("MPD 未接时应报播放器未配置，实际 reply=%q err=%v", reply, err)
 	}
 	// 后台重试晚到补接（main.go 的 retry 行为）：SetMPD/SetSnap 后应走通。
 	mpdFake := startFakeMPD(t)
@@ -291,9 +211,9 @@ func TestMainStyleDepsMusicFallbackAppliesSnapcast(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(reply, "正在播放周杰伦的青花瓷") {
-		t.Fatalf("补接 MPD 后降级点歌应走通，实际 %q", reply)
+		t.Fatalf("补接 MPD 后直连点歌应走通，实际 %q", reply)
 	}
 	if !snapFake.saw("Client.SetLatency") || !snapFake.saw("Group.SetStream") {
-		t.Fatalf("降级点歌成功后也应调 Snapcast 延迟/切流，实际收到: %v", snapFake.methods)
+		t.Fatalf("直连点歌成功后也应调 Snapcast 延迟/切流，实际收到: %v", snapFake.methods)
 	}
 }

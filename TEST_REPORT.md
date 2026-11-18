@@ -487,3 +487,37 @@ CI 首次实跑（run 44063914126）：Rust ✓、Semgrep ✓；Go ✗、Python 
 - lint 规则更新（协调员收尾）：P1 改动删了自动扫描、`wyoming.Dial` 改为 `NewDialer` 后，`scripts/lint.sh` 失败（规则 1 三项 + 规则 2 五处 + golangci 两项）——规则本身过时，不是代码回归。已修：`check-wiring.go` 删 discovery 两条、`wyoming.Dial` 改为 `NewDialer` 检查、`intercom.Start` 正则改为 `Intercom\.Start\(`、`deferredWiring` 5 个旧条目全部摘掉；删未使用的 `boolPtr`；S1008 简化；`wyoming.go` 与 `main.go` 补 nil 守卫。修后 lint 全部通过。
 - 新发现、未修（协调员复核确认属实，留待定夺）：`patch_firmware.py:patch_login` 的第一次 `re.subn` 结果被丢弃——先对 `$[156]$` 替换一次，随后重读文件、只对 `$1$` 再替换一次并校验 `n==1`；shadow 里 root 行是 `$6$`（正是新补丁镜像的格式）时必抛错，已打过补丁的 rootfs 重跑 `patch_login` 必失败。建议修法：删掉第二次 `_read` 与重复 subn，只保留第一次并校验 `n==1`，约 4 行 + 1 个回归测试。
 - 全量测试（协调员独立重跑）：`go test -count=1 ./...` 22 包全部 ok、**223 passed**（基线 156，+67）；`go vet` 干净；`go test -count=1 -race ./...` 22 包全部 ok（Hub 工人首遍 -race 时 kws 包 flake 一次，未定位；协调员重跑未复现）；`cargo test` **81 passed**（基线 53，+28）、`cargo test --features sherpa-kws` **85 passed**（基线 57，+28）、fmt OK、clippy 0 warnings；`pytest firmware-patch/tests/` **68 passed**（基线 61，+7；含 Friday 复核补的 `patch_login` 幂等回归测试）；`kws-sidecar` pytest **25 passed**（基线 16，+9）；`./scripts/lint.sh` 全部通过；客户端 e2e（真实 `run_session` + fake Hub，合成正弦波 Opus）3 项 × 各 3 次，9/9 通过。
+
+## 音乐融合 B（2026-11-18，分支 `fuse-netease-direct`，部署面）
+
+- 范围：部署面（`deploy/` + 文档）。砍 Music Assistant，Hub 直连网易云；
+  Hub 面（Go 代码 + 8 条新 Web 路由 + Cookie 落盘 + `music_folder` 改 warn）
+  由另一位工人在同分支并行改，见仓库根目录 `MUSIC_FUSION.md`。
+- 本节只写部署面已跑通的校验；**最终全量数字待协调员填入最终全量数字**
+  （Go 全量测试由协调员汇总时跑，本轮按任务要求未跑 Go 测试、未编任何数字）。
+
+### 本轮跑通的校验（部署面，2026-11-18，本机）
+
+| # | 命令 | 结果 |
+|---|---|---|
+| 1 | `python3 -c "import yaml; yaml.safe_load(open('deploy/docker-compose.yml'))"`（结构校验；本机无 docker，未做 `docker compose config`） | 通过：7 个服务（hub / whisper / piper / kws-sidecar / snapserver / mpd / netease-api），6 个卷（无 `ma-data`）；`depends_on`：hub → whisper/piper/kws-sidecar，snapserver → mpd——无任何服务依赖 MA |
+| 2 | `bash -n deploy/nas-install.sh` | 通过 |
+| 3 | grep 复核（`git grep` + `grep -r`，deploy/ + 根 README + `docs/DECISIONS.md`） | 通过：无活 MA 引用；剩余 MA/`8095` 字样全部是“已砍/已删/已废弃”类迁移注释；`MA_TOKEN` 在 deploy/ 里只出现在迁移注释与 README 迁移步骤里，compose 的 `environment` 里确认没有 `MA_TOKEN`；deploy/ 里“不存在再问 / 必须存在 / Fatal”说法已清零（仅剩一处注释说明 Hub 侧 Fatal 待改） |
+| 4 | 全仓 `git grep music-assistant\|MA_TOKEN\|8095` | 残留分类：历史审计文档（不改写历史）、`.semgrep/rules.yml:121`（有意保留的密钥检测）、`hub/config.yaml:59` 与 Hub Go 代码（归 Hub 面）、`client/Cargo.lock` 校验和巧合、`deploy/hub-linux-amd64` 旧二进制（待 Hub 面重编）。`MusicAssistant` / `MAClient` 的残留全部在 Hub Go 代码里，归 Hub 面负责 |
+
+### 全量测试（协调员独立重跑，2026-11-18）
+
+- Go 全量：`go test -count=1 ./...` 22 包全部 ok、**236 passed**（基线 223：删 6 个 MA 测试、新增 18 个融合测试 + `TestMusicViaMA`→`TestMusicDirect` 改名，账对得上）；`go vet` 干净；`go test -count=1 -race` 改动包（music/router/web/config/cmd/hub）全绿。
+- `cargo test` **81 passed**（基线 81）、`cargo test --features sherpa-kws` **85 passed**（基线 85）、fmt OK、clippy 0 warnings。
+- `pytest firmware-patch/tests/` **68 passed**（基线 68）；`kws-sidecar` pytest **25 passed**（基线 25）。
+- `./scripts/lint.sh` **全部通过**（协调员修了 3 处：`hub/cmd/hub/main.go` gofmt、`hub/internal/music/music.go` 的 7 处 `fmt.Sscanf` 改 `strconv`、`scripts/check-wiring.go` 摘掉随 MA 删除的 `NewMA`/`QueueID` 两项检查，42 → 40 项）。
+- `docker compose config`：本机无 docker，未做；NAS 上首次 `up` 前请跑一次核对。
+- NAS 实测（`up` + 7 容器 Up + `/api/netease/status` + Web 面板扫码 + 语音点歌出声）：仍 BLOCKED（关口 2，无 NAS 实测）。
+
+### BLOCKED 清单（本轮之后仍阻塞的）
+
+- **Hub 面 11 条新 Web 路由已落地、全量测试通过、二进制已重编**：`web.go:173–183` 注册 11 个 handler、新文件 `hub/internal/music/netease_auth.go`；`deploy/hub-linux-amd64` 已重编（12,018,496 字节，含新路由，`music-assistant:8095`/`MA_TOKEN` 零命中）。
+- **`music_folder` 改 warn 已落地、全量测试通过**：`ValidateStartup()` 不再因文件夹缺失 Fatal、新增 `MusicFolderWarning()`，`TestValidateStartupMusicFolder` 已同步。
+- **网易云扫码登录（关口 7）**：仍需 bai 的网易云账号在 Hub Web 面板扫码；流程文档已写好 （`deploy/README.md` §网易云扫码登录融合 B 版、`deploy/NAS_CHECKLIST.md` §5），未实测。
+- **歌单/收藏浏览未做**：本轮无歌单/收藏浏览接口，FR-05 验收口径收窄为点歌/队列/歌词；是否补由 Friday 与 bai 另定。
+- 其余关口（刷机、NAS 部署、HA 联调、真人唤醒率等）见“硬件关口检查清单”，状态不变。

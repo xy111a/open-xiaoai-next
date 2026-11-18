@@ -15,6 +15,7 @@
 package web
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
@@ -24,11 +25,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/huajun/open-xiaoai-next/hub/internal/config"
+	"github.com/huajun/open-xiaoai-next/hub/internal/music"
 	"github.com/huajun/open-xiaoai-next/hub/internal/ota"
 	"github.com/huajun/open-xiaoai-next/hub/internal/registry"
 )
@@ -43,6 +46,22 @@ const (
 	authFailWindow    = time.Minute
 	authBlockDuration = 5 * time.Minute
 )
+
+// MusicBackend 是 Web 音乐端点用的 Router 侧接口（融合 B：Hub 直连，
+// MPD 队列 + Hub 内存当前曲）。由 main 把 *router.Router 接进来；
+// 为 nil 时音乐端点一律 503（未接线，不假装成功）。
+type MusicBackend interface {
+	MusicPause(ctx context.Context) error
+	MusicResume(ctx context.Context) error
+	MusicNext(ctx context.Context) error
+	MusicPrevious(ctx context.Context) error
+	// PlaybackState 返回 MPD 状态、当前曲、队列。
+	PlaybackState(ctx context.Context) (state string, current music.MPDSong, queue []music.MPDSong, err error)
+	MusicQueue(ctx context.Context) ([]music.MPDSong, error)
+	MusicLyric(ctx context.Context, id int64) (string, error)
+	// CurrentTrack 返回 Hub 内存里的当前曲（网易云歌名/歌手/来源）。
+	CurrentTrack() (music.NeteaseSong, string, bool)
+}
 
 // Server 是 Web 面板服务。
 type Server struct {
@@ -79,6 +98,16 @@ type Server struct {
 	// hub_ca_fingerprint（客户端启动时强制要求，不写即报错退出）。
 	// 为空时该端点回 503（Hub 未启用 TLS）。
 	HubFingerprint string
+
+	// Music 是音乐后端（融合 B：main 把 Router 接进来），音乐端点
+	// /api/music/* 都经它调 MPD 队列；为 nil 时一律 503。
+	Music MusicBackend
+	// Netease 是网易云客户端（歌词端点用；扫码登录成功后 main 会把
+	// cookie 交给它，VIP 歌才能取地址）。
+	Netease *music.NeteaseClient
+	// NeteaseAuth 是网易云扫码登录管理器（/api/netease/* 用）；
+	// 为 nil 时登录端点一律 503。
+	NeteaseAuth *music.NeteaseAuth
 
 	authMu       sync.Mutex
 	authFailures map[string]*authAttempt
@@ -139,6 +168,19 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/config", s.requireAuth(s.configAPI))
 	mux.HandleFunc("/api/ota", s.requireAuth(s.otaAPI))
 	mux.HandleFunc("/api/fingerprint", s.requireAuth(s.fingerprintAPI))
+	// 网易云扫码登录（融合 B）与音乐控制：与上面一样走 requireAuth，
+	// 不新开无鉴权口。
+	mux.HandleFunc("/api/netease/status", s.requireAuth(s.neteaseStatus))
+	mux.HandleFunc("/api/netease/login/qr", s.requireAuth(s.neteaseLoginQR))
+	mux.HandleFunc("/api/netease/login/qr/check", s.requireAuth(s.neteaseLoginQRCheck))
+	mux.HandleFunc("/api/netease/logout", s.requireAuth(s.neteaseLogout))
+	mux.HandleFunc("/api/music/status", s.requireAuth(s.musicStatus))
+	mux.HandleFunc("/api/music/pause", s.requireAuth(s.musicPause))
+	mux.HandleFunc("/api/music/resume", s.requireAuth(s.musicResume))
+	mux.HandleFunc("/api/music/next", s.requireAuth(s.musicNext))
+	mux.HandleFunc("/api/music/previous", s.requireAuth(s.musicPrevious))
+	mux.HandleFunc("/api/music/queue", s.requireAuth(s.musicQueue))
+	mux.HandleFunc("/api/music/lyric", s.requireAuth(s.musicLyric))
 	return mux
 }
 
@@ -367,6 +409,14 @@ func (s *Server) configAPI(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "JSON 解析失败: " + err.Error()})
 			return
 		}
+		// 融合 B：netease.music_assistant 已废弃（MA 已移除），经 Web
+		// 写回来也要明确拒绝，不要静默丢掉——否则用户以为 MA 还在。
+		if ne, ok := patch["netease"].(map[string]any); ok {
+			if _, ok := ne["music_assistant"]; ok {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "netease.music_assistant 已废弃：MA 已移除，Hub 改为直连网易云"})
+				return
+			}
+		}
 		lock := s.cfgLock()
 		lock.Lock()
 		defer lock.Unlock()
@@ -517,4 +567,235 @@ func (s *Server) otaPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+// ---- 网易云扫码登录（融合 B：/api/netease/*）----
+
+// neteaseStatus：GET /api/netease/status，返回登录状态。
+// logged_in=false 时 needs_rescan=true（从未登录或 cookie 已过期，需重扫）。
+func (s *Server) neteaseStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只支持 GET"})
+		return
+	}
+	if s.NeteaseAuth == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "网易云登录未接线"})
+		return
+	}
+	loggedIn, nickname, expiresAt, err := s.NeteaseAuth.Status(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "查登录状态失败: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"logged_in":    loggedIn,
+		"nickname":     nickname,
+		"expires_at":   expiresAt,
+		"needs_rescan": !loggedIn,
+	})
+}
+
+// neteaseLoginQR：POST /api/netease/login/qr，建一个登录二维码。
+// 返回 key（轮询用）与 qrurl/qrimg（前端展示扫码）。
+func (s *Server) neteaseLoginQR(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只支持 POST"})
+		return
+	}
+	if s.NeteaseAuth == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "网易云登录未接线"})
+		return
+	}
+	key, qrURL, qrImg, err := s.NeteaseAuth.CreateQR(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "建二维码失败: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"key": key, "qrurl": qrURL, "qrimg": qrImg})
+}
+
+// neteaseLoginQRCheck：GET /api/netease/login/qr/check?key=K，轮询扫码结果。
+// code：800 过期（需重新建码）、801 等待扫码、802 待确认、803 成功。
+// 803 时 cookie 已写盘，同时交给 Netease 客户端（VIP 歌取地址用）。
+func (s *Server) neteaseLoginQRCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只支持 GET"})
+		return
+	}
+	if s.NeteaseAuth == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "网易云登录未接线"})
+		return
+	}
+	key := r.URL.Query().Get("key")
+	if key == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少 key 参数"})
+		return
+	}
+	code, message, err := s.NeteaseAuth.CheckQR(r.Context(), key)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "查扫码结果失败: " + err.Error()})
+		return
+	}
+	if code == music.QRCodeSuccess && s.Netease != nil {
+		s.Netease.SetCookie(s.NeteaseAuth.Cookie())
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"code":      code,
+		"message":   message,
+		"logged_in": code == music.QRCodeSuccess,
+	})
+}
+
+// neteaseLogout：POST /api/netease/logout，清除登录（删数据卷 cookie 文件，
+// 同时清 Netease 客户端的 Cookie）。
+func (s *Server) neteaseLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只支持 POST"})
+		return
+	}
+	if s.NeteaseAuth == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "网易云登录未接线"})
+		return
+	}
+	if err := s.NeteaseAuth.Logout(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "登出失败: " + err.Error()})
+		return
+	}
+	if s.Netease != nil {
+		s.Netease.SetCookie("")
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// ---- 音乐控制（融合 B：/api/music/*，经 Music 后端调 MPD）----
+
+func (s *Server) musicBackend(w http.ResponseWriter) MusicBackend {
+	if s.Music == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "音乐未接线（MPD/Router 未配置）"})
+		return nil
+	}
+	return s.Music
+}
+
+// musicStatus：GET /api/music/status，返回当前曲 + 播放状态。
+// current 优先用 Hub 内存里的当前曲（网易云歌名/歌手）；没点过歌时
+// 用 MPD 当前曲目（文件/标题）；state 是 MPD 状态 play/pause/stop。
+func (s *Server) musicStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只支持 GET"})
+		return
+	}
+	m := s.musicBackend(w)
+	if m == nil {
+		return
+	}
+	state, cur, queue, err := m.PlaybackState(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "取播放状态失败: " + err.Error()})
+		return
+	}
+	var current map[string]any
+	if song, source, ok := m.CurrentTrack(); ok {
+		current = map[string]any{"id": song.ID, "name": song.Name, "artist": song.Artist, "source": source}
+	} else if cur.File != "" {
+		name := cur.Title
+		if name == "" {
+			name = cur.Name
+		}
+		if name == "" {
+			name = cur.File
+		}
+		current = map[string]any{"name": name, "artist": cur.Artist, "file": cur.File, "source": "mpd"}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"state":     state,
+		"current":   current,
+		"queue_len": len(queue),
+	})
+}
+
+// musicControl 是 pause/resume/next/previous 四个 POST 端点的公共实现。
+func (s *Server) musicControl(w http.ResponseWriter, r *http.Request, action string, fn func(context.Context) error) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只支持 POST"})
+		return
+	}
+	m := s.musicBackend(w)
+	if m == nil {
+		return
+	}
+	if err := fn(r.Context()); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": action + "失败: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) musicPause(w http.ResponseWriter, r *http.Request) {
+	s.musicControl(w, r, "暂停", func(ctx context.Context) error { return s.Music.MusicPause(ctx) })
+}
+
+func (s *Server) musicResume(w http.ResponseWriter, r *http.Request) {
+	s.musicControl(w, r, "继续", func(ctx context.Context) error { return s.Music.MusicResume(ctx) })
+}
+
+func (s *Server) musicNext(w http.ResponseWriter, r *http.Request) {
+	s.musicControl(w, r, "下一首", func(ctx context.Context) error { return s.Music.MusicNext(ctx) })
+}
+
+func (s *Server) musicPrevious(w http.ResponseWriter, r *http.Request) {
+	s.musicControl(w, r, "上一首", func(ctx context.Context) error { return s.Music.MusicPrevious(ctx) })
+}
+
+// musicQueue：GET /api/music/queue，返回当前队列。
+func (s *Server) musicQueue(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只支持 GET"})
+		return
+	}
+	m := s.musicBackend(w)
+	if m == nil {
+		return
+	}
+	q, err := m.MusicQueue(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "取队列失败: " + err.Error()})
+		return
+	}
+	if q == nil {
+		q = []music.MPDSong{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"queue": q})
+}
+
+// musicLyric：GET /api/music/lyric?id=N，返回歌词；不带 id 时用当前曲。
+func (s *Server) musicLyric(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只支持 GET"})
+		return
+	}
+	m := s.musicBackend(w)
+	if m == nil {
+		return
+	}
+	var id int64
+	if raw := r.URL.Query().Get("id"); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id 不是数字"})
+			return
+		}
+		id = n
+	}
+	lyric, err := m.MusicLyric(r.Context(), id)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	if id == 0 {
+		if song, _, ok := m.CurrentTrack(); ok {
+			id = song.ID
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "lyric": lyric})
 }
