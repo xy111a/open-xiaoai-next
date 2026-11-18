@@ -551,12 +551,16 @@ CI 首次实跑（run 44063914126）：Rust ✓、Semgrep ✓；Go ✗、Python 
   `func (*Client).streamFor is unused`（Hub 面已提交代码 611161d 引入，归 Hub 面修）；
   其余步骤全过（规则 1 接线 40 项、规则 2 nil 守卫、规则 3 bounds、semgrep、
   Rust vec! 检查、cargo fmt/clippy、bash -n）。`lint.sh shell` / `lint.sh rust` 各自全部通过。
+  （【2026-11-18 协调员收尾：`streamFor` 已删——它是 N-P2-2 修复后剩下的死代码，
+  无调用方；`golangci-lint run ./internal/kws/` 现为 exit 0。见下文“协调员收尾”。】）
 - `bash -n`：patch.sh / unpack.sh / flash-check.sh / nas-install.sh / lint.sh /
   check-vec-len.sh 全部通过；compose 用 python yaml 解析验证（本机无 docker）：
   7 服务、cap_drop ALL 全有、hub + kws-sidecar 的 user 均为 `1000:1000`。
 - `flash-check.sh` 四路（lx06 / oh2p × 默认 / --strict）**全部 exit 1**：这是预期的
   旧镜像报告（§4b FAIL inittab P1-36 + WARN .bak/包装器/旧直行），不是回归；
   现版 patch.sh 刚打出的镜像在 pytest 里通过（`test_flash_check_ok_on_fresh_build`）。
+  （【2026-11-18 协调员收尾：镜像已重编（见下文“协调员收尾：补丁镜像 2026-11-18 重编”），
+  四路现为 **全部 exit 0**，无 WARN。】）
 - `nas-install.sh` §0 Hub 清单校验：正向 PASS（12,093,552 字节与清单一致），
   反向控制 PASS（改错清单即 FAIL）；其余 §0 项因本机无 deploy/.env 而 FAIL（预期内）。
 - Hub 二进制冒烟（2026-11-18 P2 轮重编，12,093,552 字节、
@@ -567,9 +571,68 @@ CI 首次实跑（run 44063914126）：Rust ✓、Semgrep ✓；Go ✗、Python 
 
 ### 本轮之后仍阻塞的（固件 / 部署 / CI 面）
 
-- **包内补丁镜像过期三缺口**（P1-36 inittab、P2-33 .bak、P2-34 包装器）：
-  `flash-check.sh` §4b 现会 FAIL；是否重编镜像需父代理/协调员定夺（本轮按任务决定不重编）。
 - **真机项**：刷机、NAS 部署、HA 联调、真人唤醒率、Dockerfile.hub 首次构建（本机无 docker）
   均未验证，见 `FLASH_RUNBOOK.md` 与 `NAS_CHECKLIST.md`。
-- **lint 红**：golangci-lint 的 `streamFor` unused（Hub 面，见上文）。
-- **OH2P 官方回滚包不在本机**：刷 OH2P 前先用 `download-ota.py` 下好并核对 SHA（见 `docs/RELEASE.md` §1）。
+- （已解决，不再阻塞）包内补丁镜像过期三缺口——2026-11-18 已重编，见下文“协调员收尾”。
+- （已解决，不再阻塞）lint 红 `streamFor` unused——已删，见下文。
+- （已解决，不再阻塞）OH2P 官方回滚包——已从 `work/` 拷入 `firmware/oh2p_1.58.6.bin`
+  并核对 SHA256 `1f351d87…c27b`（36,042,824 字节，与白名单一致）。
+
+### 协调员收尾：补丁镜像 2026-11-18 重编 + lint 修复（2026-11-18）
+
+- **决定**：固件面工人按任务“本轮不重编”把镜像过期三缺口留作定夺项；协调员定夺为**重编**
+  （RELEASE.md §0 的二选一里 (a)）。理由：缺口 1 是物理接触串口即可进 root shell
+  （P1-36），接受它再刷等于明知故犯；上机包的用途就是“刷机那天不用现找东西”，
+  一个自带 FAIL 的包不是可用的包。重编不改任何已定决策，不产生新密码（见下）。
+- **重编方法**：`patch.sh lx06 1.94.13` + `patch.sh oh2p 1.58.6`（现版脚本），
+  密码用一次性随机值走 `SSH_PASSWORD_FILE`（文件在 `/tmp`，用完即删，不进任何日志/报告）；
+  随后把两份新镜像的 shadow root 行**换回旧镜像的 `$6$` hash**（逐字节比对验证一致），
+  再用与 `patch.sh` 完全相同的参数重打包（`mksquashfs -comp xz -b 131072
+  -noappend -all-root -always-use-fragments -no-xattrs -no-exports`）。
+  结果：**root 密码未换**，bai 手里已有的密码继续有效；未生成、未记录、未传递任何新密码。
+- **新值**：LX06 38,457,344 字节、SHA256
+  `7dafb9507bdc4894715f2978ffaf5fd6a11af18ad61ed268f48c6309f0a05e21`；
+  OH2P 30,179,328 字节、SHA256
+  `fe2bab99eb15e423b689c24bace6fec1b665b1073dc12ec1c9fa2e4433b5c926`。
+  旧值（LX06 `7266aba9…d97b3`、OH2P `139de363…6415`）已作废。
+  同步位置：`FLASH_RUNBOOK.md` §1.1（含过期注改写）、`flash-check.sh`
+  `KNOWN_PATCHED_SHA256`（另把三处写死的“2026-11-17 实测值”字样改为不带日期的“记录值”）、
+  `docs/RELEASE.md` §0–§2、`~/workspace/speaker-open-xiaoai-rebuild/release/images/`。
+- **重编中修掉的两个管线缺口**（都是重编时实测触发的，不是顺带扩范围）：
+  1. `patch.sh` 从不传 `--cert-dir`：2026-11-17 的首版镜像是绕过 `patch.sh`、直接调
+     `patch_firmware.py --cert-dir` 打的；直接跑 `patch.sh` 会静默产出无 mTLS 证书的镜像。
+     现 `patch.sh` 默认用 `work/certs` 装入（`CERT_DIR` 可覆盖），目录不存在直接失败，
+     仅测试可设 `PATCH_NO_CERTS=1` 跳过；`flash-check.sh` §4b 新增证书核对
+     （ca.crt/client.crt 存在、client.key 0600，缺失即 FAIL）。
+     回归测试：`test_patch_sh_requires_cert_dir`（无证书目录即 FAIL 的 fail-closed 行为
+     + `PATCH_NO_CERTS=1` 跳过后走到 rootfs 检查）；e2e 测试改设 `PATCH_NO_CERTS=1`
+     （它只验打补丁，不验证书装入）。
+  2. `patch.sh` §6 验 `.bak` 用 "slave.pcm Capture" 标记法，OH2P 原厂 asound.conf 里就有
+     该行（mico_record/noop 出厂即走 Capture），重编 OH2P 时误杀致 `patch.sh` exit 1。
+     现改为与原始 root.squashfs 逐字节比对（“备份即原厂”的本来定义，与型号无关）。
+     附带发现：OH2P 解包出的 `work/oh2p_1.58.6/rootfs` 是 2026-11-17 被就地打过补丁的
+     （asound.conf 已含补丁内容），先用 `unpack.sh oh2p 1.58.6` 重新解出原厂 rootfs 才重编；
+     LX06 的 rootfs 是原厂态，未受影响。
+     回归测试：`test_oh2p_factory_asound_has_capture_marker_and_bak_matches`
+     （钉死 OH2P 原厂含该行的型号差异 + 重编镜像的 .bak 与原厂逐字节一致）。
+- **验证**：`flash-check.sh` 四路（lx06 / oh2p × 默认 / `--strict`）**全部 exit 0**，
+  无 WARN；两份新镜像的 shadow root 行与旧镜像逐字节一致（Python 比对）；
+  inittab `/bin/login`、.bak、init 包装器、证书 0600 均在 §4b 内核对通过。
+  固件 pytest 新增 2 项（`test_patch_sh_requires_cert_dir`、
+  `test_oh2p_factory_asound_has_capture_marker_and_bak_matches`），
+  本轮固件 pytest 总数 84 → **86 passed**（见下文最终重跑）。
+- **lint 修复**：删 `hub/internal/kws/kws.go:463` 的 `streamFor`（N-P2-2 修复后剩下的
+  死代码，无调用方）；`go vet ./internal/kws/` 干净，
+  `golangci-lint run ./internal/kws/` exit 0。生产行为不变（删的只是未被调用的函数）。
+- **kws -race flake 收尾**：Hub 面工人复现了 TestHelloTokenEnforced（16 遍 4 次 FAIL），
+  协调员已按测试侧修复（轮询等 Connected 归零，生产不动），61 遍 1 次 FAIL 后 51 连过；
+  协调员最终重跑 20 遍又抓到第二个 flake：TestReconnectAfterDrop（1 次 FAIL）——
+  根因是 N-P2-3 的重连排空放在发 hello 之后，测试收到 hello 后发的实时帧若落在
+  排空之前会被误当陈旧帧丢掉。修复：生产侧把排空移到发 hello 之前
+  （hello 是对端可观测的“已重连”信号，排空必须先于它；排空语义不变，
+  只排断线期积压帧，首次连接仍不排空）。修复后 `go test -race ./internal/kws/` 20 遍 0 FAIL。
+  另：TestArbiterWindow 既存 timing flake（Hub 面工人记录，1/5 FAIL，arbitration 未动）
+  仍为观察项，与本轮改动无关。
+- **OH2P 官方回滚包**：`work/oh2p_1.58.6.bin` 已拷入 `firmware/oh2p_1.58.6.bin`，
+  SHA256 `1f351d879c06ff3bd7bd4b4c68e2c8fa45eee1a82be5839e57899ae8f9b7c27b`、
+  36,042,824 字节，与白名单一致；`firmware/` 里现 LX06/OH2P 官方包齐全。
