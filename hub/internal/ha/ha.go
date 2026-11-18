@@ -42,6 +42,10 @@ type Client struct {
 	pending  map[int]chan resultMsg
 	handlers []func(event map[string]any)
 	done     chan struct{}
+	// closeOnce 保护 close(done)（H-6）：看门狗探活失败与关停可能
+	// 并发调 Close()，旧代码 select-default 双关即 panic
+	//（close of closed channel）。
+	closeOnce sync.Once
 
 	// writeMu 串行化同一连接上的所有写操作（P1-21）：gorilla websocket
 	// 禁止同一连接并发写；call() 与 SubscribeEvents() 分属不同 goroutine
@@ -123,13 +127,10 @@ func Dial(url, token string, timeout time.Duration) (*Client, error) {
 	return c, nil
 }
 
-// Close 关闭连接。
+// Close 关闭连接。并发双关安全（H-6）：sync.Once 保证
+// close(c.done) 只执行一次；底层连接的 Close 可重复调。
 func (c *Client) Close() error {
-	select {
-	case <-c.done:
-	default:
-		close(c.done)
-	}
+	c.closeOnce.Do(func() { close(c.done) })
 	return c.conn.Close()
 }
 

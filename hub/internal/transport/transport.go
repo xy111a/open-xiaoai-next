@@ -435,7 +435,9 @@ func (s *Server) Serve(l net.Listener, tlsCert *tls.Certificate) error {
 		s.mu.RLock()
 		pool := s.clientCAs
 		s.mu.RUnlock()
-		tlsConf := &tls.Config{Certificates: []tls.Certificate{*tlsCert}}
+		// H-8（gosec G402 真阳性，低风险）：显式最低 TLS 1.2；
+		// 客户端是自家 Rust 代码，支持 TLS 1.2+，无兼容问题。
+		tlsConf := &tls.Config{Certificates: []tls.Certificate{*tlsCert}, MinVersion: tls.VersionTLS12}
 		if pool != nil {
 			tlsConf.ClientAuth = tls.RequireAndVerifyClientCert
 			tlsConf.ClientCAs = pool
@@ -675,9 +677,11 @@ func (s *Server) handleRegister(c *Conn, deviceID, helloModel string, data []byt
 		log.Printf("transport: 设备 %s register 解析失败: %v", deviceID, err)
 		return
 	}
+	// H-5：与 hello 拒绝（P2-2）看齐，统一回 "rejected"，四种具体
+	// 原因只记服务端日志，不回显给对端（否则可枚举哪项校验没过）。
 	reject := func(reason string) {
 		log.Printf("transport: 设备 %s 注册被拒（%s）", deviceID, reason)
-		_ = c.SendJSON(map[string]string{"type": "register_reject", "reason": reason})
+		_ = c.SendJSON(map[string]string{"type": "register_reject", "reason": "rejected"})
 		_ = c.Close()
 	}
 	if m.DeviceID != deviceID {

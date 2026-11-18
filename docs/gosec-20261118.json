@@ -1,0 +1,476 @@
+{
+	"Golang errors": {},
+	"Issues": [
+		{
+			"severity": "HIGH",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "295",
+				"url": "https://cwe.mitre.org/data/definitions/295.html"
+			},
+			"rule_id": "G123",
+			"details": "tls.Config uses VerifyPeerCertificate while session resumption may remain enabled and VerifyConnection is not set; resumed sessions can bypass custom certificate checks",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/kws/kws.go",
+			"code": "280: \t\tInsecureSkipVerify: true, // 指纹 pin 本身就是校验，不走系统根证书\n281: \t\tVerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {\n282: \t\t\tif len(rawCerts) == 0 {\n",
+			"line": "281",
+			"column": "24",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "HIGH",
+			"confidence": "MEDIUM",
+			"cwe": {
+				"id": "190",
+				"url": "https://cwe.mitre.org/data/definitions/190.html"
+			},
+			"rule_id": "G115",
+			"details": "integer overflow conversion uint16 -\u003e int16",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/wyoming/wyoming.go",
+			"code": "324: \tfor i := range out {\n325: \t\tout[i] = int16(binary.LittleEndian.Uint16(b[2*i:]))\n326: \t}\n",
+			"line": "325",
+			"column": "17",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "HIGH",
+			"confidence": "MEDIUM",
+			"cwe": {
+				"id": "190",
+				"url": "https://cwe.mitre.org/data/definitions/190.html"
+			},
+			"rule_id": "G115",
+			"details": "integer overflow conversion int16 -\u003e uint16",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/wyoming/wyoming.go",
+			"code": "333: \tfor i, v := range pcm {\n334: \t\tbinary.LittleEndian.PutUint16(out[2*i:], uint16(v))\n335: \t}\n",
+			"line": "334",
+			"column": "50",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "HIGH",
+			"confidence": "MEDIUM",
+			"cwe": {
+				"id": "190",
+				"url": "https://cwe.mitre.org/data/definitions/190.html"
+			},
+			"rule_id": "G115",
+			"details": "integer overflow conversion int16 -\u003e uint16",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/kws/kws.go",
+			"code": "424: \tfor i, v := range pcm {\n425: \t\tbinary.LittleEndian.PutUint16(buf[i*2:], uint16(v))\n426: \t}\n",
+			"line": "425",
+			"column": "50",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "HIGH",
+			"confidence": "MEDIUM",
+			"cwe": {
+				"id": "190",
+				"url": "https://cwe.mitre.org/data/definitions/190.html"
+			},
+			"rule_id": "G115",
+			"details": "integer overflow conversion int16 -\u003e byte",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/voice/voice.go",
+			"code": "242: \tfor _, v := range pcm {\n243: \t\tpcmBytes = append(pcmBytes, byte(v), byte(v\u003e\u003e8))\n244: \t}\n",
+			"line": "243",
+			"column": "44",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "HIGH",
+			"confidence": "MEDIUM",
+			"cwe": {
+				"id": "190",
+				"url": "https://cwe.mitre.org/data/definitions/190.html"
+			},
+			"rule_id": "G115",
+			"details": "integer overflow conversion int16 -\u003e byte",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/voice/voice.go",
+			"code": "242: \tfor _, v := range pcm {\n243: \t\tpcmBytes = append(pcmBytes, byte(v), byte(v\u003e\u003e8))\n244: \t}\n",
+			"line": "243",
+			"column": "35",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "HIGH",
+			"confidence": "MEDIUM",
+			"cwe": {
+				"id": "338",
+				"url": "https://cwe.mitre.org/data/definitions/338.html"
+			},
+			"rule_id": "G404",
+			"details": "Use of weak random number generator (math/rand or math/rand/v2 instead of crypto/rand)",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/kws/kws.go",
+			"code": "633: \tjitter := nxt / 4\n634: \tdelta := time.Duration(rand.Int63n(int64(2*jitter+1))) - jitter\n635: \tnxt += delta\n",
+			"line": "634",
+			"column": "25",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "HIGH",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "295",
+				"url": "https://cwe.mitre.org/data/definitions/295.html"
+			},
+			"rule_id": "G402",
+			"details": "TLS InsecureSkipVerify set to true.",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/kws/kws.go",
+			"code": "279: \treturn \u0026tls.Config{\n280: \t\tInsecureSkipVerify: true, // 指纹 pin 本身就是校验，不走系统根证书\n281: \t\tVerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {\n",
+			"line": "280",
+			"column": "23",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "MEDIUM",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "22",
+				"url": "https://cwe.mitre.org/data/definitions/22.html"
+			},
+			"rule_id": "G304",
+			"details": "Potential file inclusion via variable",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/tlscert/tlscert.go",
+			"code": "345: \tif certPEM, err := os.ReadFile(certPath); err == nil {\n346: \t\tif keyPEM, err := os.ReadFile(keyPath); err == nil {\n347: \t\t\tif cert, err := tls.X509KeyPair(certPEM, keyPEM); err == nil {\n",
+			"line": "346",
+			"column": "21",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "MEDIUM",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "22",
+				"url": "https://cwe.mitre.org/data/definitions/22.html"
+			},
+			"rule_id": "G304",
+			"details": "Potential file inclusion via variable",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/tlscert/tlscert.go",
+			"code": "344: func (c *CA) issueCert(certPath, keyPath string, tmpl *x509.Certificate) (tls.Certificate, string, error) {\n345: \tif certPEM, err := os.ReadFile(certPath); err == nil {\n346: \t\tif keyPEM, err := os.ReadFile(keyPath); err == nil {\n",
+			"line": "345",
+			"column": "21",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "MEDIUM",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "22",
+				"url": "https://cwe.mitre.org/data/definitions/22.html"
+			},
+			"rule_id": "G304",
+			"details": "Potential file inclusion via variable",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/config/config.go",
+			"code": "464: func Load(path string) (*Config, error) {\n465: \tb, err := os.ReadFile(path)\n466: \tif err != nil {\n",
+			"line": "465",
+			"column": "12",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "117",
+				"url": "https://cwe.mitre.org/data/definitions/117.html"
+			},
+			"rule_id": "G706",
+			"details": "Log injection via taint analysis: log.Printf",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/web/web.go",
+			"code": "313: \t\t\t} else {\n314: \t\t\t\tlog.Printf(\"web 鉴权失败：%s %s\", ip, r.URL.Path)\n315: \t\t\t}\n",
+			"line": "314",
+			"column": "15",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "117",
+				"url": "https://cwe.mitre.org/data/definitions/117.html"
+			},
+			"rule_id": "G706",
+			"details": "Log injection via taint analysis: log.Printf",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/web/web.go",
+			"code": "311: \t\t\tif s.AuthToken == \"\" {\n312: \t\t\t\tlog.Printf(\"web 鉴权失败：%s %s（未配置 OPEN_XIAOAI_WEB_TOKEN）\", ip, r.URL.Path)\n313: \t\t\t} else {\n",
+			"line": "312",
+			"column": "15",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "117",
+				"url": "https://cwe.mitre.org/data/definitions/117.html"
+			},
+			"rule_id": "G706",
+			"details": "Log injection via taint analysis: log.Printf",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/web/web.go",
+			"code": "281: \t\t\ts.authMu.Unlock()\n282: \t\t\tlog.Printf(\"web 鉴权限流：%s %s（失败过多，暂拒）\", ip, r.URL.Path)\n283: \t\t\twriteJSON(w, http.StatusTooManyRequests, map[string]string{\"error\": \"鉴权失败过多，稍后再试\"})\n",
+			"line": "282",
+			"column": "14",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "117",
+				"url": "https://cwe.mitre.org/data/definitions/117.html"
+			},
+			"rule_id": "G706",
+			"details": "Log injection via taint analysis: log.Printf",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/transport/transport.go",
+			"code": "513: \tif err := registry.ValidateRoomName(hello.Room); hello.Room != \"\" \u0026\u0026 err != nil {\n514: \t\tlog.Printf(\"transport: 设备 %s hello 的房间名不合法，已忽略: %v\", host, err)\n515: \t\thello.Room = \"\"\n",
+			"line": "514",
+			"column": "13",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "117",
+				"url": "https://cwe.mitre.org/data/definitions/117.html"
+			},
+			"rule_id": "G706",
+			"details": "Log injection via taint analysis: log.Printf",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/transport/transport.go",
+			"code": "486: \t\ts.recordHelloFailure(host)\n487: \t\tlog.Printf(\"transport: 设备 hello 被拒（%s，原因：%s）\", host, reason)\n488: \t\t_ = ws.SetWriteDeadline(time.Now().Add(5 * time.Second))\n",
+			"line": "487",
+			"column": "13",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "117",
+				"url": "https://cwe.mitre.org/data/definitions/117.html"
+			},
+			"rule_id": "G706",
+			"details": "Log injection via taint analysis: log.Printf",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/transport/transport.go",
+			"code": "355: \t\ts.helloBlockedUntil[ip] = now.Add(helloBlockDuration)\n356: \t\tlog.Printf(\"transport: IP %s hello 失败 %d 次，封禁 %v\", ip, len(s.helloFails[ip]), helloBlockDuration)\n357: \t}\n",
+			"line": "356",
+			"column": "13",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/music/music.go",
+			"code": "401: \tif !strings.HasPrefix(line, \"OK\") {\n402: \t\tconn.Close()\n403: \t\treturn nil, fmt.Errorf(\"mpd: 欢迎行异常: %s\", strings.TrimSpace(line))\n",
+			"line": "402",
+			"column": "3",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/music/music.go",
+			"code": "397: \tif err != nil {\n398: \t\tconn.Close()\n399: \t\treturn nil, err\n",
+			"line": "398",
+			"column": "3",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/ha/ha.go",
+			"code": "122: \tif authResp.Type != \"auth_ok\" {\n123: \t\tconn.Close()\n124: \t\treturn nil, fmt.Errorf(\"ha: 认证失败: %s\", authResp.Message)\n",
+			"line": "123",
+			"column": "3",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/ha/ha.go",
+			"code": "118: \tif err := json.Unmarshal(msg, \u0026authResp); err != nil {\n119: \t\tconn.Close()\n120: \t\treturn nil, err\n",
+			"line": "119",
+			"column": "3",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/ha/ha.go",
+			"code": "110: \tif err != nil {\n111: \t\tconn.Close()\n112: \t\treturn nil, err\n",
+			"line": "111",
+			"column": "3",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/ha/ha.go",
+			"code": "103: \tif err := c.writeJSON(map[string]any{\"type\": \"auth\", \"access_token\": token}); err != nil {\n104: \t\tconn.Close()\n105: \t\treturn nil, err\n",
+			"line": "104",
+			"column": "3",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/ha/ha.go",
+			"code": "99: \tif err := json.Unmarshal(msg, \u0026hello); err != nil || hello.Type != \"auth_required\" {\n100: \t\tconn.Close()\n101: \t\treturn nil, fmt.Errorf(\"ha: 期望 auth_required，实际 %s\", string(msg))\n",
+			"line": "100",
+			"column": "3",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/internal/ha/ha.go",
+			"code": "92: \tif err != nil {\n93: \t\tconn.Close()\n94: \t\treturn nil, err\n",
+			"line": "93",
+			"column": "3",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/cmd/hub/main.go",
+			"code": "1066: \tif snapClient != nil {\n1067: \t\tsnapClient.Close()\n1068: \t}\n",
+			"line": "1067",
+			"column": "3",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/cmd/hub/main.go",
+			"code": "1063: \tif mpdClient != nil {\n1064: \t\tmpdClient.Close()\n1065: \t}\n",
+			"line": "1064",
+			"column": "3",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/cmd/hub/main.go",
+			"code": "705: \t\t\t\t\tlog.Printf(\"看门狗：Snapcast 探活失败，断开重连: %v\", err)\n706: \t\t\t\t\tsnapClient.Close()\n707: \t\t\t\t\tsnapClient = nil\n",
+			"line": "706",
+			"column": "6",
+			"nosec": false,
+			"suppressions": null
+		},
+		{
+			"severity": "LOW",
+			"confidence": "HIGH",
+			"cwe": {
+				"id": "703",
+				"url": "https://cwe.mitre.org/data/definitions/703.html"
+			},
+			"rule_id": "G104",
+			"details": "Errors unhandled",
+			"file": "/home/hatch/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/hub/cmd/hub/main.go",
+			"code": "688: \t\t\t\t\tlog.Printf(\"看门狗：MPD 探活失败，断开重连: %v\", err)\n689: \t\t\t\t\tmpdClient.Close()\n690: \t\t\t\t\tmpdClient = nil\n",
+			"line": "689",
+			"column": "6",
+			"nosec": false,
+			"suppressions": null
+		}
+	],
+	"Stats": {
+		"files": 23,
+		"lines": 9969,
+		"nosec": 0,
+		"found": 29
+	},
+	"GosecVersion": "dev"
+}

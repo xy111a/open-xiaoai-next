@@ -16,6 +16,7 @@ package music
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -88,7 +89,12 @@ func (a *NeteaseAuth) Load() (bool, error) {
 
 // save 把 cookie 写进数据卷：先写同目录临时文件（0600）再改名，
 // 目录不存在时建出来。调用方须已确认 cookie 非空。
+// H-9：全程持 a.mu（文件写也在锁内）——旧代码先写盘后持锁更新内存，
+// 并发 CheckQR 成功时文件与内存可能各执一个 cookie；锁内写盘的
+// 代价可忽略（并发扫码本就是边缘场景）。
 func (a *NeteaseAuth) save(cookie string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	now := time.Now()
 	f := neteaseCookieFile{Cookie: cookie, SavedAt: now.Format(time.RFC3339)}
 	b, err := json.Marshal(f)
@@ -122,10 +128,8 @@ func (a *NeteaseAuth) save(cookie string) error {
 		_ = os.Remove(tmpName)
 		return err
 	}
-	a.mu.Lock()
 	a.cookie = cookie
 	a.savedAt = now
-	a.mu.Unlock()
 	return nil
 }
 
@@ -146,6 +150,13 @@ func qrTimestamp() string {
 	return strconv.FormatInt(time.Now().UnixMilli(), 10)
 }
 
+// httpStatusError 是上游非 200 时的带状态码错误（H-4）：调用方
+// 可用 errors.As 区分“上游认出 cookie 已过期（401/403）”与
+// “网络错误/5xx”，错误文本与旧版保持一致。
+type httpStatusError struct{ code int }
+
+func (e *httpStatusError) Error() string { return fmt.Sprintf("netease-api 返回 %d", e.code) }
+
 func (a *NeteaseAuth) getJSON(ctx context.Context, u string, cookie string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -160,7 +171,7 @@ func (a *NeteaseAuth) getJSON(ctx context.Context, u string, cookie string, out 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("netease-api 返回 %d", resp.StatusCode)
+		return &httpStatusError{code: resp.StatusCode}
 	}
 	// P2-7：上游响应体限长 1MB 解码（与 NeteaseClient 的 cappedBodyDecoder 同限）。
 	return json.NewDecoder(io.LimitReader(resp.Body, maxUpstreamBody)).Decode(out)
@@ -255,6 +266,14 @@ func (a *NeteaseAuth) Status(ctx context.Context) (loggedIn bool, nickname, expi
 		} `json:"data"`
 	}
 	if err := a.getJSON(ctx, a.baseURL+"/login/status?timestamp="+qrTimestamp(), cookie, &out); err != nil {
+		// H-4：上游 401/403 说明 cookie 已过期/失效，映射为“未登录”
+		// （不返回 err），Web 层即回 logged_in=false/needs_rescan=true，
+		// 而不是 502；仅网络错误/5xx 才返回 err（Web 层 502）。
+		// NAS 上用过期 cookie 的实测仍是 BLOCKED（无 NAS），未做。
+		var se *httpStatusError
+		if errors.As(err, &se) && (se.code == http.StatusUnauthorized || se.code == http.StatusForbidden) {
+			return false, "", "", nil
+		}
 		return false, "", "", err
 	}
 	if out.Data.Account.ID == 0 {

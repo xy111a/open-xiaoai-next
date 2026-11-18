@@ -47,6 +47,36 @@ const (
 	authBlockDuration = 5 * time.Minute
 )
 
+// maxQRPerMinute / qrWindow 是建二维码的节流（H-12）：
+// 每 IP 每分钟最多新建 maxQRPerMinute 个二维码。
+const (
+	maxQRPerMinute = 10
+	qrWindow       = time.Minute
+)
+
+// allowQRCreate 记一次建二维码尝试：窗口内未满即记下并放行，
+// 满了即拒绝（不记）。调用方在调上游 CreateQR 之前调它。
+func (s *Server) allowQRCreate(ip string) bool {
+	s.qrMu.Lock()
+	defer s.qrMu.Unlock()
+	if s.qrAttempts == nil {
+		s.qrAttempts = map[string][]time.Time{}
+	}
+	now := time.Now()
+	kept := s.qrAttempts[ip][:0]
+	for _, t := range s.qrAttempts[ip] {
+		if now.Sub(t) <= qrWindow {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= maxQRPerMinute {
+		s.qrAttempts[ip] = kept
+		return false
+	}
+	s.qrAttempts[ip] = append(kept, now)
+	return true
+}
+
 // MusicBackend 是 Web 音乐端点用的 Router 侧接口（融合 B：Hub 直连，
 // MPD 队列 + Hub 内存当前曲）。由 main 把 *router.Router 接进来；
 // 为 nil 时音乐端点一律 503（未接线，不假装成功）。
@@ -111,6 +141,12 @@ type Server struct {
 
 	authMu       sync.Mutex
 	authFailures map[string]*authAttempt
+
+	// qrMu/qrAttempts 是 /api/netease/login/qr 的新建节流（H-12）：
+	// 每 IP 每分钟最多 maxQRPerMinute 次新建，防循环建二维码刷
+	// 上游 unikey。
+	qrMu       sync.Mutex
+	qrAttempts map[string][]time.Time
 }
 
 type authAttempt struct {
@@ -355,8 +391,20 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只支持 GET"})
 		return
 	}
+	// H-7：配置读走共享 CfgLock（与 configAPI PUT 的 *s.cfg 写同一把
+	// 锁），不要只用 s.mu——旧代码在 s.mu 下读 cfg.WakeWord/RoomNames，
+	// 与 PUT 并发时是对同一 Config 结构体的无锁读写，-race 可检出。
+	// 先在锁内快照出 wake_word 与 rooms，再读 KWSStatus（s.mu 管）。
+	lock := s.cfgLock()
+	lock.Lock()
+	var wakeWord string
+	var rooms []string
+	if s.cfg != nil {
+		wakeWord = s.cfg.WakeWord
+		rooms = s.cfg.RoomNames()
+	}
+	lock.Unlock()
 	s.mu.Lock()
-	cfg := s.cfg
 	kwsFn := s.KWSStatus
 	s.mu.Unlock()
 	kwsStatus := "disabled"
@@ -364,8 +412,8 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		kwsStatus = kwsFn()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"wake_word": cfg.WakeWord,
-		"rooms":     cfg.RoomNames(),
+		"wake_word": wakeWord,
+		"rooms":     rooms,
 		"devices":   len(s.reg.All()),
 		"online":    len(s.reg.Online()),
 		// KWS 边车状态：ok=可用，down=已启用但不可用（唤醒服务暂不可用），
@@ -613,6 +661,12 @@ func (s *Server) neteaseLoginQR(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "网易云登录未接线"})
 		return
 	}
+	// H-12：建二维码节流（每 IP 每分钟 ≤10 次新建），超限即 429，
+	// 不调上游、不新建 unikey。
+	if !s.allowQRCreate(clientIP(r)) {
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "建二维码过于频繁，稍后再试"})
+		return
+	}
 	key, qrURL, qrImg, err := s.NeteaseAuth.CreateQR(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "建二维码失败: " + err.Error()})
@@ -790,6 +844,12 @@ func (s *Server) musicLyric(w http.ResponseWriter, r *http.Request) {
 		n, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id 不是数字"})
+			return
+		}
+		// H-11：负数不再直通上游（旧代码只 ParseInt、不判负数，
+		// id=-5 会拼进 /lyric?id=-5 发给上游）。
+		if n < 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id 非法"})
 			return
 		}
 		id = n
