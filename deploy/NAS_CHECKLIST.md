@@ -124,4 +124,4 @@
 | binarytorch/neteasecloudmusicapi:latest | **不存在** | Docker Hub 返回 404；compose 已改为官方镜像 |
 | binaryify/netease_cloud_music_api:latest（替代） | 存在 | Docker Hub 页面可打开，官方 `docker pull binaryify/netease_cloud_music_api` |
 | kws-sidecar（本地构建，`python:3.12-slim` + sherpa-onnx） | 已修 | `deploy/docker-compose.yml` 的 kws-sidecar 服务：与 Hub 一样走 host 网络，Hub 经 `ws://127.0.0.1:10400/v1/kws` 连接；模型不 bake 进镜像，首次启动由 entrypoint 下载到 `kws-data` 卷（约 5.6MB，SHA256 见 `kws-sidecar/scripts/download-model.sh`），下载失败容器报错退出 |
-| hub（本地构建） | 已修 | 原 `build: ../hub` 无 Dockerfile；现用 `deploy/Dockerfile.hub` + 预编译 `deploy/hub-linux-amd64`（11,747,288 字节，SHA256 `1e4f6f6cc814597ad2fbc1de763207a06cc4bc0ec1d50552a156f68df54bc80a`，2026-11-17 服务端 KWS 接线后重编；旧值 `f12c09e0…` 已取代） |
+| hub（本地构建） | 已修 | 原 `build: ../hub` 无 Dockerfile；现用 `deploy/Dockerfile.hub` + 预编译 `deploy/hub-linux-amd64`（12,093,552 字节，SHA256 `95535eee9f1152547b3fe585aef731f33293f1040d09afe73a95b75444ead7de`，2026-11-18 P2 轮从分支尖重编，清单 `deploy/hub-linux-amd64.sha256`；旧值 `1e4f6f6c…c80a` / 11,747,288 字节已取代） |

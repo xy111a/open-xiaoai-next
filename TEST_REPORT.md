@@ -129,7 +129,7 @@
 | D | FR-10 自动化测试 | `go test ./...`（hub/） | 新包 internal/alerts：6 测试——播报文本（类型+位置）、勿扰跳过（含边界）、非安全类不播报、假 HA WS 推真信封事件端到端；全量 go test 88 通过 | 通过 | 真 HA 联调（实际触发、“漏水 5s 内播报”时延） |
 | E | ALSA 接线（Client） | `cargo test`；`./build-armv7.sh` | `cargo test` **37 passed**（32 + 新增 ALSA 5 项）；trait 隔离硬件，Fake 设备测试；无硬件返回明确错误、不崩溃；ARMv7 交叉编译通过，产物 ELF 32-bit ARM 静态链接 **2,852,620 字节**（含 musl libasound，仍 <5MB）（【2026-11-18 P2 轮注：ARM 产物已改 gnueabihf 重编，现为 **2,444,332 字节**、SHA256 `e90c3058…61ff`，见下文“全部重跑输出”】） | 通过 | 真音箱 `hw:0,0` 采集 / `hw:0,2` 播放实测 |
 | F | KWS“你好小李”.onnx 模型验证 | Python 实验（sherpa-onnx 2.0.1）+ `cargo test --features sherpa-kws` | 模型 sherpa-onnx-kws-zipformer-wenetspeech-3.3M（Apache 2.0），int8 集 5,708,052 字节；**合成语音正 5/5 检出、负 5/5 静默**（SNR 5dB 加噪仍检出）；Rust feature `sherpa-kws` 接入，`cargo test --features sherpa-kws` **41 passed**；复核人用真实模型 + 真实 .so + 真实 TTS 样本重跑端到端测试通过（非 SKIP）；模型文件未进仓库，下载脚本 client/scripts/download-kws-model.sh + 文档 client/kws/README.md 已写 | 通过（仅合成语音） | ARM 版 `libsherpa-onnx-c-api.so` 待交叉编译；真人唤醒率（1m/3m ≥95%）与 ARM 真机性能 |
-| G | NAS 部署包 | `go build -o deploy/hub-linux-amd64`；YAML 校验；`bash -n` | Hub linux/amd64 二进制 11,534,848 字节，冒烟 `--help` 退出 0、`/api/status` 返回 wake_word“你好小李”；docker-compose 镜像逐个核实：**binarytorch/neteasecloudmusicapi 不存在（404）→ 改为官方 binaryify/netease_cloud_music_api**；另修 hub 无 Dockerfile、缺 OPEN_XIAOAI_TOKEN 两个必死错；deploy/nas-install.sh（bash -n OK）+ NAS_CHECKLIST.md 已写（【2026-11-18 P2 轮注：Hub 二进制已重编，现为 11,747,288 字节、SHA256 `1e4f6f6c…c80a`，见下文“重编部署二进制”；P2 轮结束时将再次重编并更新该节】） | 通过 | NAS 上实际运行 |
+| G | NAS 部署包 | `go build -o deploy/hub-linux-amd64`；YAML 校验；`bash -n` | Hub linux/amd64 二进制 11,534,848 字节，冒烟 `--help` 退出 0、`/api/status` 返回 wake_word“你好小李”；docker-compose 镜像逐个核实：**binarytorch/neteasecloudmusicapi 不存在（404）→ 改为官方 binaryify/netease_cloud_music_api**；另修 hub 无 Dockerfile、缺 OPEN_XIAOAI_TOKEN 两个必死错；deploy/nas-install.sh（bash -n OK）+ NAS_CHECKLIST.md 已写（【2026-11-18 P2 轮注：Hub 二进制已重编，现为 12,093,552 字节、SHA256 `95535eee…ead7de`，见下文“重编部署二进制”】） | 通过 | NAS 上实际运行 |
 | H | 网易云登录准备 | 文档核实（MA 官方文档） | deploy/README.md 新增扫码登录流程：扫码点在 MA 界面（QR Login）、登录态存 MA 侧 ma-data 卷、Cookie 约 30 天过期重扫、VIP 歌需 VIP 账号；未尝试登录 | 通过 | bai 的网易云账号扫码 |
 
 ### 第二轮发现并修复的 2 个真实问题
@@ -142,7 +142,7 @@
 - `go test -count=1 ./...`：20 个包 ok，**88 通过、0 失败**；`go vet` / `go build` OK。
 - `cargo test`：**37 passed**；`cargo test --features sherpa-kws`：**41 passed**；sherpa 端到端测试用真实模型 + 真实 .so + 真实 TTS 样本重跑通过（非 SKIP）。
 - `pytest tests/`（firmware-patch）：**36 passed in 65.57s**。
-- OH2P 镜像 30,175,232 字节、SHA256 `db00add0…f0423` 已核对；LX06 镜像 SHA256 仍为 `cc36b28e…54f06d`；firmware/lx06_1.94.13.bin MD5 仍为 `b202de2bbe149ce884aa500911151b95`；ARM 产物 2,852,620 字节 ELF 32-bit ARM 静态链接已核对；deploy/hub-linux-amd64 11,534,848 字节 ELF 64-bit 已核对。（【2026-11-18 P2 轮注：本条是 2026-11-17 当时的核对记录；镜像/二进制随后都重编过——现值：OH2P 30,179,328 字节 `139de363…6415`、LX06 `7266aba9…d97b3`、ARM 2,444,332 字节 `e90c3058…61ff`、Hub 11,747,288 字节 `1e4f6f6c…c80a`，见下文“补丁镜像 SHA 同步”“重编部署二进制”“全部重跑输出”】）
+- OH2P 镜像 30,175,232 字节、SHA256 `db00add0…f0423` 已核对；LX06 镜像 SHA256 仍为 `cc36b28e…54f06d`；firmware/lx06_1.94.13.bin MD5 仍为 `b202de2bbe149ce884aa500911151b95`；ARM 产物 2,852,620 字节 ELF 32-bit ARM 静态链接已核对；deploy/hub-linux-amd64 11,534,848 字节 ELF 64-bit 已核对。（【2026-11-18 P2 轮注：本条是 2026-11-17 当时的核对记录；镜像/二进制随后都重编过——现值：OH2P 30,179,328 字节 `139de363…6415`、LX06 `7266aba9…d97b3`、ARM 2,444,332 字节 `e90c3058…61ff`、Hub 12,093,552 字节 `95535eee…ead7de`，见下文“补丁镜像 SHA 同步”“重编部署二进制”“全部重跑输出”】）
 
 ## 审计修复（2026-11-17）
 
@@ -403,10 +403,16 @@ Hub 启动即报“唤醒服务暂不可用”。统一方案：**边车也走 h
 
 ### 重编部署二进制（Hub 代码变了）
 
-`go build -o deploy/hub-linux-amd64 ./cmd/hub`：**11,747,288 字节**，ELF 64-bit x86-64，
-SHA256 `1e4f6f6cc814597ad2fbc1de763207a06cc4bc0ec1d50552a156f68df54bc80a`（旧值
-`f12c09e0…`、11,534,848 字节已取代）。冒烟：`--help` exit 0；弱 Token
-（`CHANGE_ME`、短 Token）启动即 Fatal（`OPEN_XIAOAI_TOKEN 无效…至少 16 位`）exit 1。
+`go build -o deploy/hub-linux-amd64 ./cmd/hub`：**12,093,552 字节**，ELF 64-bit x86-64，
+SHA256 `95535eee9f1152547b3fe585aef731f33293f1040d09afe73a95b75444ead7de`（旧值
+`1e4f6f6c…c80a`、11,747,288 字节已取代）。2026-11-18 P2 轮从分支 `fix-p2-loose-ends`
+尖 996329c 的干净 HEAD worktree 编译（工作树里 hub/ 有他人未提交改动、不编译，
+故不用工作树编）；清单 `deploy/hub-linux-amd64.sha256` 已生成（`nas-install.sh` §0
+比对，不一致即 FAIL）。冒烟：`--help` exit 0；弱 Token
+（`CHANGE_ME`、短 Token）启动即 Fatal（`OPEN_XIAOAI_TOKEN 无效…至少 16 位`）exit 1；
+设强 Token 后启动，`/api/status` 无 Token 返回 401、带 Web Token 返回 200
+（含 `wake_word`“你好小李”，`kws_status: down` 是本机无边车的预期结果）；
+`ldd` 只依赖 libc/libm。
 
 ### 全部重跑输出（2026-11-17，全绿）
 
