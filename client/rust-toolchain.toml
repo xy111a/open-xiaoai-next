@@ -5,8 +5,11 @@
 # 都用 rustc 1.100.0（2026-11-09，实测版本，见 `rustc --version`）。
 # 换版本时改这里一个数字，并重跑一次两遍构建 SHA 比对（见下）。
 #
-# 注意：rustup 按本文件自动切工具链；新机器上首次构建会自动下载
-# 1.100.0 + 两个 ARM target（约几分钟，只需一次）。
+# 注意：rustup 按本文件自动切工具链并自动下载下面列出的 target；
+# 未列出的 target 不会自动下载（C-7：旧注释称“自动下载两个 ARM
+# target”不成立——当时文件里根本没有 targets 列表）。新机器上首次
+# 构建不再报“target 未安装”，两个 ARM target 随工具链一起装
+# （约几分钟，只需一次）。
 # 配合两构建脚本里的 --remap-path-prefix（路径）与 SOURCE_DATE_EPOCH
 # （时间戳），同一提交在不同目录/不同时间构建应产出相同 SHA。
 # 验证方法：CARGO_TARGET_DIR 换两个不同目录各 clean 构建一次，比对
@@ -14,3 +17,4 @@
 # build-armv7-gnueabihf.sh；宿主机用 cargo build --release）。
 [toolchain]
 channel = "1.100.0"
+targets = ["armv7-unknown-linux-gnueabihf", "armv7-unknown-linux-musleabihf"]
