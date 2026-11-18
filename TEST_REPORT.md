@@ -531,3 +531,45 @@ CI 首次实跑（run 44063914126）：Rust ✓、Semgrep ✓；Go ✗、Python 
 - **网易云扫码登录（关口 7）**：仍需 bai 的网易云账号在 Hub Web 面板扫码；流程文档已写好 （`deploy/README.md` §网易云扫码登录融合 B 版、`deploy/NAS_CHECKLIST.md` §5），未实测。
 - **歌单/收藏浏览未做**：本轮无歌单/收藏浏览接口，FR-05 验收口径收窄为点歌/队列/歌词；是否补由 Friday 与 bai 另定。
 - 其余关口（刷机、NAS 部署、HA 联调、真人唤醒率等）见“硬件关口检查清单”，状态不变。
+
+## P2 全修轮（2026-11-18，分支 `fix-p2-loose-ends`，固件 / 部署 / CI 面）
+
+本节只记固件 / 部署 / CI 面的最终重跑值；Hub / 客户端 / 边车面的最终值以各面状态文件为准。
+
+### 全量测试（固件 / 部署 / CI 面工人重跑，2026-11-18）
+
+- `python3 -m pytest firmware-patch/tests/ -q`：**84 passed**（基线 68；本轮新增 16 项：
+  patch_firmware 幂等/.bak/SSH_PASSWORD_FILE、P2-31 回归、P2-39 inode 校验、
+  flash-check §4b/--strict、download-ota 参数校验）。
+- Go 全量：`go test ./... -count=1` 22 包全部 ok、**270 passed**、0 FAIL；
+  `go vet ./...` 干净；`gofmt -l hub scripts` 干净。
+  （本轮重跑时工作树里 hub/ 曾有他人未提交改动致 `go vet` 失败，收尾时已由 Hub 面修好；
+  Hub 二进制从干净 HEAD worktree（尖 996329c）重编，见下文。）
+- `cargo test`：**96 passed**、0 failed（客户端面本轮计数；基线 81/85 的拆分口径已变，以本次为准）。
+- `kws-sidecar` pytest（venv）：**55 passed**（基线 25；边车面本轮已扩到 55，固件面未动它）。
+- `scripts/lint.sh`：**FAIL，只红 golangci-lint 一步**——`hub/internal/kws/kws.go:463`
+  `func (*Client).streamFor is unused`（Hub 面已提交代码 611161d 引入，归 Hub 面修）；
+  其余步骤全过（规则 1 接线 40 项、规则 2 nil 守卫、规则 3 bounds、semgrep、
+  Rust vec! 检查、cargo fmt/clippy、bash -n）。`lint.sh shell` / `lint.sh rust` 各自全部通过。
+- `bash -n`：patch.sh / unpack.sh / flash-check.sh / nas-install.sh / lint.sh /
+  check-vec-len.sh 全部通过；compose 用 python yaml 解析验证（本机无 docker）：
+  7 服务、cap_drop ALL 全有、hub + kws-sidecar 的 user 均为 `1000:1000`。
+- `flash-check.sh` 四路（lx06 / oh2p × 默认 / --strict）**全部 exit 1**：这是预期的
+  旧镜像报告（§4b FAIL inittab P1-36 + WARN .bak/包装器/旧直行），不是回归；
+  现版 patch.sh 刚打出的镜像在 pytest 里通过（`test_flash_check_ok_on_fresh_build`）。
+- `nas-install.sh` §0 Hub 清单校验：正向 PASS（12,093,552 字节与清单一致），
+  反向控制 PASS（改错清单即 FAIL）；其余 §0 项因本机无 deploy/.env 而 FAIL（预期内）。
+- Hub 二进制冒烟（2026-11-18 P2 轮重编，12,093,552 字节、
+  SHA256 `95535eee9f1152547b3fe585aef731f33293f1040d09afe73a95b75444ead7de`）：
+  `--help` exit 0；弱 Token 启动即 Fatal exit 1；设强 Token 后启动，
+  `/api/status` 无 Token 返回 401、带 Web Token 返回 200
+  （`kws_status: down` 是本机无边车的预期结果）；`ldd` 只依赖 libc/libm。
+
+### 本轮之后仍阻塞的（固件 / 部署 / CI 面）
+
+- **包内补丁镜像过期三缺口**（P1-36 inittab、P2-33 .bak、P2-34 包装器）：
+  `flash-check.sh` §4b 现会 FAIL；是否重编镜像需父代理/协调员定夺（本轮按任务决定不重编）。
+- **真机项**：刷机、NAS 部署、HA 联调、真人唤醒率、Dockerfile.hub 首次构建（本机无 docker）
+  均未验证，见 `FLASH_RUNBOOK.md` 与 `NAS_CHECKLIST.md`。
+- **lint 红**：golangci-lint 的 `streamFor` unused（Hub 面，见上文）。
+- **OH2P 官方回滚包不在本机**：刷 OH2P 前先用 `download-ota.py` 下好并核对 SHA（见 `docs/RELEASE.md` §1）。
