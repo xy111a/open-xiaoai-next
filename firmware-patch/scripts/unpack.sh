@@ -21,10 +21,11 @@ case "$MODEL" in
     lx06|oh2p) ;;
     *) echo "未知型号：$MODEL_RAW（只支持 lx06 / oh2p）" >&2; exit 1 ;;
 esac
-case "$VERSION" in
-    [0-9]*.[0-9]*.[0-9]*) ;;
-    *) echo "版本号格式不对：$VERSION（应为 x.y.z，如 1.94.13）" >&2; exit 1 ;;
-esac
+# P2-9：版本号必须严格是 x.y.z——case 的 `.` 是通配符，"1/94/13" 也能
+# 通过，拼进路径就是穿越；用正则锚定首尾（与 patch.sh / flash-check.sh 同款）。
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "版本号格式不对：$VERSION（应为 x.y.z，如 1.94.13）" >&2; exit 1
+fi
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="${PATCH_WORK_DIR:-$HERE/work}"
@@ -97,8 +98,32 @@ cat "$OUT/mico_version"
 #    "Operation not permitted"（非致命错误；原厂 rootfs 的 dev/ 本就
 #    是空的——启动时由 devtmpfs 接管）。加 -no-exit-code 让这类非致命
 #    错误不影响退出码；真正的门是下面的产物校验。
+#    P2-39：-no-exit-code 也会掩盖真正的解包错误，所以把输出收到日志里
+#    单独校验（与 patch.sh §6 同款）：只允许“建设备节点失败（无权限）”
+#    与“xz 压缩选项读不出”两类良性行，其余含 error/failed 的行即失败；
+#    再用 inode 数硬门：期望解出数 = unsquashfs -s 的 inodes − 建设备失败行数
+#    （find 含根目录本身，inodes 也含根目录，两边口径一致，不用减 1）。
 command -v unsquashfs >/dev/null || { echo "缺 unsquashfs（apt 装 squashfs-tools）" >&2; exit 1; }
-unsquashfs -d "$OUT/rootfs" -f -no-exit-code "$OUT/root.squashfs"
+UNSQUASH_LOG="$OUT-unsquashfs.log"
+unsquashfs -d "$OUT/rootfs" -f -no-exit-code "$OUT/root.squashfs" \
+    >"$UNSQUASH_LOG" 2>&1 \
+    || { echo "解包失败：unsquashfs 解开 root.squashfs 失败（见 $UNSQUASH_LOG）" >&2; exit 1; }
+EXPECT_INODES="$(unsquashfs -s "$OUT/root.squashfs" 2>/dev/null | grep -oE 'Number of inodes [0-9]+' | grep -oE '[0-9]+$' || true)"
+DEV_FAILS="$(grep -cE 'failed to create (character|block) device .* Operation not permitted' "$UNSQUASH_LOG" || true)"
+FOUND="$(find "$OUT/rootfs" | wc -l)"
+if [ -n "$EXPECT_INODES" ]; then
+    EXPECT_FOUND="$((EXPECT_INODES - DEV_FAILS))"
+    [ "$FOUND" -eq "$EXPECT_FOUND" ] || { echo "解包失败：解出 $FOUND，期望 $EXPECT_FOUND（inodes $EXPECT_INODES − 建设备失败 $DEV_FAILS）" >&2; exit 1; }
+else
+    echo "警告：读不到 unsquashfs -s 的 inode 数，跳过数量硬门" >&2
+fi
+if grep -iE 'error|failed' "$UNSQUASH_LOG" \
+    | grep -vE 'failed to create (character|block) device .* Operation not permitted|error reading stored compressor options' \
+    | grep -q .; then
+    grep -iE 'error|failed' "$UNSQUASH_LOG" >&2
+    echo "解包失败：unsquashfs 日志里有非良性 error/failed 行（见上）" >&2
+    exit 1
+fi
 [ -d "$OUT/rootfs" ] || { echo "解包失败：$OUT/rootfs 不存在" >&2; exit 1; }
 for f in etc/init.d/dropbear bin/ota bin/flash.sh; do
     [ -f "$OUT/rootfs/$f" ] || { echo "解包失败：rootfs 里缺 $f" >&2; exit 1; }

@@ -82,6 +82,22 @@ def test_unpack_real_firmware(unpacked_work):
     assert (rootfs / "etc/init.d/dropbear").exists()
     assert (rootfs / "bin/ota").exists()
     assert (rootfs / "usr/lib/libxaudio_engine.so").exists()
+    # P2-39：unsquashfs 输出收进日志，inode 硬门已跑过——解出数应为
+    # inodes(2137) − 建设备失败(1 个 /dev/console) − 根目录本身(1)。
+    log = unpacked_work / "lx06_1.94.13-unsquashfs.log"
+    assert log.exists()
+    assert "created 1348 files" in log.read_text()
+    assert sum(1 for _ in rootfs.rglob("*")) == EXPECTED_SQFS_INODES - 2
+
+
+def test_unpack_rejects_slash_version(tmp_path):
+    """P2-9：带斜杠的版本号必须拒绝（旧 case 模式的 `.` 是通配符，会放行）。"""
+    work = tmp_path / "work"
+    work.mkdir()
+    r = run(["bash", str(SCRIPTS / "unpack.sh"), "lx06", "1/94/13"],
+            env_extra={"PATCH_WORK_DIR": str(work)})
+    assert r.returncode != 0
+    assert "版本号格式不对" in r.stderr
 
 
 def test_unpack_squashfs_header_matches_rea(unpacked_work):
