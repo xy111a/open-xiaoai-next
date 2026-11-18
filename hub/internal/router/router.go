@@ -23,6 +23,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -103,6 +104,11 @@ type Router struct {
 	// 默认 60s（New 里设）；0 表示用默认值。60s 是“误触可撤销”的窗口，
 	// 不是拨出时限——PLAN 要求触发后 10s 内拨出/推送送达，那是 Notify 下游的事。
 	EmergencyTimeout time.Duration
+
+	// MusicBudget 是点歌的网易云总预算（H-1）：Search + SongURL 合计，
+	// 0 表示用默认值 8s。正常路径远快于此；上游一抖时预算一到即超时
+	// 转本地兜底，不再静默拖 60–90s。测试可调小以覆盖超时路径。
+	MusicBudget time.Duration
 
 	// currentMu 保护内存里的当前曲（融合 B：播放状态归 Hub 管——MPD 队列
 	// 是队列真相，current 是最近一次点歌成功的曲名/歌手，供歌词与
@@ -742,8 +748,65 @@ var (
 	lyricRe  = regexp.MustCompile(`^(?:歌词|显示歌词|歌词是什么)\s*$`)
 )
 
+// defaultMusicBudget 是点歌的网易云总预算默认值（H-1）：Search + SongURL
+// 合计 8s。单次 HTTP 客户端超时 15s、3 首串行取地址最坏 60–90s 静默阻塞
+// 是本项要堵的缺口；8s 预算 + 并行取地址后，最坏约 8s 即转本地兜底。
+const defaultMusicBudget = 8 * time.Second
+
+// musicBudget 取点歌的网易云总预算（MusicBudget 为 0 时用默认值）。
+func (r *Router) musicBudget() time.Duration {
+	if r.MusicBudget > 0 {
+		return r.MusicBudget
+	}
+	return defaultMusicBudget
+}
+
+// fetchSongURLs 并行取多首歌的可播地址（H-1）：旧代码逐首串行
+// SongURL → PlayURL，最坏 3×15s；并行后最坏约等于单次 SongURL 的耗时，
+// 且受调用方 musicCtx 总预算约束（预算到即取消在途请求）。
+// 返回与 songs 等长、按原顺序排列的 URL（取不到为空字符串），调用方按
+// 原顺序优先播放，保证“搜到的第一首优先”；lastErr 是最后一次取地址失败。
+func fetchSongURLs(ctx context.Context, netease *music.NeteaseClient, songs []music.NeteaseSong) (urls []string, lastErr error) {
+	urls = make([]string, len(songs))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for i, song := range songs {
+		wg.Add(1)
+		go func(i int, id int64) {
+			defer wg.Done()
+			u, err := netease.SongURL(ctx, id)
+			if err != nil {
+				log.Printf("netease: 取地址失败（歌曲 %d）: %v", id, err)
+				mu.Lock()
+				lastErr = err
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			urls[i] = u
+			mu.Unlock()
+		}(i, song.ID)
+	}
+	wg.Wait()
+	return urls, lastErr
+}
+
+// musicSlowFallback 是点歌超时后的本地兜底（H-1）：Router 只有一个回复
+// 通道，语音管线把返回的回复整句 TTS 播出，所以“网易云有点慢，先试本地”
+// 这句播报就落在回复句首，再接本地结果，不另起播报通道。
+func (r *Router) musicSlowFallback(ctx context.Context, query string) (string, bool, error) {
+	if reply, ok := r.playLocal(ctx, query); ok {
+		return "网易云有点慢，先试本地，" + reply, true, nil
+	}
+	if !r.localMusicAvailable() {
+		return "网易云有点慢，本地曲库还没配好，先换一首试试？", true, nil
+	}
+	return "网易云有点慢，本地曲库里也没有这首歌，请稍后再试。", true, nil
+}
+
 // music 处理点歌与播放控制。点歌降级顺序（融合 B，直连主路）：
-//  1. 网易云搜歌 → 逐首取 SongURL → MPD.PlayURL（成功即播，记当前曲）；
+//  1. 网易云搜歌 → 3 首歌并行取 SongURL → 按搜歌顺序 MPD.PlayURL
+//     （成功即播，记当前曲；Search + SongURL 合计预算 8s，超时即转 2）；
 //  2. 直连全失败 → MPD 本地曲库同名歌（search filename → PlayFile）；
 //  3. 本地也没有 → 明确回复放不了（不静默失败、不落到 Agent 闲聊）。
 //
@@ -800,8 +863,19 @@ func (r *Router) music(ctx context.Context, deviceID, text string) (string, bool
 	if mpd == nil {
 		return "音乐服务没接好（播放器未配置）。", true, nil
 	}
-	songs, err := netease.Search(ctx, query, 3)
+	// H-1：点歌的网易云阶段（Search + SongURL）单独设总预算
+	// （默认 8s），不沿用语音管线 120s 的总超时；预算一到即取消在途
+	// 请求、转本地兜底。本地兜底（playLocal）与 MPD 播放仍用原 ctx。
+	musicCtx, cancel := context.WithTimeout(ctx, r.musicBudget())
+	defer cancel()
+	songs, err := netease.Search(musicCtx, query, 3)
 	if err != nil {
+		// H-1：预算内搜歌超时（或上游抖动被预算掐断）→ 先播报再试本地，
+		// 不等满 15s 单次超时、更不等串行 3 首的最坏 60–90s。
+		if errors.Is(musicCtx.Err(), context.DeadlineExceeded) {
+			log.Printf("netease: 搜歌 %q 超时（预算 %s），先试本地兜底", query, r.musicBudget())
+			return r.musicSlowFallback(ctx, query)
+		}
 		log.Printf("netease: 搜歌 %q 失败，先试本地兜底: %v", query, err)
 		if reply, ok := r.playLocal(ctx, query); ok {
 			return reply, true, nil
@@ -814,20 +888,27 @@ func (r *Router) music(ctx context.Context, deviceID, text string) (string, bool
 		}
 		return "没搜到“" + query + "”，换个歌名试试？", true, nil
 	}
-	var lastErr error
-	for _, song := range songs {
-		u, err := netease.SongURL(ctx, song.ID)
-		if err != nil {
-			lastErr = err
+	// H-1：3 首歌的 SongURL 并行取（最先有地址的按搜歌顺序优先播），
+	// 全程受 musicCtx 总预算约束；MPD.PlayURL 仍按顺序逐首试，
+	// 它是本地 MPD，每条命令自带 5s 读写 deadline，不走网易云预算。
+	urls, lastErr := fetchSongURLs(musicCtx, netease, songs)
+	for i, song := range songs {
+		if urls[i] == "" {
 			continue
 		}
-		if err := mpd.PlayURL(u); err != nil {
+		if err := mpd.PlayURL(urls[i]); err != nil {
 			lastErr = err
 			continue
 		}
 		r.setCurrent(song, "netease")
 		r.applySnapcast()
 		return "正在播放" + displaySongName(song) + "。", true, nil
+	}
+	// 全失败：取地址阶段被预算掐断 → 按超时走（先播报再试本地）；
+	// 否则是确实无可播地址（VIP/无版权等），走原有明确回复。
+	if errors.Is(musicCtx.Err(), context.DeadlineExceeded) {
+		log.Printf("netease: 直连点歌 %q 取地址超时（预算 %s），走本地兜底", query, r.musicBudget())
+		return r.musicSlowFallback(ctx, query)
 	}
 	log.Printf("netease: 直连点歌 %q 失败（%v），走本地兜底", query, lastErr)
 	if reply, ok := r.playLocal(ctx, query); ok {
