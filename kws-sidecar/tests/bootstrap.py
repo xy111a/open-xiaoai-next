@@ -28,16 +28,21 @@
 是逗号后 prosody/停顿的差异让 transducer 的关键词路径丢了；
 前缀 1.3s 单独喂是能检出的）。所以生成后用离线 spotter 逐个校验
 （与测试同样的流式喂法：20ms 块 + 1s trailing 静音；正样本必须
-检出、负样本必须静默），不合格的正/负样本重抽，最多 10 次；10 次
-仍不合格就明确报错（不硬凑、不跳过）。噪声样本是确定性的（固定
+检出、负样本必须静默），不合格的正/负样本重抽，最多 10 次重抽
+（即最多 11 次检测）；10 次重抽仍不合格就明确报错（不硬凑、不跳过）。
+重抽前备份原文件为 <name>.bak-<时间戳>（默认资产根是共享实验目录，
+不静默改写参考样本）。校验阈值读 KWS_THRESHOLD / KWS_SCORE 环境变量，
+与服务端 server.py 同源（默认 0.25/1.0）。噪声样本是确定性的（固定
 种子），校验不过直接报错，不重抽。
 """
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
 import urllib.request
 import wave
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -66,6 +71,16 @@ VOICE_FILES = [
     ("zh_CN-huayan-medium.onnx", f"{VOICE_BASE}.onnx"),
     ("zh_CN-huayan-medium.onnx.json", f"{VOICE_BASE}.onnx.json"),
 ]
+# Piper 语音文件的 SHA256 pin（SC-P2-8：只 pin 版本 tag、不验 SHA 时，
+# tag 被重指或传输损坏要到 piper 合成失败才暴露，报错还指向 piper
+# 而非下载；实测值取自 ~/workspace/.kws-exp/tts/ 现有文件，
+# 2026-11-18；上游重发时更新此处，_download 会明确报错）。
+VOICE_SHA256 = {
+    "zh_CN-huayan-medium.onnx":
+        "9929917bf8cabb26fd528ea44d3a6699c11e87317a14765312420be230be0f3d",
+    "zh_CN-huayan-medium.onnx.json":
+        "d521dc45504a8ccc99e325822b35946dd701840bfb07e3dbb31a40929ed6a82b",
+}
 
 # (文件名, 文本, length-scale；None = 默认 1.0)。
 # 文本与变体照抄 ~/workspace/.kws-exp/run_kws_test.py 的 SAMPLES 表；
@@ -88,12 +103,47 @@ NOISE_SECONDS = 2
 NOISE_STD = 5000  # 与实验样本 neg_noise2s.wav 实测 RMS≈5012 一致
 NOISE_SEED = 20261117
 
-# 样本校验：最多重抽次数；阈值与分数取边车默认值（README 的
-# KWS_THRESHOLD / KWS_SCORE，实验验证值）。
-MAX_GENERATION_ATTEMPTS = 10
-VERIFY_THRESHOLD = 0.25
-VERIFY_SCORE = 1.0
+# 样本校验：最多重抽次数（SC-P2-11：旧代码按检测次数计数，
+# MAX_GENERATION_ATTEMPTS=10 实际是 10 次检测 / 9 次重抽，与文档
+# “重抽最多 10 次”差一；现按重抽次数计，即最多 11 次检测）。
+MAX_REROLLS = 10
 TRAILING_SILENCE_FRAMES = 50  # 1s 静音，与测试的 stream_frames 一致
+
+
+def _verify_thresholds():
+    """样本校验用的阈值/分数：与服务端同源（SC-P2-9）——读
+    KWS_THRESHOLD / KWS_SCORE 环境变量，默认 0.25/1.0（实验验证值，
+    与 server.py 的 DEFAULT_THRESHOLD / DEFAULT_SCORE 一致）。
+    写死常量会与部署改过的阈值悄悄分叉（样本校验通过、生产阈值下
+    检不出，或反之）。非法值直接报错，不静默用。"""
+    try:
+        threshold = float(os.environ.get("KWS_THRESHOLD", "0.25"))
+        score = float(os.environ.get("KWS_SCORE", "1.0"))
+    except ValueError as e:
+        raise RuntimeError(
+            "bootstrap: KWS_THRESHOLD / KWS_SCORE must be numbers "
+            f"(got {os.environ.get('KWS_THRESHOLD')!r} / "
+            f"{os.environ.get('KWS_SCORE')!r}); fix the env vars") from e
+    if not 0 < threshold <= 1 or score < 0:
+        raise RuntimeError(
+            "bootstrap: KWS_THRESHOLD must be in (0, 1] and KWS_SCORE "
+            f">= 0 (got threshold={threshold}, score={score}); "
+            "server.py refuses to start with the same values — "
+            "fix the env vars")
+    return threshold, score
+
+
+def _backup_existing(path: Path):
+    """重抽前备份已存在的样本（SC-P2-10）：<name>.bak-<YYYYMMDD-HHMMSS>。
+    默认资产根是共享实验目录（~/workspace/.kws-exp），原地重抽会改写
+    参考样本；备份后才覆盖，坏抽样可追溯、可恢复。不存在时返回 None。"""
+    if not path.is_file():
+        return None
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.name}.bak-{stamp}")
+    shutil.copyfile(path, backup)
+    print(f"[bootstrap] backed up {path.name} -> {backup.name}", flush=True)
+    return backup
 
 
 def assets_root() -> Path:
@@ -152,7 +202,28 @@ def _ensure_keywords(root: Path, model_dir: Path) -> Path:
     return target
 
 
-def _download(url: str, dest: Path) -> None:
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _voice_sha_ok(path: Path) -> bool:
+    """语音文件 SHA 是否与 pin 值一致（SC-P2-8）。未 pin 的文件不做
+    判定（返回 True，只记录），不让未知文件触发反复重下。"""
+    expected = VOICE_SHA256.get(path.name)
+    if expected is None:
+        return True
+    return _sha256_file(path) == expected
+
+
+def _download(url: str, dest: Path, sha256=None) -> None:
+    """下载文件；传 sha256 时下载后校验（SC-P2-8），不符即删文件重报
+    （不留损坏文件让 piper 合成失败时才暴露）。
+
+    失败时抛 RuntimeError（写清缺什么、从哪下），不静默跳过。"""
     dest.parent.mkdir(parents=True, exist_ok=True)
     print(f"[bootstrap] downloading {url} -> {dest} ...", flush=True)
     try:
@@ -165,17 +236,37 @@ def _download(url: str, dest: Path) -> None:
         raise RuntimeError(
             f"bootstrap: failed to download {url}: {e}; "
             "check network access to huggingface.co") from e
+    if sha256 is not None and _sha256_file(dest) != sha256:
+        dest.unlink()
+        raise RuntimeError(
+            f"bootstrap: downloaded {url} failed SHA256 verification "
+            f"(expected {sha256}); deleted the corrupt file — the "
+            "release tag may have been re-pointed or the transfer was "
+            "damaged; verify the upstream file and update VOICE_SHA256 "
+            "in tests/bootstrap.py")
 
 
 def _ensure_voice(root: Path) -> Path:
     tts_dir = root / "tts"
     voice_onnx = tts_dir / VOICE_FILES[0][0]
     if all((tts_dir / name).is_file() for name, _ in VOICE_FILES):
-        return voice_onnx
+        # SC-P2-8：已存在的文件也验 SHA——损坏的语音文件否则要到
+        # piper 合成失败才暴露；不符即删掉重下，不静默用坏文件。
+        bad = [name for name, _ in VOICE_FILES
+               if not _voice_sha_ok(tts_dir / name)]
+        if not bad:
+            print(f"[bootstrap] voice files present and SHA256 OK "
+                  f"({', '.join(name for name, _ in VOICE_FILES)})",
+                  flush=True)
+            return voice_onnx
+        print(f"[bootstrap] voice file(s) failed SHA256 check: "
+              f"{', '.join(bad)}; re-downloading ...", flush=True)
+        for name in bad:
+            (tts_dir / name).unlink()
     for name, url in VOICE_FILES:
         dest = tts_dir / name
         if not dest.is_file():
-            _download(url, dest)
+            _download(url, dest, sha256=VOICE_SHA256.get(name))
     return voice_onnx
 
 
@@ -305,8 +396,10 @@ def _verify_samples(root: Path, model_dir: Path, keywords_file: Path,
                     samples_dir: Path) -> None:
     """逐个校验样本：正样本必须检出、负样本必须静默。
 
-    不合格的可重抽样本（Piper 合成）重抽，最多 MAX_GENERATION_ATTEMPTS
-    次；噪声样本是确定性的，校验不过直接报错。
+    不合格的可重抽样本（Piper 合成）重抽，最多 MAX_REROLLS 次重抽
+    （即最多 MAX_REROLLS + 1 次检测）；噪声样本是确定性的，校验不过
+    直接报错。重抽前备份原文件（SC-P2-10），不静默改写共享实验目录。
+    校验阈值读 KWS_THRESHOLD / KWS_SCORE，与服务端同源（SC-P2-9）。
     """
     try:
         import sherpa_onnx
@@ -315,14 +408,18 @@ def _verify_samples(root: Path, model_dir: Path, keywords_file: Path,
             "bootstrap: cannot verify samples, sherpa-onnx is not "
             "installed; install it first: "
             "pip install -r requirements.txt") from e
+    threshold, score = _verify_thresholds()
     spotter = sherpa_onnx.KeywordSpotter(
         tokens=str(model_dir / "tokens.txt"),
         encoder=str(model_dir / REQUIRED_MODEL_FILES[0]),
         decoder=str(model_dir / REQUIRED_MODEL_FILES[1]),
         joiner=str(model_dir / REQUIRED_MODEL_FILES[2]),
         keywords_file=str(keywords_file),
-        keywords_threshold=VERIFY_THRESHOLD,
-        keywords_score=VERIFY_SCORE, num_threads=1)
+        keywords_threshold=threshold,
+        keywords_score=score, num_threads=1)
+    print(f"[bootstrap] verifying samples with threshold={threshold} "
+          f"score={score} (from KWS_THRESHOLD / KWS_SCORE env, "
+          f"same source as server.py)", flush=True)
     pos = {name for name, _, _ in SAMPLE_SPECS if name.startswith("pos")}
     neg = {name for name, _, _ in SAMPLE_SPECS if name.startswith("neg")}
     neg.add(NOISE_FILE)
@@ -330,9 +427,10 @@ def _verify_samples(root: Path, model_dir: Path, keywords_file: Path,
     for name in sorted(pos | neg):
         expect_wake = name in pos
         path = samples_dir / name
-        attempts = 0
+        # SC-P2-11：按重抽次数计数（rerolls），不按检测次数计——
+        # 旧代码 attempts 从 1 计检测次数，10 次检测只含 9 次重抽。
+        rerolls = 0
         while True:
-            attempts += 1
             ok = _detect(spotter, path) == expect_wake
             if ok:
                 break
@@ -342,19 +440,22 @@ def _verify_samples(root: Path, model_dir: Path, keywords_file: Path,
                     f"{NOISE_FILE} failed verification "
                     f"(expected silent, got wake); this is a model/"
                     "threshold issue, not a bad draw — do not ignore")
-            if attempts >= MAX_GENERATION_ATTEMPTS:
+            if rerolls >= MAX_REROLLS:
                 raise RuntimeError(
                     "bootstrap: sample "
-                    f"{name} failed verification {attempts} times "
+                    f"{name} failed verification after {rerolls} "
+                    f"re-rolls ({rerolls + 1} detections) "
                     f"(expected {'wake' if expect_wake else 'silent'}); "
                     "the model is marginal on this sentence — "
                     "do not silently pass, investigate before "
                     "changing the sample text")
             if piper is None:
                 piper, ffmpeg, voice_onnx = _sample_toolchain(root)
+            rerolls += 1
+            _backup_existing(path)  # SC-P2-10：重抽前备份原文件
             print(f"[bootstrap] sample {name} failed verification; "
-                  f"re-rolling (attempt {attempts + 1}/"
-                  f"{MAX_GENERATION_ATTEMPTS}) ...", flush=True)
+                  f"re-rolling (re-roll {rerolls}/"
+                  f"{MAX_REROLLS}) ...", flush=True)
             spec = next(s for s in SAMPLE_SPECS if s[0] == name)
             _synthesize_sample(piper, ffmpeg, voice_onnx, spec[1],
                                spec[2], path)

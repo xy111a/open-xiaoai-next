@@ -334,6 +334,13 @@ func sanitizeValue(v any) any {
 }
 
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
+	// P2-56：只响应 "/"，其余未匹配路径返回 404——旧代码里
+	// mux 的 "/" 匹配所有未命中路径并返回 200 首页，
+	// 调用方拼错 API 路径（如 /api/statuss）会被掩盖。
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>open-xiaoai-next</title>
 <style>body{font-family:system-ui;max-width:720px;margin:40px auto;padding:0 16px}table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:6px 10px}</style>

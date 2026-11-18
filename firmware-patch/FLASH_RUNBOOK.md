@@ -32,11 +32,13 @@
 | 官方 OH2P 1.58.6 `.bin` | 36,042,824 | `1f351d879c06ff3bd7bd4b4c68e2c8fa45eee1a82be5839e57899ae8f9b7c27b` |
 | LX06 原始 root.squashfs | 37,500,699 | `317a54909f12b63f22128965bf9005c06435d15f61c4202bb88c4524bf1e2ef4` |
 | OH2P 原始 root.squashfs | 29,953,626 | `c33dfc21a2a3093b6c4e41f3bf0738e1ff21daf59bbccc5203863bdb62dfa493` |
-| **LX06 补丁镜像 root-patched.squashfs（2026-11-17 重编后实测）** | **38,453,248** | **`7266aba99b769947bd3ce937c23f0dc0443ad52883f04e4992eed45c0d7d97b3`** |
-| **OH2P 补丁镜像 root-patched.squashfs（2026-11-17 重编后实测）** | **30,179,328** | **`139de363d39d0a5472bf9b00c015effd9a24c379ca5fa2436cc21c43e8706415`** |
+| **LX06 补丁镜像 root-patched.squashfs（2026-11-18 重编后实测）** | **38,457,344** | **`7dafb9507bdc4894715f2978ffaf5fd6a11af18ad61ed268f48c6309f0a05e21`** |
+| **OH2P 补丁镜像 root-patched.squashfs（2026-11-18 重编后实测）** | **30,179,328** | **`fe2bab99eb15e423b689c24bace6fec1b665b1073dc12ec1c9fa2e4433b5c926`** |
 
-> 旧 SHA（LX06 `cc36b28e7f2e998d5a6a88f8597de85f0cc0021a1d864d4d785234a6bb54f06d`、OH2P `db00add0ad5674ba8efda41b647a5b1b4508a6fb4d54fa554f2526614fff0423`）已被取代：前一波 P0-2 修复改了补丁内容，镜像重编后 SHA 变了，以上表为准（已用 `sha256sum` 在磁盘上核实）。
-> `flash-check.sh` 内部的 `KNOWN_PATCHED_SHA256` 已同步为上表新值（2026-11-17 联调时核实：两型号均 `PASS 补丁镜像 SHA256 与 2026-11-17 实测值一致`，无 WARN）。
+> 旧 SHA（LX06 `7266aba99b769947bd3ce937c23f0dc0443ad52883f04e4992eed45c0d7d97b3`、OH2P `139de363d39d0a5472bf9b00c015effd9a24c379ca5fa2436cc21c43e8706415`，2026-11-17 打的）已被取代：P2 轮补丁代码比镜像新三处（P1-36 inittab、P2-33 .bak、P2-34 包装器），2026-11-18 用现版 `patch.sh` 重编，SHA 变了，以上表为准（已用 `sha256sum` 在磁盘上核实）。更旧的 SHA（LX06 `cc36b28e…54f06d`、OH2P `db00add0…f0423`）同样作废。
+> `flash-check.sh` 内部的 `KNOWN_PATCHED_SHA256` 已同步为上表新值（2026-11-18 重编后核实：两型号默认与 `--strict` 四路均 exit 0，`PASS 补丁镜像 SHA256 与记录值一致`，无 WARN）。
+>
+> 【2026-11-18 P2 轮重编注：重编时 root 密码未换——新镜像的 shadow root 行沿用了旧镜像的 `$6$` hash（bai 手里已有的密码继续有效），未生成新密码；重编还修了两个管线缺口：(1) `patch.sh` 此前从不传 `--cert-dir`，直接跑它会产出无 mTLS 证书的镜像，现已默认用 `work/certs` 装入（缺目录直接失败，仅测试可设 `PATCH_NO_CERTS=1`）；(2) `patch.sh` §6 验 `.bak` 曾用 "slave.pcm Capture" 标记法，OH2P 原厂 asound.conf 里就有该行会误杀，现改为与原始 root.squashfs 逐字节比对。详见 `TEST_REPORT.md`“P2 全修轮”一节。】
 
 补丁镜像上限 **40MB（0x02800000 = 41,943,040 字节）**，超了变砖。
 `flash-check.sh` 会逐项核对上表，任一 FAIL 都不许刷。
@@ -44,6 +46,11 @@
 > 补丁镜像若被重编（例如另一位修复工人在改 `patch_firmware.py`），SHA256
 > 会变：以重编后 `flash-check.sh` 打印的值为准，并把新值与重编原因记进
 > §8 检查清单，不要硬套上表。
+>
+> 【2026-11-18 P2 轮重编注：上表镜像已是 2026-11-18 用现版 `patch.sh` 重编的，
+> 含 P1-36（inittab `/bin/login`）、P2-33（.bak）、P2-34（init 包装器）与 mTLS
+> 证书；`flash-check.sh` §4b 四路（两型号 × 默认/`--strict`）均 exit 0。
+> 旧的“镜像过期三缺口”二选一已失效，不再适用。】
 
 ### 1.2 恢复用原厂材料（回滚的第二道保险，第一道是未动过的槽，见 §6）
 
@@ -75,9 +82,24 @@ Micro USB 调试口（拆机参考：52audio 38303）。OH2P：底部 Type-C，�
 ```bash
 cd firmware-patch
 ./scripts/flash-check.sh lx06 1.94.13   # 或 oh2p 1.58.6
+# 刷机当天用 --strict 再跑一遍：SHA 与 §1.1 记录值不一致即 FAIL（默认只警告）。
+./scripts/flash-check.sh --strict lx06 1.94.13
 ```
 
 全部 PASS（WARN 只提示、不拦截）才继续。把输出保存下来附在 §8 清单后。
+注意：`--strict` 下 SHA 不一致即 FAIL；§4b 内容验证缺标记即 FAIL
+（.bak 与 init 包装器缺失只警告——针对旧版补丁产物；2026-11-18 重编的
+当前镜像里两者都有，不会触发该警告）。
+
+### 1.5 Hub OTA 更新（首刷之后的事，不在首刷流程里）
+
+- 首刷之后再推补丁镜像走 Hub 自有 OTA（`hub/internal/ota`）。**绝不复用
+  原厂 `bin/flash.sh` 推补丁镜像**——它会重写 u-boot；补丁镜像没有小米
+  签名，走不通原厂 OTA，复用它等于把设备变砖。
+- Hub OTA 的 `VerifyTimeout` 是 **30 秒**（`hub/internal/ota/ota.go` 的
+  `VerifyTimeout: 30s`，`PushTimeout` 10 分钟是另一项）：设备须在 30 秒内
+  回 hello，否则任务标失败。设备回 hello 慢（首次启动、网络抖动）时任务
+  会误判失败——先看设备日志再决定是否重推，不要连续重推。
 `flash-check.sh` 只做本地校验：官方 `.bin` / 原始 root.squashfs 白名单
 SHA256、补丁镜像大小 / 魔数 / `unsquashfs -s` 解析、mico_version 一致性。
 设备侧步骤它验不了，见 §2–§6。

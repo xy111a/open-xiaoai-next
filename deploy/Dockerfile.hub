@@ -7,9 +7,17 @@
 # 故不加 :ro；只读挂载下 Save 必然失败）。
 # 运行时依赖：二进制为动态链接 glibc（ldd 实测只依赖 libc/libm，Opus 已静态编入），
 # 不需要 libopus；但 LLM 走 HTTPS，需要 ca-certificates。
-# P1-4：FROM 未钉 digest——本机到 registry-1.docker.io 的 manifest 接口超时，
-# 无法可信解析 bookworm-slim 的 digest；钉死前先在能访问 Docker Hub 的机器上取。
-FROM debian:bookworm-slim
+# P1-4：FROM 已钉 digest（2026-11-18 从 Docker Hub 取的 debian:bookworm-slim
+# latest 的 digest，见 deploy/docker-compose.yml 头注释）；apt 包不钉版本——
+# bookworm 是稳定版（只有安全更新），钉死具体版本号会在快照轮换时断构建，
+# 基础镜像 digest 才是真正钉死底座的那一层。
+# P1-4：以 uid 1000 的 appuser 运行（USER appuser），不再 root。注意 /app
+# 必须属主 appuser：config.Save 用 os.CreateTemp 在 /app（config.yaml 所在
+# 目录）建临时文件再改名，/app 不可写时语音认领房间与 Web 改配置都会失败
+# （P1-32 的 Save 就是为这个存在的）。/app/hub-data 同样 chown：具名卷
+# 首次挂载时 Docker 把镜像里该目录的属主 copy-up 进卷；已存在卷的迁移
+# 由 nas-install.sh §4 的 chown one-shot 负责。
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 # tzdata（P1-46）：compose 传 TZ=Asia/Shanghai，没有 zoneinfo 文件时 TZ 不生效、
 # 容器仍是 UTC；tzdata 让 Hub 容器真正用北京时间。
@@ -21,6 +29,19 @@ COPY hub-linux-amd64 /usr/local/bin/hub
 RUN chmod +x /usr/local/bin/hub
 
 WORKDIR /app
+RUN groupadd -r appuser -g 1000 \
+    && useradd -r -u 1000 -g appuser appuser \
+    && mkdir -p /app/hub-data \
+    && chown appuser:appuser /app /app/hub-data
+
+# P1-4：只探 4399 监听，不冒充业务健康（/api/status 要 Web Token，
+# 健康检查里不放 token）。裸 TCP 连上即关，Hub 的 wss 握手会收到 EOF，
+# 只记一条日志，不影响服务。无 docker 的本机无法构建验证，首次构建
+# 在 NAS 上跑（nas-install.sh §4 先 build 再 up，构建失败即停）。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["bash", "-c", "cat < /dev/null > /dev/tcp/127.0.0.1/4399"]
+
+USER appuser
 EXPOSE 4399 8080
 ENTRYPOINT ["/usr/local/bin/hub"]
 CMD ["-config", "/app/config.yaml"]

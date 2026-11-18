@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"math/big"
 	"net"
 	"os"
@@ -36,8 +37,102 @@ func Fingerprint(certPEM []byte) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// LoadOrCreate 读现有证书，不存在则生成一对新的（CA 自签，10 年有效期）。
+// serverCertValidity 是服务端/客户端证书的有效期（P2-1）：
+// 旧代码 10 年——私钥一旦泄露可冒充 Hub 长达 10 年，且指纹 pin
+// 不会过期失效。改 2 年，到期前 30 天启动时自动重签（见 reuse 检查）。
+// CA 本身仍 10 年（CA 轮换会废掉全部客户端证书，另行规划）。
+const serverCertValidity = 2 * 365 * 24 * time.Hour
+
+// renewBefore 是证书剩余有效期低于该值时启动即重签的阈值。
+const renewBefore = 30 * 24 * time.Hour
+
+// lanSANs 取本机局域网 IP 与主机名，供新证书的 SAN 用（P2-1：
+// 旧 SAN 只有 127.0.0.1/localhost/open-xiaoai-hub，非 pin 客户端
+// 校验局域网地址会失败）。取不到时只返回回环地址，不阻塞签发。
+func lanSANs() ([]net.IP, []string) {
+	ips := []net.IP{net.ParseIP("127.0.0.1")}
+	names := []string{"localhost", "open-xiaoai-hub"}
+	if hn, err := os.Hostname(); err == nil && hn != "" {
+		names = append(names, hn)
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ips, names
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() || ip.To4() == nil {
+				continue
+			}
+			if !ip.IsPrivate() {
+				continue
+			}
+			dup := false
+			for _, have := range ips {
+				if have.Equal(ip) {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				ips = append(ips, ip)
+			}
+		}
+	}
+	return ips, names
+}
+
+// parseLeafCert 解析 PEM 证书文件里的叶子证书（校验有效期用）。
+func parseLeafCert(certPEM []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return nil, fmt.Errorf("证书 PEM 解码失败")
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
+
+// certNeedsRenew 判断证书是否该重签：已过期、30 天内过期、
+// 或尚未生效（时钟 skew 之外）都算该重签。
+func certNeedsRenew(cert *x509.Certificate, now time.Time) bool {
+	if now.After(cert.NotAfter.Add(-renewBefore)) {
+		return true
+	}
+	if now.Before(cert.NotBefore) {
+		return true
+	}
+	return false
+}
+
+// backupDamaged 把损坏/过期证书与私钥改名备份（不直接删，
+// 指纹变了要能找回旧证书比对），返回备份路径。
+func backupDamaged(certPath, keyPath string) {
+	stamp := time.Now().Format("20060102-150405")
+	_ = os.Rename(certPath, certPath+".bak."+stamp)
+	_ = os.Rename(keyPath, keyPath+".bak."+stamp)
+}
+
+// LoadOrCreate 读现有证书，不存在则生成一对新的（2 年有效期，P2-1）。
 // 返回可直接给 tls.Config 用的证书。
+//
+// 现有证书复用前校验有效期：已过期或 30 天内过期即备份旧文件
+// （.bak.<时间戳>）后重签；损坏（解析/加载失败）同样备份后重签，
+// 不再让 Hub 因一张坏证书无法启动（旧代码直接返回错误 → main Fatal）。
+// 指纹变了要同步更新 client.toml 的 hub_ca_fingerprint，
+// 重签时记一条日志提醒操作员。
 //
 // 注意：这是旧的自签服务端证书路径（无 CA、无客户端证书）。
 // mTLS 部署请用 LoadOrCreateMTLS()：CA 签发的服务端证书 + 客户端 CA 池。
@@ -49,21 +144,23 @@ func LoadOrCreate(dataDir string) (tls.Certificate, string, error) {
 	if err := os.MkdirAll(filepath.Dir(p.Cert), 0700); err != nil {
 		return tls.Certificate{}, "", err
 	}
-	if _, err := os.Stat(p.Cert); err == nil {
-		if _, err := os.Stat(p.Key); err == nil {
+	if pemBytes, err := os.ReadFile(p.Cert); err == nil {
+		if _, err := os.ReadFile(p.Key); err == nil {
 			cert, err := tls.LoadX509KeyPair(p.Cert, p.Key)
-			if err != nil {
-				return tls.Certificate{}, "", err
+			if err == nil {
+				if leaf, err := parseLeafCert(pemBytes); err == nil {
+					if !certNeedsRenew(leaf, time.Now()) {
+						fp, err := Fingerprint(pemBytes)
+						if err == nil {
+							return cert, fp, nil
+						}
+					} else {
+						log.Printf("tlscert: 证书将于 %s 过期（剩余有效期不足 30 天），备份后重签", leaf.NotAfter.Format("2006-01-02"))
+					}
+				}
 			}
-			pemBytes, err := os.ReadFile(p.Cert)
-			if err != nil {
-				return tls.Certificate{}, "", err
-			}
-			fp, err := Fingerprint(pemBytes)
-			if err != nil {
-				return tls.Certificate{}, "", err
-			}
-			return cert, fp, nil
+			// 加载失败 / 解析失败 / 该重签：备份旧文件后往下重签。
+			backupDamaged(p.Cert, p.Key)
 		}
 	}
 	// 生成新证书。
@@ -75,15 +172,16 @@ func LoadOrCreate(dataDir string) (tls.Certificate, string, error) {
 	if err != nil {
 		return tls.Certificate{}, "", err
 	}
+	ips, names := lanSANs()
 	tmpl := x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: "open-xiaoai-hub", Organization: []string{"open-xiaoai-next"}},
 		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour),
+		NotAfter:     time.Now().Add(serverCertValidity),
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
-		DNSNames:     []string{"localhost", "open-xiaoai-hub"},
+		IPAddresses:  ips,
+		DNSNames:     names,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -113,7 +211,7 @@ func LoadOrCreate(dataDir string) (tls.Certificate, string, error) {
 //
 // 文件布局（dataDir/tls/ 下）：
 //   ca.crt / ca.key        自签 CA（10 年；私钥 0600，永不离开 NAS）
-//   hub.crt / hub.key      CA 签发的服务端证书（SAN 与旧 LoadOrCreate 一致）
+//   hub.crt / hub.key      CA 签发的服务端证书（2 年有效期，SAN 含局域网地址）
 //   client-<cn>.crt/.key   CA 签发的客户端证书（随固件下发给音箱，见
 //                          firmware-patch/scripts/gen-certs.sh 与
 //                          patch_firmware.py --cert-dir）
@@ -183,7 +281,8 @@ func LoadOrCreateCA(dataDir string) (*CA, error) {
 	}
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	if err := os.WriteFile(p.Cert, certPEM, 0644); err != nil {
+	// P2-4：CA 证书也 0600（旧代码 0644）。
+	if err := os.WriteFile(p.Cert, certPEM, 0600); err != nil {
 		return nil, err
 	}
 	if err := os.WriteFile(p.Key, keyPEM, 0600); err != nil {
@@ -239,20 +338,26 @@ func (c *CA) Pool() *x509.CertPool {
 }
 
 // issueCert 用 CA 签发一张证书（服务端或客户端），写到指定路径；
-// 已存在且确由该 CA 签发时直接复用，不重签。
+// 已存在、确由该 CA 签发且剩余有效期 >30 天时直接复用，不重签。
+// 过期/将过期/损坏时备份旧文件后重签（P2-1：旧代码只认签名不认有效期，
+// 一张 10 年证书过期后仍被复用，Hub 带着过期证书启动）。
 func (c *CA) issueCert(certPath, keyPath string, tmpl *x509.Certificate) (tls.Certificate, string, error) {
 	if certPEM, err := os.ReadFile(certPath); err == nil {
 		if keyPEM, err := os.ReadFile(keyPath); err == nil {
 			if cert, err := tls.X509KeyPair(certPEM, keyPEM); err == nil {
 				if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil {
-					if err := leaf.CheckSignatureFrom(c.Cert); err == nil {
+					if err := leaf.CheckSignatureFrom(c.Cert); err == nil && !certNeedsRenew(leaf, time.Now()) {
 						fp, err := Fingerprint(certPEM)
 						if err == nil {
 							return cert, fp, nil
 						}
+					} else if err == nil {
+						// 有效期不足：重签会换指纹，记日志提醒同步 client.toml。
+						log.Printf("tlscert: %s 剩余有效期不足 30 天，备份后重签（指纹会变，需同步更新 client.toml 的 hub_ca_fingerprint）", certPath)
 					}
 				}
 			}
+			backupDamaged(certPath, keyPath)
 		}
 	}
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -265,7 +370,7 @@ func (c *CA) issueCert(certPath, keyPath string, tmpl *x509.Certificate) (tls.Ce
 	}
 	tmpl.SerialNumber = serial
 	tmpl.NotBefore = time.Now().Add(-time.Hour)
-	tmpl.NotAfter = time.Now().Add(10 * 365 * 24 * time.Hour)
+	tmpl.NotAfter = time.Now().Add(serverCertValidity)
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, c.Cert, &key.PublicKey, c.Key)
 	if err != nil {
 		return tls.Certificate{}, "", err
@@ -275,7 +380,8 @@ func (c *CA) issueCert(certPath, keyPath string, tmpl *x509.Certificate) (tls.Ce
 	if err := os.MkdirAll(filepath.Dir(certPath), 0700); err != nil {
 		return tls.Certificate{}, "", err
 	}
-	if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
+	// P2-4：证书文件也 0600（旧代码 0644，同 NAS 多用户可读）。
+	if err := os.WriteFile(certPath, certPEM, 0600); err != nil {
 		return tls.Certificate{}, "", err
 	}
 	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
@@ -293,14 +399,15 @@ func (c *CA) issueCert(certPath, keyPath string, tmpl *x509.Certificate) (tls.Ce
 }
 
 // IssueServerCert 签发（或复用）CA 签名的 Hub 服务端证书，写到
-// dataDir/tls/hub.crt + hub.key。SAN 与旧 LoadOrCreate() 一致。
+// dataDir/tls/hub.crt + hub.key。SAN 含本机局域网 IP/主机名（P2-1）。
 func (c *CA) IssueServerCert(dataDir string) (tls.Certificate, string, error) {
+	ips, names := lanSANs()
 	tmpl := &x509.Certificate{
 		Subject:     pkix.Name{CommonName: "open-xiaoai-hub", Organization: []string{"open-xiaoai-next"}},
 		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},
-		DNSNames:    []string{"localhost", "open-xiaoai-hub"},
+		IPAddresses: ips,
+		DNSNames:    names,
 	}
 	return c.issueCert(filepath.Join(dataDir, "tls", "hub.crt"),
 		filepath.Join(dataDir, "tls", "hub.key"), tmpl)

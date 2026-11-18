@@ -23,6 +23,7 @@ NAS 上实际运行未验证）。
 | hub | 本地构建（deploy/Dockerfile.hub + 预编译二进制 deploy/hub-linux-amd64） | host | 唯一常驻服务，管仲裁/语音/音乐/HA/OTA |
 | whisper | rhasspy/wyoming-whisper | 10300 | small-int8，中文，beam-size 1 |
 | piper | rhasspy/wyoming-piper | 10200 | zh_CN-huayan-medium，流式合成 |
+| kws-sidecar | 本地构建（kws-sidecar/Dockerfile + server.py，模型首次启动下载到 kws-data 卷） | host（10400） | 服务端唤醒检测（sherpa-onnx WenetSpeech，“你好小李”）；Hub 经 ws://127.0.0.1:10400/v1/kws 连它 |
 | snapserver | ivdata/snapserver | host | 多房间同步播放服务端 |
 | mpd | vimagick/mpd | host | 读 /volume1/music（可选本地兜底），写 snapfifo |
 | netease-api | binaryify/netease_cloud_music_api | 3000 | 网易云非官方 API，只绑 127.0.0.1；本身不保存登录态，Cookie 由 Hub 存在 hub-data 卷，约 1–2 个月过期需重扫 |
@@ -64,15 +65,19 @@ NAS 上实际运行未验证）。
 
 ## 2026-11-17 部署包更新（G）
 
-- **Hub 二进制已编好**：`deploy/hub-linux-amd64`，11,534,848 字节，
-  SHA256 `f12c09e00098a00188fcdd8e18a171696ef1d5a82051c51d6aa122573734945b`，
+- **Hub 二进制已编好**（2026-11-18 P2 轮收尾重编，分支 `fix-p2-loose-ends` 尖 afcdcf0，
+  干净 HEAD worktree 编译）：`deploy/hub-linux-amd64`，12,093,544 字节，
+  SHA256 `973a3b1fa2d34acab7a1feaa5c6fb146bc01167735b4c50ba408d1acd0213091`，
   `go build -o deploy/hub-linux-amd64 ./cmd/hub`（hub/ 下，Go 1.23.12）。
-  本机冒烟验证：`--help` 打印用法退出 0；设 `OPEN_XIAOAI_TOKEN` 后启动，
-  `curl :8080/api/status` 返回 `{"devices":2,"online":0,"rooms":null,"wake_word":"你好小李"}`，
-  `/api/devices` 返回配置里的两台占位设备；收信号后干净退出，未常驻。
+  清单 `deploy/hub-linux-amd64.sha256` 已生成（`nas-install.sh` §0 会比对，
+  不一致即 FAIL；重编后须重新生成清单）。本机冒烟验证：`--help` 打印用法退出 0；
+  弱 Token（`CHANGE_ME`）启动即 Fatal 退出 1；设强 Token 后启动，
+  `curl :8080/api/status` 无 Token 返回 401，带 Web Token 返回
+  `{"devices":0,"kws_down":true,"kws_status":"down","online":0,"rooms":null,"wake_word":"你好小李"}`
+  （`kws_status: down` 是本机无边车的预期结果）；收信号后干净退出，未常驻。
   未设 `OPEN_XIAOAI_TOKEN` 时 Hub 直接退出（日志 `环境变量 OPEN_XIAOAI_TOKEN 未设置`），
   所以 compose 里补上了这个环境变量。`ldd` 实测二进制只依赖 libc/libm，
-  Opus 已静态编入，NAS 上不需要装 libopus。
+  Opus 已静态编入，NAS 上不需要装 libopus。旧值 11,747,288 字节（`1e4f6f6c…c80a`）已被取代。
 - **修掉三个必死的错**（否则 `docker compose up` 一定失败）：
   1. hub 原来写 `build: ../hub`，但 hub/ 下没有 Dockerfile → 改为 `deploy/Dockerfile.hub`
      （debian:bookworm-slim + ca-certificates，只装预编译二进制；config.yaml 不打进镜像，

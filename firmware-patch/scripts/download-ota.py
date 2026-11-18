@@ -35,6 +35,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -79,9 +80,32 @@ ALLOWED_LINK_HOSTS = frozenset({"cdn.cnbj1.fds.api.mi-img.com"})
 
 CHUNK_SIZE = 1024 * 1024  # 流式下载分块：1MB
 
+# P2-23：下载参数的格式白名单（第一道门；白名单 EXPECTED 是第二道）。
+# version 的点必须字面匹配——未转义的 `.` 会放过 "1/94/13" 之类带斜杠的
+# 输入，拼进 URL 与本地文件名就是路径穿越。model/channel/sn 也只允许
+# 安全字符集，sn 为空表示不传（filterID= 空）。
+_MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+_CHANNEL_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+_SN_RE = re.compile(r"^[A-Za-z0-9_-]{0,64}$")
+
+
+def validate_ota_params(model: str, version: str, channel: str = "release",
+                        sn: str = "") -> None:
+    """校验下载参数格式；不合格式即 ValueError（在拼 URL/查白名单之前）。"""
+    if not _MODEL_RE.fullmatch(model or ""):
+        raise ValueError(f"型号格式不对：{model!r}（只允许小写字母/数字/_/-）")
+    if not _VERSION_RE.fullmatch(version or ""):
+        raise ValueError(f"版本号格式不对：{version!r}（应为 x.y.z，如 1.94.13）")
+    if not _CHANNEL_RE.fullmatch(channel or ""):
+        raise ValueError(f"channel 格式不对：{channel!r}")
+    if not _SN_RE.fullmatch(sn or ""):
+        raise ValueError(f"sn 格式不对：{sn!r}（只允许字母/数字/_/-，≤64 字符）")
+
 
 def expected(model: str, version: str) -> dict:
     """取白名单条目；不在白名单即拒绝（强制门，发网络请求之前调用）。"""
+    validate_ota_params(model, version)
     try:
         return EXPECTED[(model, version)]
     except KeyError:
@@ -109,6 +133,7 @@ def build_ota_url(model: str, version: str, channel: str = "release",
 
     now_ms 为毫秒时间戳；不传时取当前时间（time.time() * 1000）。
     """
+    validate_ota_params(model, version, channel, sn)
     if now_ms is None:
         now_ms = int(time.time() * 1000)
     ota_info = (

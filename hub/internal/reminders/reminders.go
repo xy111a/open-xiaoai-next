@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,7 +61,10 @@ type Store struct {
 	path    string // 持久化文件（JSON）
 	onFire  func(r Reminder)
 	stopCh  chan struct{}
-	stopped bool
+	started bool
+	// dirty 是“内存已改、落盘失败待重试”标记（P2-14）：saveLocked
+	// 失败时置位，下次 tick 重试保存，不让一次磁盘错误丢掉整批变更。
+	dirty bool
 }
 
 // New 新建 Store。path 为空表示不持久化。onFire 在提醒到点时被调用。
@@ -79,6 +83,11 @@ func (s *Store) SetOnFire(fn func(r Reminder)) {
 	defer s.mu.Unlock()
 	s.onFire = fn
 }
+
+// Load 从文件读回。文件损坏（JSON 解析失败）时把损坏文件改名备份
+// （path + ".corrupt.<时间戳>"），并返回错误——P2-44：
+// 旧代码静默丢掉全部提醒（main.go 里错误还被 `_ =` 吞掉），
+// 现在损坏有备份、启动有日志，提醒可从备份人工恢复。
 func (s *Store) Load() error {
 	if s.path == "" {
 		return nil
@@ -92,7 +101,12 @@ func (s *Store) Load() error {
 	}
 	var items []*Reminder
 	if err := json.Unmarshal(b, &items); err != nil {
-		return err
+		backup := s.path + ".corrupt." + time.Now().Format("20060102-150405")
+		if rerr := os.Rename(s.path, backup); rerr != nil {
+			return fmt.Errorf("提醒文件损坏（JSON 解析失败），备份也失败: %w（原错误: %v）", rerr, err)
+		}
+		log.Printf("reminders: 提醒文件损坏，已备份到 %s，本次启动提醒为空", backup)
+		return fmt.Errorf("提醒文件损坏（已备份到 %s）: %w", backup, err)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -119,11 +133,32 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0644); err != nil {
+	// P2-4：提醒文件含用户语音原文，落盘 0600；唯一临时文件
+	// （CreateTemp），不与其它写路径共用固定 .tmp 名。
+	dir := filepath.Dir(s.path)
+	f, err := os.CreateTemp(dir, ".reminders-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	tmp := f.Name()
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, 0600); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, s.path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // Add 新增一条提醒，返回 ID。Next 由调用方算好传入。
@@ -141,23 +176,37 @@ func (s *Store) Add(r Reminder) (string, error) {
 	r.Enabled = true
 	cp := r
 	s.items[r.ID] = &cp
-	return r.ID, s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		// P2-14：落盘失败置 dirty，下次 tick 重试保存；
+		// 错误仍返回给调用方（Router 会明说记不下来）。
+		s.dirty = true
+		return r.ID, err
+	}
+	return r.ID, nil
 }
 
 // Cancel 取消一条提醒（按 ID）；不存在返回 false。
-func (s *Store) Cancel(id string) bool {
+// 落盘失败时返回 error——调用方须告诉用户“取消没存住”，
+// 不能谎报已取消（P2-14：旧代码 `_ = saveLocked()` 吞掉错误，
+// 重启后提醒复活重播）。
+func (s *Store) Cancel(id string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.items[id]; !ok {
-		return false
+		return false, nil
 	}
 	delete(s.items, id)
-	_ = s.saveLocked()
-	return true
+	if err := s.saveLocked(); err != nil {
+		s.dirty = true
+		log.Printf("reminders: 取消 %s 后落盘失败（重启后可能复活）: %v", id, err)
+		return true, err
+	}
+	return true, nil
 }
 
 // CancelByText 按内容取消（语音取消用：“取消吃药提醒”）。
-func (s *Store) CancelByText(text string) int {
+// 落盘失败时返回 error（同 Cancel）。
+func (s *Store) CancelByText(text string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
@@ -167,8 +216,15 @@ func (s *Store) CancelByText(text string) int {
 			n++
 		}
 	}
-	_ = s.saveLocked()
-	return n
+	if n == 0 {
+		return 0, nil
+	}
+	if err := s.saveLocked(); err != nil {
+		s.dirty = true
+		log.Printf("reminders: 按文本取消 %q 后落盘失败（重启后可能复活）: %v", text, err)
+		return n, err
+	}
+	return n, nil
 }
 
 // List 返回全部提醒的快照。
@@ -196,13 +252,26 @@ func NextDaily(at string, now time.Time) (time.Time, error) {
 }
 
 // Start 启动调度循环（每秒扫一次）。
+// P2-13：重复 Start 是 no-op，不再每调一次多一个 ticker goroutine
+// （双倍触发）；Stop 后可再次 Start（每次用新的 stopCh，
+// 旧代码 Stop 关掉 stopCh 后新 goroutine 一启动就读到已关闭的 channel
+// 而立即退出，调度器再也起不来）。
 func (s *Store) Start() {
+	s.mu.Lock()
+	if s.started {
+		s.mu.Unlock()
+		return
+	}
+	s.started = true
+	stopCh := make(chan struct{})
+	s.stopCh = stopCh
+	s.mu.Unlock()
 	go func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-s.stopCh:
+			case <-stopCh:
 				return
 			case now := <-ticker.C:
 				s.tick(now)
@@ -211,25 +280,29 @@ func (s *Store) Start() {
 	}()
 }
 
-// Stop 停止调度循环。
+// Stop 停止调度循环；可再次 Start。
 func (s *Store) Stop() {
 	s.mu.Lock()
-	if !s.stopped {
-		s.stopped = true
-		close(s.stopCh)
+	if !s.started {
+		s.mu.Unlock()
+		return
 	}
+	s.started = false
+	close(s.stopCh)
 	s.mu.Unlock()
 }
 
 func (s *Store) tick(now time.Time) {
 	s.mu.Lock()
 	var due []*Reminder
+	changed := false
 	for _, it := range s.items {
 		if !it.Enabled || it.Next.After(now) {
 			continue
 		}
 		cp := *it
 		due = append(due, &cp)
+		changed = true
 		// 算下一次。
 		switch it.Kind {
 		case KindOnce, KindAction:
@@ -255,11 +328,24 @@ func (s *Store) tick(now time.Time) {
 			delete(s.items, it.ID)
 		}
 	}
-	_ = s.saveLocked()
+	// P2-44：只有增删改（或上次落盘失败待重试）时才写盘——旧代码
+	// 每秒全量写盘，无论有无变化。落盘失败记 error 日志并置 dirty，
+	// 下次 tick 重试；内存里的变更已生效，不因写盘失败回滚。
+	if changed || s.dirty {
+		if err := s.saveLocked(); err != nil {
+			s.dirty = true
+			log.Printf("reminders: 提醒落盘失败（下次 tick 重试）: %v", err)
+		} else {
+			s.dirty = false
+		}
+	}
+	onFire := s.onFire
 	s.mu.Unlock()
+	// P2-44：到点回调不再同步阻塞调度——每条提醒起独立 goroutine
+	// 执行（TTS 合成 + 网络发送慢也不拖住 1s tick）。
 	for _, r := range due {
-		if s.onFire != nil {
-			s.onFire(*r)
+		if onFire != nil {
+			go onFire(*r)
 		}
 	}
 }

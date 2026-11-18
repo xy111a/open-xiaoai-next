@@ -272,18 +272,153 @@ def test_patch_disable_ota_standalone(tmp_path):
 # --- 启动 ---
 
 def test_patch_start(patched_rootfs):
+    # P2-34：rc.local 走包装器，不再直接执行 /data/init.sh。
     rc = (patched_rootfs / "etc/rc.local").read_text()
-    line = '[ -f "/data/init.sh" ] && sh /data/init.sh >/dev/null 2>&1 &'
-    assert rc.count(line) == 1
-    assert rc.index(line) < rc.index("exit 0")
+    wrapper_line = ('[ -x /etc/open-xiaoai/init.sh ] '
+                    '&& /etc/open-xiaoai/init.sh >/dev/null 2>&1 &')
+    assert rc.count(wrapper_line) == 1
+    assert rc.index(wrapper_line) < rc.index("exit 0")
+    assert '[ -f "/data/init.sh" ] && sh /data/init.sh' not in rc
+    wrapper = (patched_rootfs / "etc/open-xiaoai/init.sh").read_text()
+    assert wrapper.startswith("#!/bin/sh")
+    assert "ls -ln" in wrapper  # 设备上没有 stat，用 ls -ln 判断属主/权限
+    assert "sha256sum" in wrapper
+    assert "init.sh.sha256" in wrapper
+    assert 'exec sh "$INIT"' in wrapper
+    assert (patched_rootfs / "etc/open-xiaoai/init.sh").stat().st_mode & 0o777 == 0o755
 
 
 def test_patch_start_idempotent(tmp_path):
     root = copy_rootfs(tmp_path / "rootfs")
     patch_start(root)
     patch_start(root)  # 第二次不重复加
-    line = '[ -f "/data/init.sh" ] && sh /data/init.sh >/dev/null 2>&1 &'
-    assert (root / "etc/rc.local").read_text().count(line) == 1
+    wrapper_line = ('[ -x /etc/open-xiaoai/init.sh ] '
+                    '&& /etc/open-xiaoai/init.sh >/dev/null 2>&1 &')
+    rc = (root / "etc/rc.local").read_text()
+    assert rc.count(wrapper_line) == 1
+    assert '[ -f "/data/init.sh" ] && sh /data/init.sh' not in rc
+
+
+def test_patch_start_migrates_old_direct_line(tmp_path):
+    # P2-34 迁移：已打过旧补丁（rc.local 里是旧直行）的 rootfs 重跑，
+    # 旧行被替换为包装器行，不留两行、不报错。
+    root = copy_rootfs(tmp_path / "rootfs")
+    rc = root / "etc/rc.local"
+    old = '[ -f "/data/init.sh" ] && sh /data/init.sh >/dev/null 2>&1 &'
+    rc.write_text(rc.read_text().replace("exit 0", old + "\n\nexit 0", 1))
+    patch_start(root)
+    after = rc.read_text()
+    assert old not in after
+    wrapper_line = ('[ -x /etc/open-xiaoai/init.sh ] '
+                    '&& /etc/open-xiaoai/init.sh >/dev/null 2>&1 &')
+    assert after.count(wrapper_line) == 1
+    assert (root / "etc/open-xiaoai/init.sh").is_file()
+
+
+# --- P2-32：其余补丁步骤也必须可重复执行 ---
+
+def test_patch_ssh_twice(tmp_path):
+    root = copy_rootfs(tmp_path / "rootfs")
+    check_ssh(root)
+    patch_ssh(root)
+    check_ssh(root)  # 已打补丁态也接受
+    patch_ssh(root)  # 第二次不报错、不重复改
+    assert "micocfg_work_mode" not in (root / "etc/init.d/dropbear").read_text()
+    assert (root / "etc/init.d/dropbear").read_text().count(
+        "mkdir -p /data/etc/dropbear") == 1
+
+
+def test_patch_disable_ota_twice(tmp_path):
+    root = copy_rootfs(tmp_path / "rootfs")
+    check_disable_ota(root)
+    patch_disable_ota(root)
+    check_disable_ota(root)  # 已禁态也接受
+    patch_disable_ota(root)  # 第二次不报错、不重复插 return 1
+    ota = (root / "bin/ota").read_text()
+    # 两个函数头后各恰好一次 return 1（原厂文件里本来就有 14 处 return 1，
+    # 不能数总数；只数“函数头下一行就是 return 1”的插入点）。
+    inserted = re.findall(
+        r"^(?:download_upgrade|upgrade)\(\) \{$\n[ \t]*return 1$",
+        ota, re.MULTILINE)
+    assert len(inserted) == 2
+    wireless = (root / "etc/init.d/wireless").read_text()
+    idx = wireless.index("    identity=$4\n")
+    chunk = wireless[idx:idx + 120]
+    assert 'echo "download_fail"' in chunk
+    assert "exit 3" in chunk
+    # 插入只做一次（原厂文件别处本来就有 download_fail，不能数总数）。
+    assert chunk.count('echo "download_fail"') == 1
+
+
+def test_patch_libxaudio_twice(tmp_path):
+    root = copy_rootfs(tmp_path / "rootfs")
+    assert check_libxaudio(root) == LIBXAUDIO_OFFSET
+    assert patch_libxaudio(root) == LIBXAUDIO_OFFSET
+    assert check_libxaudio(root) == LIBXAUDIO_OFFSET  # 已打补丁态也接受
+    assert patch_libxaudio(root) == LIBXAUDIO_OFFSET  # 第二次不重写
+    data = (root / "usr/lib/libxaudio_engine.so").read_bytes()
+    assert data[LIBXAUDIO_OFFSET:LIBXAUDIO_OFFSET + 6] == b"noop\x00\x00"
+
+
+def test_patch_all_twice(tmp_path):
+    # 整套 patch_all 在同一份 rootfs 上跑两次都必须成功（P2-32 全量）。
+    root = copy_rootfs(tmp_path / "rootfs")
+    r1 = patch_all(root, "lx06")
+    r2 = patch_all(root, "lx06")
+    assert r1["libxaudio_offset"] == r2["libxaudio_offset"] == LIBXAUDIO_OFFSET
+    assert hash_matches_password(TEST_SSH_PASSWORD, shadow_root_hash(root))
+    assert (root / "etc/open-xiaoai/init.sh").is_file()
+    assert (root / "etc/asound.conf.bak").is_file()
+
+
+# --- P2-33：asound 改动留 .bak ---
+
+def test_patch_asound_writes_bak(tmp_path):
+    root = copy_rootfs(tmp_path / "rootfs")
+    factory = {rel: (root / rel).read_bytes()
+               for rel in ("etc/asound.conf", "etc/asound.conf.dts")}
+    patch_asound(root)
+    for rel, orig in factory.items():
+        bak = root / (rel + ".bak")
+        assert bak.is_file()
+        assert bak.read_bytes() == orig  # .bak 里是原厂内容，不是打过补丁的
+        assert (root / rel).read_bytes() != orig
+    # 重跑不覆盖已有的 .bak（仍是原厂内容），补丁内容也不变。
+    patch_asound(root)
+    for rel, orig in factory.items():
+        assert (root / (rel + ".bak")).read_bytes() == orig
+
+
+# --- P2-8：密码也可从文件读（不进进程环境） ---
+
+def test_patch_login_password_from_file(tmp_path, monkeypatch):
+    pw_file = tmp_path / "pw.txt"
+    pw_file.write_text("file-password-0123456789\n")
+    monkeypatch.setenv("SSH_PASSWORD_FILE", str(pw_file))
+    monkeypatch.delenv("SSH_PASSWORD", raising=False)
+    root = copy_rootfs(tmp_path / "rootfs")
+    got_hash = patch_login(root)
+    assert hash_matches_password("file-password-0123456789", got_hash)
+
+
+def test_patch_login_password_file_beats_env(tmp_path, monkeypatch):
+    # SSH_PASSWORD_FILE 优先于 SSH_PASSWORD（文件方式更安全）。
+    pw_file = tmp_path / "pw.txt"
+    pw_file.write_text("file-password-0123456789\n")
+    monkeypatch.setenv("SSH_PASSWORD_FILE", str(pw_file))
+    monkeypatch.setenv("SSH_PASSWORD", "env-password-0123456789")
+    root = copy_rootfs(tmp_path / "rootfs")
+    got_hash = patch_login(root)
+    assert hash_matches_password("file-password-0123456789", got_hash)
+
+
+def test_patch_login_password_file_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("SSH_PASSWORD_FILE", str(tmp_path / "nope.txt"))
+    monkeypatch.delenv("SSH_PASSWORD", raising=False)
+    root = copy_rootfs(tmp_path / "rootfs")
+    with pytest.raises(PatchError):
+        patch_login(root)
+    assert "$1$N0Iz0LLs$kZ5zG/Y2AUWHNE5I3ElWm1" in (root / "etc/shadow").read_text()
 
 
 # --- asound ---

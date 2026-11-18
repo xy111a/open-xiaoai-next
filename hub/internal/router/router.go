@@ -36,6 +36,7 @@ import (
 	"github.com/huajun/open-xiaoai-next/hub/internal/agent"
 	"github.com/huajun/open-xiaoai-next/hub/internal/ha"
 	"github.com/huajun/open-xiaoai-next/hub/internal/music"
+	"github.com/huajun/open-xiaoai-next/hub/internal/registry"
 	"github.com/huajun/open-xiaoai-next/hub/internal/reminders"
 )
 
@@ -519,6 +520,11 @@ func (r *Router) roomClaim(_ context.Context, deviceID, text string) (string, bo
 		if room == "" {
 			return "", false
 		}
+		// P2-3：语音认领的房间名同样要合法（超长/含控制字符直接拒绝，
+		// 不进注册表、配置文件与日志）。
+		if err := registry.ValidateRoomName(room); err != nil {
+			return "这个房间名记不下来，换个短一点的名字，比如“客厅”。", true
+		}
 		if r.deps.RoomClaim == nil {
 			return "", false
 		}
@@ -548,7 +554,12 @@ func (r *Router) reminder(ctx context.Context, deviceID, text string) (string, b
 		room = r.deps.RoomOfDevice(deviceID)
 	}
 	if m := cancelRe.FindStringSubmatch(text); m != nil {
-		n := r.deps.Reminders.CancelByText(strings.TrimSpace(m[1]))
+		n, err := r.deps.Reminders.CancelByText(strings.TrimSpace(m[1]))
+		if err != nil {
+			// P2-14：取消落盘失败时明说，不要谎报已取消——
+			// 内存里已删、磁盘里还在，重启后提醒会复活。
+			return "取消失败，保存没存住，请稍后再试一次。", true, nil
+		}
 		if n == 0 {
 			return "没找到“" + strings.TrimSpace(m[1]) + "”的提醒。", true, nil
 		}
@@ -659,6 +670,17 @@ var rememberRe = regexp.MustCompile(`^记住(.+)$`)
 var recallRe = regexp.MustCompile(`^(你还记得|你记得|我说过|我让你记住的)(什么|啥|哪些|哪些事)?$`)
 var homeRe = regexp.MustCompile(`我回来了|我到家了`)
 
+// allowedVoiceDomain 是语音可直接控制的 domain 白名单（P2-49）：
+// 灯/插座/空调/窗帘四类；门锁/燃气/热水器等高风险 domain 不在内。
+// 家电命令与回家场景共用同一张表，场景不再是 allowlist 的旁路。
+func allowedVoiceDomain(domain string) bool {
+	switch domain {
+	case "light", "switch", "climate", "cover":
+		return true
+	}
+	return false
+}
+
 func (r *Router) sceneMemory(ctx context.Context, deviceID, text string) (string, bool, error) {
 	// P1-41：记忆只写不读的另一半——“你还记得什么”读出来。
 	if recallRe.MatchString(text) {
@@ -684,6 +706,20 @@ func (r *Router) sceneMemory(ctx context.Context, deviceID, text string) (string
 	if homeRe.MatchString(text) {
 		if r.ha() == nil {
 			return "", false, nil
+		}
+		// P2-49：场景执行前先查场景内含的实体，逐个过 domain 白名单——
+		// 场景内容由用户在 HA 侧配置，可能含门锁/燃气，一句语音即可
+		// 触发。查不到场景内容（场景不存在、属性缺失、HA 故障）时
+		// fail-closed：拒绝执行并明说，不猜场景内容。
+		entities, err := r.ha().GetSceneEntityIDs("scene.coming_home")
+		if err != nil {
+			return "想帮你开回家场景，但查不到 scene.coming_home 里有什么设备，先在 HA 里确认一下场景内容。", true, nil
+		}
+		for _, eid := range entities {
+			domain := strings.SplitN(eid, ".", 2)[0]
+			if !allowedVoiceDomain(domain) {
+				return "回家场景里有不能语音控制的设备（" + eid + "），先在 HA 里把它移出场景再试。", true, nil
+			}
 		}
 		// “我回来了”跑 HA 场景 scene.coming_home（需在 HA 里建好）。
 		if err := r.ha().CallService("scene", "turn_on", "scene.coming_home"); err != nil {
@@ -1066,11 +1102,10 @@ func (r *Router) homeAssistant(ctx context.Context, deviceID, text string) (stri
 		return "", false, nil
 	}
 	// 高风险设备拒绝：门锁/燃气/热水器不在别名表里才安全；
-	// 即使配了，也只允许开关灯/插座/空调/窗帘这四类 domain。
+	// 即使配了，也只允许开关灯/插座/空调/窗帘这四类 domain
+	// （与回家场景共用 allowedVoiceDomain 同一张白名单，见 P2-49）。
 	domain := strings.SplitN(entityID, ".", 2)[0]
-	switch domain {
-	case "light", "switch", "climate", "cover":
-	default:
+	if !allowedVoiceDomain(domain) {
 		return "这个设备不能语音直接控制，请当面确认。", true, nil
 	}
 	turnOn := action == "开" || action == "打开" || action == "开启"

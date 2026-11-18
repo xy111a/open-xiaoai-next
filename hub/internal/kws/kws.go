@@ -21,10 +21,15 @@ package kws
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strings"
@@ -72,8 +77,14 @@ type Options struct {
 	// ReconnectInitial / ReconnectMax 是断线重连的退避区间；<=0 时 500ms / 30s。
 	ReconnectInitial time.Duration
 	ReconnectMax     time.Duration
-	// HealthInterval 是后台健康检查间隔；<=0 时 30s（Start 后生效）。
+	// HealthInterval 是后台健康检查间隔；<=0 时 10s（Start 后生效）。
+	// N-P2-5：旧默认 30s，边车挂掉/恢复后 kws_status 最长滞后 30 秒。
 	HealthInterval time.Duration
+	// TLSFingerprint 是边车 wss 自签证书的 SHA-256 指纹（小写 hex，
+	// N-P2-10）：配了才允许 wss + 自签证书的边车，拨号与健康检查
+	// 共用同一 pin 配置；不配时 wss 只认系统根证书；ws 地址下忽略。
+	// 由 config.KWS.Fingerprint 传入。
+	TLSFingerprint string
 	// Token 是边车鉴权 Token（SC-P1-3）：与 Hub 的 OPEN_XIAOAI_TOKEN
 	// 复用同一值，hello 里必须带上；边车缺失/错误即回 error + 1008 关闭。
 	// 生产由 main.go 从 config.Token() 传入；为空时边车会拒绝连接
@@ -109,7 +120,7 @@ func (o *Options) applyDefaults() {
 		o.ReconnectMax = 30 * time.Second
 	}
 	if o.HealthInterval <= 0 {
-		o.HealthInterval = 30 * time.Second
+		o.HealthInterval = 10 * time.Second
 	}
 	if o.Logger == nil {
 		o.Logger = log.Default()
@@ -122,6 +133,9 @@ type Client struct {
 	healthURL string
 	opts      Options
 	keywords  map[string]bool
+	// httpClient 是健康检查用的 HTTP 客户端（N-P2-10：与 WS 拨号
+	// 共用同一 TLS 配置，wss + 自签证书时健康检查不再默认校验失败）。
+	httpClient *http.Client
 
 	events chan WakeEvent
 
@@ -199,6 +213,11 @@ func New(rawURL string, opts Options) (*Client, error) {
 		return nil, err
 	}
 	opts.applyDefaults()
+	if opts.TLSFingerprint != "" {
+		if _, err := normalizeFingerprintHex(opts.TLSFingerprint); err != nil {
+			return nil, err
+		}
+	}
 	c := &Client{
 		url:       rawURL,
 		healthURL: healthURL,
@@ -207,6 +226,10 @@ func New(rawURL string, opts Options) (*Client, error) {
 		streams:   map[string]*stream{},
 		dropped:   map[string]uint64{},
 		done:      make(chan struct{}),
+	}
+	c.httpClient = &http.Client{
+		Timeout:   3 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: c.tlsConfig()},
 	}
 	for _, kw := range opts.Keywords {
 		if c.keywords == nil {
@@ -217,15 +240,75 @@ func New(rawURL string, opts Options) (*Client, error) {
 	return c, nil
 }
 
+// normalizeFingerprintHex 归一化指纹（去冒号/空格，转小写），
+// 必须是 64 位 hex，否则返回错误。
+func normalizeFingerprintHex(fp string) (string, error) {
+	fp = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(fp, ":", ""), " ", ""), "-", ""))
+	if len(fp) != 64 {
+		return "", fmt.Errorf("kws TLS 指纹必须是 64 位 hex，实际 %d 位", len(fp))
+	}
+	for _, r := range fp {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return "", fmt.Errorf("kws TLS 指纹含非 hex 字符")
+		}
+	}
+	return fp, nil
+}
+
+// tlsConfig 返回边车连接的 TLS 配置（N-P2-10）：
+//   - ws 地址：nil（不走 TLS）；
+//   - wss 且未配指纹：nil（系统根证书校验，默认行为）；
+//   - wss 且配了指纹：pin 该指纹（InsecureSkipVerify + 自定义校验，
+//     同时校验有效期），拨号与健康检查共用。
+func (c *Client) tlsConfig() *tls.Config {
+	u, err := url.Parse(c.url)
+	if err != nil || u.Scheme != "wss" {
+		return nil
+	}
+	fp, err := normalizeFingerprintHex(c.opts.TLSFingerprint)
+	if err != nil || fp == "" {
+		return nil
+	}
+	return &tls.Config{
+		InsecureSkipVerify: true, // 指纹 pin 本身就是校验，不走系统根证书
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("kws: 边车未出示证书")
+			}
+			cert, err := x509.ParseCertificate(rawCerts[0])
+			if err != nil {
+				return fmt.Errorf("kws: 边车证书解析失败: %w", err)
+			}
+			now := time.Now()
+			if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
+				return fmt.Errorf("kws: 边车证书不在有效期内")
+			}
+			sum := sha256.Sum256(rawCerts[0])
+			if hex.EncodeToString(sum[:]) != fp {
+				return fmt.Errorf("kws: 边车证书指纹不匹配")
+			}
+			return nil
+		},
+	}
+}
+
 // Events 返回 wake 事件 channel（缓冲 32；满时丢事件并记日志，不堵读循环）。
 func (c *Client) Events() <-chan WakeEvent { return c.events }
 
 // Start 启动后台健康检查（每 HealthInterval GET 一次 /health，更新 Down 状态）。
 // 不调 Start 也不影响音频流与重连；main 里调一次即可。
+// N-P2-5：启动即先查一次，不等第一个 tick（边车挂了 30 秒内状态还是旧的）。
 func (c *Client) Start() {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
 	c.wg.Add(1)
+	c.mu.Unlock()
 	go func() {
 		defer c.wg.Done()
+		_ = c.CheckHealth(context.Background())
 		t := time.NewTicker(c.opts.HealthInterval)
 		defer t.Stop()
 		for {
@@ -240,6 +323,7 @@ func (c *Client) Start() {
 }
 
 // CheckHealth 对边车做一次 HTTP GET /health（3s 超时），更新健康状态并返回结果。
+// N-P2-10：走与 WS 拨号同一 TLS 配置（指纹 pin 时健康检查也认自签证书）。
 func (c *Client) CheckHealth(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
@@ -248,7 +332,10 @@ func (c *Client) CheckHealth(ctx context.Context) error {
 		c.setHealth(false, err.Error())
 		return err
 	}
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := c.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 3 * time.Second}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		c.setHealth(false, err.Error())
@@ -262,6 +349,13 @@ func (c *Client) CheckHealth(ctx context.Context) error {
 	}
 	c.setHealth(true, "")
 	return nil
+}
+
+// triggerHealthCheck 在流连接状态变化时立即触发一次健康检查
+// （N-P2-5：不等下一个 tick，kws_status 不再最长滞后 30 秒）。
+// 异步跑，不阻塞调用方（拨号/断线路径）。
+func (c *Client) triggerHealthCheck() {
+	go func() { _ = c.CheckHealth(context.Background()) }()
 }
 
 func (c *Client) setHealth(ok bool, errMsg string) {
@@ -316,14 +410,24 @@ func (c *Client) DroppedFrames(deviceID string) uint64 {
 // 发给边车。永不阻塞：队列满时丢最旧帧并计数、节流记日志。
 // 注意：pcm 切片调用后即被拷贝，调用方可以复用底层数组。
 func (c *Client) SendPCM(deviceID string, pcm []int16) {
-	if len(pcm) == 0 || c.isClosed() {
+	if len(pcm) == 0 {
 		return
 	}
 	buf := make([]byte, len(pcm)*2)
 	for i, v := range pcm {
 		binary.LittleEndian.PutUint16(buf[i*2:], uint16(v))
 	}
-	s := c.streamFor(deviceID)
+	// N-P2-2：closed 检查与建流必须在同一把 c.mu 内完成——
+	// 旧代码先 isClosed() 检查（释放锁）、再 streamFor 建流，
+	// 两步之间 Close() 可插进来完成 wg.Wait() 并返回，随后建流的
+	// wg.Add(1) 启动一个永不被等的流 goroutine（拨号泄漏）。
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	s := c.streamForLocked(deviceID)
+	c.mu.Unlock()
 	select {
 	case s.queue <- buf:
 	default:
@@ -342,18 +446,23 @@ func (c *Client) SendPCM(deviceID string, pcm []int16) {
 }
 
 func (c *Client) recordDrop(deviceID string) {
+	c.recordDrops(deviceID, 1)
+}
+
+// recordDrops 累计丢帧数（N-P2-3：重连排空陈旧帧时批量记）。
+func (c *Client) recordDrops(deviceID string, n uint64) {
 	c.droppedMu.Lock()
-	c.dropped[deviceID]++
-	n := c.dropped[deviceID]
+	c.dropped[deviceID] += n
+	total := c.dropped[deviceID]
 	c.droppedMu.Unlock()
-	if n == 1 || n%logDropEvery == 0 {
-		c.opts.Logger.Printf("kws: 唤醒服务暂不可用，丢弃设备 %s 的音频帧（累计丢 %d 帧，边车断线或消费过慢）", deviceID, n)
+	if total == n || total%logDropEvery < n {
+		c.opts.Logger.Printf("kws: 唤醒服务暂不可用，丢弃设备 %s 的音频帧（累计丢 %d 帧，边车断线或消费过慢）", deviceID, total)
 	}
 }
 
-func (c *Client) streamFor(deviceID string) *stream {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// streamForLocked 取或新建某设备的流（调用方须已持 c.mu；
+// Close 后不再新建，见 N-P2-2）。
+func (c *Client) streamForLocked(deviceID string) *stream {
 	if s, ok := c.streams[deviceID]; ok {
 		return s
 	}
@@ -398,12 +507,6 @@ func (c *Client) Close() {
 	})
 }
 
-func (c *Client) isClosed() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.closed
-}
-
 // ---- 每设备流 ----
 
 type stream struct {
@@ -417,6 +520,10 @@ type stream struct {
 	connMu    sync.Mutex
 	conn      *websocket.Conn
 	connected atomic.Bool
+	// everConnected 是该流曾经连上过边车（N-P2-3：只在重连时排空
+	// 陈旧 PCM；首次连接不排空）。只在 run/serve 同一 goroutine
+	// 里读写，无需加锁。
+	everConnected bool
 }
 
 func newStream(c *Client, deviceID string) *stream {
@@ -492,6 +599,8 @@ func (s *stream) run() {
 			s.client.opts.Logger.Printf("kws: 边车连接断开（设备 %s）: %v", s.deviceID, err)
 		}
 		s.connected.Store(false)
+		// N-P2-5：断线即触发一次健康检查，kws_status 不等下一个 tick。
+		s.client.triggerHealthCheck()
 		if s.stopped() {
 			return
 		}
@@ -503,10 +612,25 @@ func (s *stream) run() {
 	}
 }
 
+// nextBackoff 算下一次重连退避：翻倍，上限封顶，再加 ±25% jitter
+// （N-P2-12：旧代码纯翻倍，两台设备的流在边车同一次重启后退避值
+// 完全相同，重连脉冲同步化；jitter 把脉冲打散）。
 func nextBackoff(cur, max time.Duration) time.Duration {
 	nxt := cur * 2
 	if nxt > max {
-		return max
+		nxt = max
+	}
+	if nxt <= 0 {
+		return nxt
+	}
+	jitter := nxt / 4
+	delta := time.Duration(rand.Int63n(int64(2*jitter+1))) - jitter
+	nxt += delta
+	if nxt > max {
+		nxt = max
+	}
+	if nxt <= 0 {
+		return cur
 	}
 	return nxt
 }
@@ -514,6 +638,9 @@ func nextBackoff(cur, max time.Duration) time.Duration {
 func (s *stream) dial() (*websocket.Conn, error) {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: s.client.opts.DialTimeout,
+		// N-P2-10：wss + 自签证书时用指纹 pin 的 TLS 配置；
+		// 未配指纹时为 nil（系统根证书，默认行为）。
+		TLSClientConfig: s.client.tlsConfig(),
 	}
 	conn, _, err := dialer.Dial(s.client.url, nil)
 	if err != nil {
@@ -528,6 +655,22 @@ func (s *stream) dial() (*websocket.Conn, error) {
 // serve 在一条已建立的连接上跑收发：发 hello，写泵发 PCM、定时 ping，
 // 读泵收 wake/ready/error；任一泵出错即返回（run 负责重连）。
 func (s *stream) serve(conn *websocket.Conn) error {
+	// N-P2-3：重连时先排空断线期积压的陈旧 PCM（约 1 秒旧音频）——
+	// 旧代码直接排空同一队列，断线前/断线中的旧音频被当实时音频发给
+	// 边车，检出关键词即幽灵唤醒。排空的帧计入丢帧数。
+	// 注意：只在重连时排空——首次连接时队列里是拨号期间刚到的
+	// 实时音频，丢掉就等于丢一整句的开头。
+	// 顺序关键：排空必须在发 hello 之前。hello 是对端可观测到的
+	// “已重连”信号，调用方（如测试）收到 hello 后发的实时帧若落在
+	// hello 之后、排空之前，就会被误当陈旧帧丢掉（-race 下偶发，
+	// TestReconnectAfterDrop 2026-11-18 复现）。先排空再发 hello，
+	// 此后入队的一律是实时帧，不再被排空。
+	if s.everConnected {
+		if n := s.drainQueue(); n > 0 {
+			s.client.opts.Logger.Printf("kws: 边车重连，丢弃设备 %s 断线期积压的 %d 帧陈旧音频", s.deviceID, n)
+			s.client.recordDrops(s.deviceID, uint64(n))
+		}
+	}
 	hello := map[string]any{
 		"type": "hello", "device_id": s.deviceID, "sample_rate": s.client.opts.SampleRate,
 		// SC-P1-3 对接：边车要求 hello 带 token（hmac 常数时间比较），
@@ -542,6 +685,9 @@ func (s *stream) serve(conn *websocket.Conn) error {
 	conn.SetReadLimit(maxInboundBytes)
 	s.connected.Store(true)
 	s.client.opts.Logger.Printf("kws: 边车已连接（设备 %s，%s）", s.deviceID, s.client.url)
+	s.everConnected = true
+	// N-P2-5：连上即触发一次健康检查，kws_status 不等下一个 tick。
+	s.client.triggerHealthCheck()
 
 	done := make(chan struct{})
 	var once sync.Once
@@ -566,6 +712,19 @@ func (s *stream) serve(conn *websocket.Conn) error {
 	wg.Wait()
 	s.closeConn()
 	return <-errCh
+}
+
+// drainQueue 非阻塞排空流队列，返回丢弃的帧数（N-P2-3）。
+func (s *stream) drainQueue() int {
+	n := 0
+	for {
+		select {
+		case <-s.queue:
+			n++
+		default:
+			return n
+		}
+	}
 }
 
 // writePump 从队列取 PCM 发二进制帧；每 30s 发一次 ping 保活。
@@ -652,11 +811,18 @@ func (s *stream) handleMessage(data []byte) {
 			return
 		}
 		ev := WakeEvent{
-			DeviceID:    firstNonEmpty(m.DeviceID, s.deviceID),
+			// N-P2-4：wake 事件的 device_id 一律用流自身的 ID，
+			// 不轻信边车回传值——边车异常/被冒充回别的 device_id，
+			// Hub 会给从未唤醒的设备开会话、发 wake_win。
+			// 回传值不一致时记 warn。
+			DeviceID:    s.deviceID,
 			Keyword:     m.Keyword,
 			RMS:         m.RMS,
 			TimestampMs: m.TimestampMs,
 			ReceivedAt:  time.Now(),
+		}
+		if m.DeviceID != "" && m.DeviceID != s.deviceID {
+			s.client.opts.Logger.Printf("kws: 边车回传的 wake device_id %q 与流 %q 不一致，以流 ID 为准", m.DeviceID, s.deviceID)
 		}
 		select {
 		case s.client.events <- ev:
@@ -675,11 +841,4 @@ func (s *stream) handleMessage(data []byte) {
 	default:
 		s.client.opts.Logger.Printf("kws: 边车未知消息类型 %q（设备 %s），忽略", env.Type, s.deviceID)
 	}
-}
-
-func firstNonEmpty(a, b string) string {
-	if strings.TrimSpace(a) != "" {
-		return a
-	}
-	return b
 }

@@ -23,6 +23,70 @@
 
 use anyhow::{anyhow, Result};
 use opus_rs::{Application, OpusDecoder, OpusEncoder};
+use std::time::{Duration, Instant};
+
+/// 失败节流器（P2-20 / P2-N4 共用）：对每帧都可能失败的热路径做
+/// “1 秒一条 + 计数”的日志节流，并判定何时该做恢复动作（停后端/重建
+/// 编解码器）。`note_failure` 在该记日志时返回 true；连续失败达到
+/// `recover_after` 次时 `should_recover()` 为 true；一次成功即清零。
+pub struct FailureThrottle {
+    consecutive: u32,
+    total: u64,
+    last_log: Option<Instant>,
+    log_interval: Duration,
+    recover_after: u32,
+}
+
+impl FailureThrottle {
+    pub fn new(log_interval: Duration, recover_after: u32) -> Self {
+        Self {
+            consecutive: 0,
+            total: 0,
+            last_log: None,
+            log_interval,
+            recover_after,
+        }
+    }
+
+    /// 记一次失败；返回 true 表示调用方现在应记一条日志（含累计数）。
+    pub fn note_failure(&mut self) -> bool {
+        self.consecutive += 1;
+        self.total += 1;
+        let now = Instant::now();
+        let due = match self.last_log {
+            None => true,
+            Some(t) => now.duration_since(t) >= self.log_interval,
+        };
+        if due {
+            self.last_log = Some(now);
+        }
+        due
+    }
+
+    /// 记一次成功：连续计数清零（累计总数保留，供日志用）。
+    pub fn note_success(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// 恢复动作后调用：连续计数与节流计时都清零，重新开始计数。
+    pub fn reset(&mut self) {
+        self.consecutive = 0;
+        self.last_log = None;
+    }
+
+    pub fn consecutive(&self) -> u32 {
+        self.consecutive
+    }
+
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// 连续失败是否已达到恢复阈值（调用方据此停后端或重建编解码器）。
+    pub fn should_recover(&self) -> bool {
+        self.consecutive >= self.recover_after
+    }
+}
 
 /// 采样率：16kHz（协议冻结值）。
 pub const SAMPLE_RATE: u32 = 16_000;
@@ -93,6 +157,13 @@ impl OpusCodec {
     }
 }
 
+/// P2-52：构建断言用的标记：`build-armv7.sh` 用 `strings` 在产物里找它，
+/// 证明该 ARM 二进制确实开了 `alsa` feature（无 ALSA 的应急版里没有
+/// 本标记；只看二进制能不能跑分不出来）。`#[used]` 保证 LTO/strip 后仍保留。
+#[cfg(feature = "alsa")]
+#[used]
+pub static ALSA_BACKEND_MARKER: &[u8] = b"open-xiaoai-audio-backend=alsa\0";
+
 /// f32（±1.0）→ i16，钳制防溢出（opus-rs 解码输出即此约定）。
 pub fn f32_to_i16(s: f32) -> i16 {
     (s * 32768.0).clamp(i16::MIN as f32, i16::MAX as f32) as i16
@@ -101,31 +172,41 @@ pub fn f32_to_i16(s: f32) -> i16 {
 use std::cell::RefCell;
 
 thread_local! {
-    /// 任务书指定的自由函数形态：`encode_pcm_frame(&[i16;320]) -> Vec<u8>`。
+    /// 任务书指定的自由函数形态：`encode_pcm_frame(&[i16;320]) -> Result<Vec<u8>>`。
     /// 用线程本地编解码器复用，避免每帧重建编码器状态。
-    static CODEC: RefCell<OpusCodec> = RefCell::new(
-        OpusCodec::new().expect("opus codec init must succeed"),
-    );
+    /// P2-54：线程本地存的是 `Result<OpusCodec>`——初始化失败时自由函数
+    /// 返回 Err 而不是在线程本地初始化处 panic；`try_borrow_mut` 失败
+    /// （重入）时同样返回 Err，不 panic。
+    static CODEC: RefCell<Result<OpusCodec>> = RefCell::new(OpusCodec::new());
 }
 
-/// 编码一帧 20ms PCM → Opus 包（任务书签名；编解码失败时 panic，
-/// 调用方应在流式路径用 `OpusCodec` 并处理 Result）。
+/// 编码一帧 20ms PCM → Opus 包（任务书签名；P2-54 起返回 `Result`，
+/// 编解码失败不再 panic，调用方按 Err 处理。流式路径用 `OpusCodec`）。
 #[allow(dead_code)]
-pub fn encode_pcm_frame(pcm: &[i16; FRAME_SAMPLES]) -> Vec<u8> {
+pub fn encode_pcm_frame(pcm: &[i16; FRAME_SAMPLES]) -> Result<Vec<u8>> {
     CODEC.with(|c| {
-        c.borrow_mut()
-            .encode_frame(pcm)
-            .expect("opus encode must succeed for a valid 320-sample frame")
+        let mut guard = c
+            .try_borrow_mut()
+            .map_err(|_| anyhow!("opus codec is already borrowed (reentrant encode_pcm_frame)"))?;
+        let codec = guard
+            .as_mut()
+            .map_err(|e| anyhow!("opus codec init failed: {e}"))?;
+        codec.encode_frame(pcm)
     })
 }
 
-/// 解码一帧 Opus 包 → PCM（任务书签名；失败时 panic，流式路径用 `OpusCodec`）。
+/// 解码一帧 Opus 包 → PCM（任务书签名；P2-54 起返回 `Result`，失败不再
+/// panic，流式路径用 `OpusCodec`）。
 #[allow(dead_code)]
-pub fn decode_opus_frame(opus: &[u8]) -> Vec<i16> {
+pub fn decode_opus_frame(opus: &[u8]) -> Result<Vec<i16>> {
     CODEC.with(|c| {
-        c.borrow_mut()
-            .decode_frame(opus)
-            .expect("opus decode must succeed for a packet produced by encode_pcm_frame")
+        let mut guard = c
+            .try_borrow_mut()
+            .map_err(|_| anyhow!("opus codec is already borrowed (reentrant decode_opus_frame)"))?;
+        let codec = guard
+            .as_mut()
+            .map_err(|e| anyhow!("opus codec init failed: {e}"))?;
+        codec.decode_frame(opus)
     })
 }
 
@@ -168,6 +249,14 @@ pub trait AudioDevice: Send {
     fn set_volume(&mut self, _volume: u8) -> Result<()> {
         Err(anyhow!(
             "volume control not supported by this audio device (no ALSA mixer)"
+        ))
+    }
+    /// 立即停播（P2-N1）：丢弃 ALSA 播放缓冲里已写入、尚未放出的帧，
+    /// 并把播放设备复位到可写状态。默认实现返回明确错误（该设备不支持
+    /// 立即停播）；只清 `playing` 标志而不停 ALSA 的旧行为已被本方法取代。
+    fn stop_playback(&mut self) -> Result<()> {
+        Err(anyhow!(
+            "immediate stop_playback not supported by this audio device (no ALSA playback)"
         ))
     }
 }
@@ -515,6 +604,39 @@ impl AudioDevice for AlsaAudioDevice {
     fn set_volume(&mut self, volume: u8) -> Result<()> {
         self.set_volume_via_mixer(volume)
     }
+
+    /// P2-N1：立即停播——`snd_pcm_drop` 丢弃播放缓冲里已写入的约 80ms
+    /// 尾音，再 `prepare` 让设备回到可写状态（下一帧可直接写，不必重开
+    /// 设备）。未请求播放方向或设备未打开时返回明确错误。
+    fn stop_playback(&mut self) -> Result<()> {
+        if !self.want_playback {
+            return Err(anyhow!(
+                "ALSA playback not opened: this Audio instance was opened capture-only (P0-N1: use open_playback_only for playback)"
+            ));
+        }
+        let pcm = self.playback.as_ref().ok_or_else(|| {
+            anyhow!(
+                "ALSA playback unavailable: device {} open failed: {}",
+                self.playback_dev,
+                self.playback_err.as_deref().unwrap_or("unknown error")
+            )
+        })?;
+        pcm.drop().map_err(|e| {
+            anyhow!(
+                "ALSA playback drop on {} failed: {e} (errno {})",
+                self.playback_dev,
+                e.errno()
+            )
+        })?;
+        pcm.prepare().map_err(|e| {
+            anyhow!(
+                "ALSA playback prepare on {} failed after drop: {e} (errno {})",
+                self.playback_dev,
+                e.errno()
+            )
+        })?;
+        Ok(())
+    }
 }
 
 /// 音频设备：Opus 编解码器 + 一个 `AudioDevice`（真实 ALSA / Fake / 无设备）。
@@ -621,6 +743,21 @@ impl Audio {
         self.device.set_volume(volume)
     }
 
+    /// 立即停播（P2-N1）：丢弃播放缓冲里的尾音并复位播放设备（见
+    /// `AudioDevice::stop_playback`）。无播放设备时返回明确错误。
+    pub fn stop_playback(&mut self) -> Result<()> {
+        self.device.stop_playback()
+    }
+
+    /// 重建流式编解码器（P2-N4）：编码器进入持续错误状态、连续失败达到
+    /// 阈值后调用——丢弃旧编解码器状态，用全新 `OpusCodec` 替换。
+    /// 重建失败时返回 Err，旧编解码器保持原样（不留半初始化状态）。
+    pub fn rebuild_codec(&mut self) -> Result<()> {
+        let fresh = OpusCodec::new()?;
+        self.codec = fresh;
+        Ok(())
+    }
+
     /// 一行设备状态描述（供日志/诊断与 P0-N1 回归测试用）。
     /// 只在测试里调用；生产日志走 `open_selected` 内的 `device.describe()`。
     #[allow(dead_code)]
@@ -700,10 +837,12 @@ mod tests {
     fn free_function_roundtrip() {
         let frame = sine_frame(440.0, 10000);
         // 多喂几帧进线程本地编解码器以过稳态，再测最后一帧。
+        // P2-54：自由函数返回 Result，失败不再 panic——这里 unwrap 即
+        // 断言正常帧必须成功；空包解码必须返回 Err（见下一测试）。
         let mut decoded = Vec::new();
         for _ in 0..10 {
-            let packet = encode_pcm_frame(&frame);
-            decoded = decode_opus_frame(&packet);
+            let packet = encode_pcm_frame(&frame).unwrap();
+            decoded = decode_opus_frame(&packet).unwrap();
         }
         assert_eq!(decoded.len(), FRAME_SAMPLES);
         let err = (rms_of(&decoded) - rms_of(&frame)).abs() / rms_of(&frame);
@@ -712,6 +851,63 @@ mod tests {
             "free-function roundtrip RMS error {:.1}%",
             err * 100.0
         );
+    }
+
+    #[test]
+    fn free_function_failures_return_err_not_panic() {
+        // P2-54：空包解码失败必须返回 Err，而不是 panic。
+        assert!(decode_opus_frame(&[]).is_err());
+        // 正常帧在失败调用后仍可用（线程本地编解码器未被一次失败毒化）。
+        let frame = sine_frame(440.0, 10000);
+        let packet = encode_pcm_frame(&frame).unwrap();
+        assert_eq!(decode_opus_frame(&packet).unwrap().len(), FRAME_SAMPLES);
+    }
+
+    #[test]
+    fn failure_throttle_logs_once_per_interval_then_recovers() {
+        // P2-20 / P2-N4 共用节流器：1 秒一条 + 计数，成功清零。
+        let mut t = FailureThrottle::new(Duration::from_millis(50), 3);
+        assert!(t.note_failure(), "first failure must log");
+        assert!(
+            !t.note_failure(),
+            "second failure within interval must stay silent"
+        );
+        assert_eq!(t.consecutive(), 2);
+        assert_eq!(t.total(), 2);
+        assert!(!t.should_recover(), "2 consecutive < recover_after 3");
+        // 第三次失败：仍在 50ms 节流窗内，不再记日志，但达到恢复阈值。
+        assert!(
+            !t.note_failure(),
+            "third failure within interval must stay silent"
+        );
+        assert!(
+            t.should_recover(),
+            "3 consecutive must hit the recover threshold"
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            t.note_failure(),
+            "failure after the interval must log again"
+        );
+        t.note_success();
+        assert_eq!(t.consecutive(), 0, "one success resets the streak");
+        assert!(!t.should_recover());
+        assert_eq!(t.total(), 4, "total keeps counting across successes");
+        t.reset();
+        assert_eq!(t.consecutive(), 0);
+        assert!(t.note_failure(), "reset clears the throttle timer too");
+    }
+
+    #[test]
+    fn rebuild_codec_keeps_audio_usable() {
+        // P2-N4：重建后编码/解码仍正常（旧状态被丢弃，不留半初始化状态）。
+        let mut audio = Audio::with_device(Box::new(FakeAudioDevice::with_frames(vec![]))).unwrap();
+        audio.rebuild_codec().unwrap();
+        let frame = sine_frame(1000.0, 12000);
+        let packet = audio.encode_pcm(&frame).unwrap();
+        assert!(!packet.is_empty());
+        let decoded = audio.decode_opus(&packet).unwrap();
+        assert_eq!(decoded.len(), FRAME_SAMPLES);
     }
 
     #[test]
@@ -789,6 +985,8 @@ mod tests {
         played: Vec<i16>,
         /// P1-N1：最近一次 set_volume 调用的值（None = 从未调过）。
         last_volume: Option<u8>,
+        /// P2-N1：stop_playback 被调过几次（每次调用清空已播缓冲）。
+        stop_calls: usize,
     }
 
     impl FakeAudioDevice {
@@ -797,6 +995,7 @@ mod tests {
                 capture_queue: frames.into(),
                 played: Vec::new(),
                 last_volume: None,
+                stop_calls: 0,
             }
         }
     }
@@ -822,6 +1021,14 @@ mod tests {
 
         fn set_volume(&mut self, volume: u8) -> Result<()> {
             self.last_volume = Some(volume);
+            Ok(())
+        }
+
+        /// P2-N1：Fake 的 stop_playback 清空已播缓冲（模拟 ALSA drop 丢弃
+        /// 尾音），并计数调用次数。
+        fn stop_playback(&mut self) -> Result<()> {
+            self.played.clear();
+            self.stop_calls += 1;
             Ok(())
         }
     }
@@ -993,5 +1200,55 @@ mod tests {
         let err = audio.set_volume(80).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("ALSA mixer"), "unexpected error: {msg}");
+    }
+
+    // --- P2-N1：立即停播丢弃缓冲尾音 ---
+    #[test]
+    fn stop_playback_clears_buffered_frames_on_fake_device() {
+        // Fake 设备：播两帧后 stop_playback → 已播缓冲被清空、调用被计数。
+        let mut dev = FakeAudioDevice::with_frames(vec![]);
+        dev.play(&[100i16; FRAME_SAMPLES]).unwrap();
+        dev.play(&[200i16; FRAME_SAMPLES]).unwrap();
+        assert_eq!(dev.played.len(), 2 * FRAME_SAMPLES);
+        dev.stop_playback().unwrap();
+        assert!(
+            dev.played.is_empty(),
+            "stop_playback must drop buffered frames"
+        );
+        assert_eq!(dev.stop_calls, 1);
+        // 停播后仍可继续播（设备已复位，不必重开）。
+        dev.play(&[300i16; FRAME_SAMPLES]).unwrap();
+        assert_eq!(dev.played.len(), FRAME_SAMPLES);
+    }
+
+    #[test]
+    fn stop_playback_without_hardware_is_clear_error_not_fake_ok() {
+        // 无硬件（NoAudioDevice）：stop_playback 必须返回明确错误，
+        // 不能谎报已停播；Audio 层透传该错误。
+        let mut audio = Audio::with_device(Box::new(NoAudioDevice::new(
+            "test: no hardware (NoAudioDevice)",
+        )))
+        .unwrap();
+        let err = audio.stop_playback().unwrap_err();
+        assert!(
+            err.to_string().contains("not supported"),
+            "unexpected error: {err}"
+        );
+        // Fake 设备经 Audio 透传：stop_playback 成功返回 Ok。
+        let mut audio = Audio::with_device(Box::new(FakeAudioDevice::with_frames(vec![]))).unwrap();
+        audio.stop_playback().unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "alsa")]
+    fn stop_playback_on_capture_only_instance_is_clear_error() {
+        // P0-N1：capture-only 实例根本没打开播放方向，stop_playback
+        // 应返回“未打开方向”的明确错误，而不是去碰不存在的播放设备。
+        let mut audio = Audio::open_capture_only().unwrap();
+        let err = audio.stop_playback().unwrap_err();
+        assert!(
+            err.to_string().contains("not opened"),
+            "unexpected error: {err}"
+        );
     }
 }

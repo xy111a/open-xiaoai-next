@@ -72,7 +72,7 @@
 | shell 脚本 | `pytest tests/test_shell_scripts.py -q`（含在上）+ `bash -n scripts/patch.sh scripts/unpack.sh` | 8 passed；bash -n OK | 通过 | 无 |
 | unpack 真实固件 | 测试内用真实 `lx06_1.94.13.bin` 重跑解包 | root.squashfs **37,500,699 字节、Squashfs v4.0 xz、2137 inodes、blocksize 131072**，与 REA_ANALYSIS.md 一致 | 通过 | 无 |
 | patch.sh 端到端 | 测试内跑完整流水线 | 输出镜像 **38,453,248 字节 < 41,943,040（40MB），余 3,489,792 字节**；重解后全部补丁标记都在 | 通过 | 无 |
-| 补丁镜像持久交付（复核人重跑） | `OTA_BIN=<官方包> ./scripts/unpack.sh lx06 1.94.13` + `./scripts/patch.sh lx06 1.94.13` | `firmware-patch/work/lx06_1.94.13/root-patched.squashfs`，**38,453,248 字节 < 40MB**，SHA256 `cc36b28e7f2e998d5a6a88f8597de85f0cc0021a1d864d4d785234a6bb54f06d`；原包 MD5 仍为 `b202de2bbe149ce884aa500911151b95` | 通过 | 真机刷机验证 |
+| 补丁镜像持久交付（复核人重跑） | `OTA_BIN=<官方包> ./scripts/unpack.sh lx06 1.94.13` + `./scripts/patch.sh lx06 1.94.13` | `firmware-patch/work/lx06_1.94.13/root-patched.squashfs`，**38,453,248 字节 < 40MB**，SHA256 `cc36b28e7f2e998d5a6a88f8597de85f0cc0021a1d864d4d785234a6bb54f06d`；原包 MD5 仍为 `b202de2bbe149ce884aa500911151b95`（【2026-11-18 P2 轮注：该 SHA 是重编前的旧镜像；2026-11-17 重编后现为 `7266aba99b769947bd3ce937c23f0dc0443ad52883f04e4992eed45c0d7d97b3`，见下文“补丁镜像 SHA 同步”】） | 通过 | 真机刷机验证 |
 | firmware/ 原物未动 | 测试内校验 | `lx06_1.94.13.bin` MD5 仍为 `b202de2bbe149ce884aa500911151b95`；`firmware/rootfs` shadow 仍为原 hash | 通过 | 无 |
 
 实施中修正的问题（均有测试覆盖）：`download-ota.py` 时间戳由秒级改为毫秒（与 ota.ts / REA 一致）；旧 `unpack.sh` 调 unblob 用 `-x`，unblob 26.6.4 只有 `-e`，已修正；unblob 缺 `sasquatch`/`7z` 时非零退出但产物已正确 carve 出，`unpack.sh` 改为以产物校验为准；容器无 CAP_MKNOD 时 `unsquashfs` 建 `/dev/*` 节点报 `Operation not permitted`（非致命），两处调用加 `-no-exit-code`；`/tmp` 是 512MB tmpfs 装不下多份 rootfs 副本，测试临时目录改到 `firmware-patch/.pytest-tmp`。
@@ -114,8 +114,8 @@
 | 内容 | 测试命令 | 输出摘要 | 结果 | 阻塞项 |
 |---|---|---|---|---|
 | Web 面板 + config 读写 | `go test ./internal/web/` + Hub 冒烟 | /api/status、/api/devices、config GET/PUT（含校验失败拒绝）、OTA POST 均验证；真二进制 `:18080` 可访问 | 通过 | 无 |
-| 一键 OTA（失败回滚 boot1） | `go test ./internal/ota/ ./internal/web/` | 状态机 Push→Verifying→OK/Failed、超时扫荡、Web 下发均验证 | 通过 | 真机刷机验证（需 bai 硬件）；回滚本身是设备端 boot1 行为 |
-| 对讲全双工 | — | 未实现全双工切换，当前为半双工（见 Phase 3）；全双工需真机验证回声路径 | 未做 | 需真机验证 |
+| 一键 OTA（失败回滚 boot1） | `go test ./internal/ota/ ./internal/web/` | 包内状态机单测通过（Push→Verifying→OK/Failed、超时扫荡、Web 下发）；生产接线零调用（P1-9：ConfirmHello/MarkRebooted/Sweep 在 P1 全量修复前未接线），回滚闭环未实现（【2026-11-18 P2 轮注：原“均验证”说法会误以为生产 OTA 已通，见 AUDIT_ROUND2.md §6 P1-9】） | 通过（单测部分） | 真机刷机验证（需 bai 硬件）；回滚本身是设备端 boot1 行为 |
+| 对讲全双工 | — | 未实现全双工切换，当前为半双工（见 Phase 3）；全双工需真机验证回声路径（【2026-11-18 P2 轮注：本行已被第二轮补做 B 行取代——全双工已做，见下；本行是当时的状态】） | 未做（当时） | 需真机验证 |
 | 紧急呼叫 FR-15（可选） | `go test ./internal/router/` | “救命/打 120/叫救护车/打 110/报警”触发 Notify + 回复；取消路径为语音“取消呼叫”（Router 侧未接取消状态机） | 部分 | 真机验证；取消状态机待补 |
 | 摄像头主动播报 FR-10 | — | `main.go` 已接 HA `state_changed` 订阅（leak/smoke/water → 播报，勿扰时段跳过），无自动化测试 | 未测 | 真 HA 摄像头联调（需 bai 硬件） |
 
@@ -123,13 +123,13 @@
 
 | # | 内容 | 测试命令 | 输出摘要 | 结果 | 阻塞项 |
 |---|---|---|---|---|---|
-| A | OH2P 补丁验证 | `download-ota.py` 下 1.58.6 → `unpack.sh oh2p 1.58.6` → `patch.sh oh2p 1.58.6`；`pytest tests/ -q` | 官方包 36,042,824 字节，MD5 `eb86c0c12ea118fb701433bf009a180c`，与 2026-11-16 验证值一致；镜像 `firmware-patch/work/oh2p_1.58.6/root-patched.squashfs` **30,175,232 字节 < 40MB**，SHA256 `db00add0ad5674ba8efda41b647a5b1b4508a6fb4d54fa554f2526614fff0423`；pytest **36 passed**（35 + 新增 OH2P 回归测试 1 项）；LX06 镜像重跑后 SHA256 仍为 `cc36b28e…54f06d` | 通过 | 真机刷机/开机/SSH/Hub 连接 |
+| A | OH2P 补丁验证 | `download-ota.py` 下 1.58.6 → `unpack.sh oh2p 1.58.6` → `patch.sh oh2p 1.58.6`；`pytest tests/ -q` | 官方包 36,042,824 字节，MD5 `eb86c0c12ea118fb701433bf009a180c`，与 2026-11-16 验证值一致；镜像 `firmware-patch/work/oh2p_1.58.6/root-patched.squashfs` **30,175,232 字节 < 40MB**，SHA256 `db00add0ad5674ba8efda41b647a5b1b4508a6fb4d54fa554f2526614fff0423`；pytest **36 passed**（35 + 新增 OH2P 回归测试 1 项）；LX06 镜像重跑后 SHA256 仍为 `cc36b28e…54f06d`（【2026-11-18 P2 轮注：两个 SHA 都是重编前的旧镜像；2026-11-17 重编后 OH2P 现为 30,179,328 字节、`139de363…6415`，LX06 现为 `7266aba9…d97b3`，见下文“补丁镜像 SHA 同步”】） | 通过 | 真机刷机/开机/SSH/Hub 连接 |
 | B | 对讲全双工 | `go test ./...`（hub/） | `SetFullDuplex`/`SetHalfDuplex` 切换保留会话；全双工双向中继；`EchoCancel` 合成回声输入 RMS 2832.0 → 残余 89.9（3.2%）< 50%；全量 go test 88 通过 | 通过 | 真机回声实测；Opus 级回声接线（decode→AEC→re-encode）未做 |
 | C | FR-15 取消状态机 | `go test ./...`（hub/） | 触发→取消、触发→60s 超时清理、重复触发不重复 Notify、同设备隔离取消；全量 go test 88 通过 | 通过 | 真实通知链路（HA fire_event → 电话网关/推送）10s 内送达未验证；真机语音取消 |
 | D | FR-10 自动化测试 | `go test ./...`（hub/） | 新包 internal/alerts：6 测试——播报文本（类型+位置）、勿扰跳过（含边界）、非安全类不播报、假 HA WS 推真信封事件端到端；全量 go test 88 通过 | 通过 | 真 HA 联调（实际触发、“漏水 5s 内播报”时延） |
-| E | ALSA 接线（Client） | `cargo test`；`./build-armv7.sh` | `cargo test` **37 passed**（32 + 新增 ALSA 5 项）；trait 隔离硬件，Fake 设备测试；无硬件返回明确错误、不崩溃；ARMv7 交叉编译通过，产物 ELF 32-bit ARM 静态链接 **2,852,620 字节**（含 musl libasound，仍 <5MB） | 通过 | 真音箱 `hw:0,0` 采集 / `hw:0,2` 播放实测 |
+| E | ALSA 接线（Client） | `cargo test`；`./build-armv7.sh` | `cargo test` **37 passed**（32 + 新增 ALSA 5 项）；trait 隔离硬件，Fake 设备测试；无硬件返回明确错误、不崩溃；ARMv7 交叉编译通过，产物 ELF 32-bit ARM 静态链接 **2,852,620 字节**（含 musl libasound，仍 <5MB）（【2026-11-18 P2 轮注：ARM 产物已改 gnueabihf 重编，现为 **2,444,332 字节**、SHA256 `e90c3058…61ff`，见下文“全部重跑输出”】） | 通过 | 真音箱 `hw:0,0` 采集 / `hw:0,2` 播放实测 |
 | F | KWS“你好小李”.onnx 模型验证 | Python 实验（sherpa-onnx 2.0.1）+ `cargo test --features sherpa-kws` | 模型 sherpa-onnx-kws-zipformer-wenetspeech-3.3M（Apache 2.0），int8 集 5,708,052 字节；**合成语音正 5/5 检出、负 5/5 静默**（SNR 5dB 加噪仍检出）；Rust feature `sherpa-kws` 接入，`cargo test --features sherpa-kws` **41 passed**；复核人用真实模型 + 真实 .so + 真实 TTS 样本重跑端到端测试通过（非 SKIP）；模型文件未进仓库，下载脚本 client/scripts/download-kws-model.sh + 文档 client/kws/README.md 已写 | 通过（仅合成语音） | ARM 版 `libsherpa-onnx-c-api.so` 待交叉编译；真人唤醒率（1m/3m ≥95%）与 ARM 真机性能 |
-| G | NAS 部署包 | `go build -o deploy/hub-linux-amd64`；YAML 校验；`bash -n` | Hub linux/amd64 二进制 11,534,848 字节，冒烟 `--help` 退出 0、`/api/status` 返回 wake_word“你好小李”；docker-compose 镜像逐个核实：**binarytorch/neteasecloudmusicapi 不存在（404）→ 改为官方 binaryify/netease_cloud_music_api**；另修 hub 无 Dockerfile、缺 OPEN_XIAOAI_TOKEN 两个必死错；deploy/nas-install.sh（bash -n OK）+ NAS_CHECKLIST.md 已写 | 通过 | NAS 上实际运行 |
+| G | NAS 部署包 | `go build -o deploy/hub-linux-amd64`；YAML 校验；`bash -n` | Hub linux/amd64 二进制 11,534,848 字节，冒烟 `--help` 退出 0、`/api/status` 返回 wake_word“你好小李”；docker-compose 镜像逐个核实：**binarytorch/neteasecloudmusicapi 不存在（404）→ 改为官方 binaryify/netease_cloud_music_api**；另修 hub 无 Dockerfile、缺 OPEN_XIAOAI_TOKEN 两个必死错；deploy/nas-install.sh（bash -n OK）+ NAS_CHECKLIST.md 已写（【2026-11-18 P2 轮注：Hub 二进制已重编，现为 12,093,552 字节、SHA256 `95535eee…ead7de`，见下文“重编部署二进制”】【2026-11-18 协调员收尾注：协调员收尾又重编一次，现为 12,093,544 字节、`973a3b1f…3091`，见“重编部署二进制”】） | 通过 | NAS 上实际运行 |
 | H | 网易云登录准备 | 文档核实（MA 官方文档） | deploy/README.md 新增扫码登录流程：扫码点在 MA 界面（QR Login）、登录态存 MA 侧 ma-data 卷、Cookie 约 30 天过期重扫、VIP 歌需 VIP 账号；未尝试登录 | 通过 | bai 的网易云账号扫码 |
 
 ### 第二轮发现并修复的 2 个真实问题
@@ -137,10 +137,12 @@
 2. FR-10 旧接线读扁平的 `ev["entity_id"]` / `ev["new_state"]`，但真 HA 的 state_changed 事件是 `event.data.*` 嵌套信封——旧接线在真 HA 下永远不会触发。已改 `ShouldAnnounce` 两种形状都认（嵌套优先、扁平兼容），`SubscribeEvents` 的错误此前被 `_` 丢弃，现在记日志。
 
 ### 第二轮复核人重跑结果（2026-11-17）
+
+（2026-11-18 P2 轮注：本节是 2026-11-17 当时的重跑记录，数字未改；最新全量值见文末“P1 全量修复”（go 223、cargo 81/85、pytest 68、sidecar 25）与“音乐融合 B”（go 236）两节；P2 轮结束后再补一节最终重跑。）
 - `go test -count=1 ./...`：20 个包 ok，**88 通过、0 失败**；`go vet` / `go build` OK。
 - `cargo test`：**37 passed**；`cargo test --features sherpa-kws`：**41 passed**；sherpa 端到端测试用真实模型 + 真实 .so + 真实 TTS 样本重跑通过（非 SKIP）。
 - `pytest tests/`（firmware-patch）：**36 passed in 65.57s**。
-- OH2P 镜像 30,175,232 字节、SHA256 `db00add0…f0423` 已核对；LX06 镜像 SHA256 仍为 `cc36b28e…54f06d`；firmware/lx06_1.94.13.bin MD5 仍为 `b202de2bbe149ce884aa500911151b95`；ARM 产物 2,852,620 字节 ELF 32-bit ARM 静态链接已核对；deploy/hub-linux-amd64 11,534,848 字节 ELF 64-bit 已核对。
+- OH2P 镜像 30,175,232 字节、SHA256 `db00add0…f0423` 已核对；LX06 镜像 SHA256 仍为 `cc36b28e…54f06d`；firmware/lx06_1.94.13.bin MD5 仍为 `b202de2bbe149ce884aa500911151b95`；ARM 产物 2,852,620 字节 ELF 32-bit ARM 静态链接已核对；deploy/hub-linux-amd64 11,534,848 字节 ELF 64-bit 已核对。（【2026-11-18 P2 轮注：本条是 2026-11-17 当时的核对记录；镜像/二进制随后都重编过——现值：OH2P 30,179,328 字节 `139de363…6415`、LX06 `7266aba9…d97b3`、ARM 2,444,332 字节 `e90c3058…61ff`、Hub 12,093,552 字节 `95535eee…ead7de`，见下文“补丁镜像 SHA 同步”“重编部署二进制”“全部重跑输出”】【2026-11-18 协调员收尾注：镜像又重编一次（LX06 38,457,344 字节 `7dafb950…05e21`、OH2P `fe2bab99…5c926`），Hub 又重编一次（12,093,544 字节 `973a3b1f…3091`）】）
 
 ## 审计修复（2026-11-17）
 
@@ -163,7 +165,7 @@
 | 9 | P1-26 点歌/Snapcast 接线 | `hub/cmd/hub/main.go`：启动时查 MA `Players()` 取默认 `player_id` 作 `QueueID`（查不到记日志、点歌走 MPD 降级）；`music.DialMPD(cfg.Hub.MPD)` 注入 `MPD`；`music.DialSnap(cfg.Hub.Snapcast)`；MPD/Snapcast 启动时没连上时后台每 30s 重试、连上即经 `rt.SetMPD`/`rt.SetSnap` 补接 | `go test -count=1 ./internal/router/`；`go test -count=1 ./internal/music/` | router `ok`，17 passed；music `ok`，5 passed | 通过 | MA 恢复后 `QueueID` 不热更新（需重启 Hub，见 P1-27）；真机两台同步播放延迟差 ≤10ms 未验证（关口 3） |
 | 10 | P1-31 卷挂错位 | `deploy/docker-compose.yml`：卷改挂到 `/app/hub-data`（Hub 数据目录就是 `./hub-data`，`WORKDIR /app`），原来挂 `/app/data` 没人用 | 仅核对 compose 文件（VM 内无 NAS 可验证） | `hub-data:/app/hub-data` 已确认在 compose 里；`hub/config.yaml:56` 的 `data_dir: "./hub-data"` 与之对应 | 通过（文件核对） | **NAS 实测 BLOCKED**（关口 2：容器重建后提醒/记忆/TLS 证书指纹不变，需在 NAS 上验证） |
 | 11 | P1-32 config `:ro` | `deploy/docker-compose.yml`：挂载去掉 `:ro`（改可写）；`hub/cmd/hub/main.go` 的 `OnRoomClaim`：`Save` 失败记日志，不再吞掉。本轮另改了 `deploy/Dockerfile.hub` 里“运行时由 docker-compose.yml 挂载（只读）”的过时注释，与现状一致 | 仅核对 compose 文件与 main.go（VM 内无 NAS 可验证） | `../hub/config.yaml:/app/config.yaml`（无 `:ro`）已确认 | 通过（文件核对） | **NAS 实测 BLOCKED**（关口 2：语音认领房间重启后仍在，需在 NAS 上验证）；可写/种子配置分离（P1-22/P1-23 重构范围）未修 |
-| 12 | P1-40 ARM 无 KWS | `client/build-armv7.sh`：默认开 `--features sherpa-kws`（`--no-sherpa-kws` 仅供应急构建），构建末尾断言产物含 sherpa 标记（`open-xiaoai-kws-backend=sherpa-onnx-2.0.1` 等 3 个）与 ARM `.so` 的 10 个必需导出符号；`client/src/kws.rs`：feature 开时 `Kws::new` 直接返回 Err——生产路径在 sherpa 后端加载失败后调到这里，Err 经 `?` 向上传播，进程以非零码退出并打印原因，绝不静默跑 RMS；ARM 版 `libsherpa-onnx-c-api.so` 已取（`client/kws/vendor-arm/`，sherpa-onnx 官方 v2.0.1 `linux-arm-gnueabihf-shared`，SHA256 `46d5250538b5bcf97d921204f7fe61eca7bac119ad2dcb1c95b557a314d8bc6b`，`libonnxruntime.so` SHA256 `4636872e9b50f985b7ecaa55a6829dee81bdb96f77010b5bc0a4059e51d872dc`） | `./build-armv7.sh`（`client/`，本轮重跑）；`cargo test --features sherpa-kws`（`client/`） | `./build-armv7.sh` exit 0（`Finished release profile in 39.88s`）；`ASSERT OK: ARM binary contains sherpa-kws markers (feature enabled)`；`ASSERT OK: kws/vendor-arm/libsherpa-onnx-c-api.so exports all 10 required KWS symbols`；产物 `target/armv7-unknown-linux-musleabihf/release/open-xiaoai-client` 2,885,364 字节，`ELF 32-bit LSB executable, ARM, EABI5, statically linked, stripped`；`cargo test --features sherpa-kws`：`50 passed; 0 failed` | **部分通过：构建与断言通过，真机唤醒仍 BLOCKED**（见下） | **P1-40 真实状态——按审计要求已做，但真机唤醒仍 BLOCKED**：【2026-11-17 P1 全量修复时勘误：以下 GLIBC 版本号已过期——`readelf -V` 实测官方 v2.0.1 两个 ARM `.so` 都要求 **GLIBC 最高 2.34 / GLIBCXX 最高 3.4.29**（不是 2.29），“ORT 只要求 GLIBC_2.4”已被证伪；旧版 v1.10.34/v1.9.29 要求 2.29，v1.8.10 无 KWS C API；出路 (b) 应为“ORT + sherpa 都需从源码重编，或 KWS 继续放 NAS 边车”。路线决策：长期服务端模式（见 FIXES_ROUND2.md §0），A 路保留为未来可选项。】官方 ARM `.so` 要求 `GLIBC_2.29`（音箱最高 2.25）且 `GLIBCXX_3.4.29`（音箱最高 3.4.22），`build-armv7.sh` 本轮重跑即打印 `WARNING: kws/vendor-arm/libsherpa-onnx-c-api.so requires GLIBC_2.29, speaker has glibc 2.25 — will NOT load on-device as-is`（GLIBCXX 同理）；且 musl 静态 Client 不支持 `dlopen`（x86_64 同构实测：musl 静态程序 `dlopen` 直接失败 `Dynamic loading not supported`，exit 2）。即：哪怕拿到版本兼容的 `.so`，不改 Client 链接方式也加载不了。出路二选一，待决策：(a) Client 改动态链接 musl（或 static-PIE）+ 交叉编译 musl 版 sherpa/ORT（ORT 没有 musl 预编译，需从源码编，工作量大）；或 (b) Client 改 `armv7-unknown-linux-gnueabihf`（glibc 2.25 目标，zig 可指定 `-target arm-linux-gnueabihf.2.25`）+ 从源码重编 sherpa（复用官方 `libonnxruntime.so`，它只要求 GLIBC_2.4；音箱自带 glibc 2.25 与 `/usr/lib/libasound.so.2`，glibc 路线有现成地基）。证据在 `client/kws/vendor-arm/SOURCE.md` 与 `client/kws/README.md`。在决策落地前，刷进音箱的 Client 在 FR-01 上仍是零能力（只会上报 RMS，永不产生 `wake` 事件），且 `cargo test --features sherpa-kws` 的 50 通过全部是 x86_64 宿主机上的验证，不能当作 ARM 真机唤醒的证据 |
+| 12 | P1-40 ARM 无 KWS | `client/build-armv7.sh`：默认开 `--features sherpa-kws`（`--no-sherpa-kws` 仅供应急构建），构建末尾断言产物含 sherpa 标记（`open-xiaoai-kws-backend=sherpa-onnx-2.0.1` 等 3 个）与 ARM `.so` 的 10 个必需导出符号；`client/src/kws.rs`：feature 开时 `Kws::new` 直接返回 Err——生产路径在 sherpa 后端加载失败后调到这里，Err 经 `?` 向上传播，进程以非零码退出并打印原因，绝不静默跑 RMS；ARM 版 `libsherpa-onnx-c-api.so` 已取（`client/kws/vendor-arm/`，sherpa-onnx 官方 v2.0.1 `linux-arm-gnueabihf-shared`，SHA256 `46d5250538b5bcf97d921204f7fe61eca7bac119ad2dcb1c95b557a314d8bc6b`，`libonnxruntime.so` SHA256 `4636872e9b50f985b7ecaa55a6829dee81bdb96f77010b5bc0a4059e51d872dc`） | `./build-armv7.sh`（`client/`，本轮重跑）；`cargo test --features sherpa-kws`（`client/`） | `./build-armv7.sh` exit 0（`Finished release profile in 39.88s`）；`ASSERT OK: ARM binary contains sherpa-kws markers (feature enabled)`；`ASSERT OK: kws/vendor-arm/libsherpa-onnx-c-api.so exports all 10 required KWS symbols`；产物 `target/armv7-unknown-linux-musleabihf/release/open-xiaoai-client` 2,885,364 字节，`ELF 32-bit LSB executable, ARM, EABI5, statically linked, stripped`；`cargo test --features sherpa-kws`：`50 passed; 0 failed` | **部分通过：构建与断言通过，真机唤醒仍 BLOCKED**（见下） | **P1-40 真实状态——按审计要求已做，但真机唤醒仍 BLOCKED**：【2026-11-17 P1 全量修复时勘误：以下 GLIBC 版本号已过期——`readelf -V` 实测官方 v2.0.1 两个 ARM `.so` 都要求 **GLIBC 最高 2.34 / GLIBCXX 最高 3.4.29**（不是 2.29），“ORT 只要求 GLIBC_2.4”已被证伪；旧版 v1.10.34/v1.9.29 要求 2.29，v1.8.10 无 KWS C API；出路 (b) 应为“ORT + sherpa 都需从源码重编，或 KWS 继续放 NAS 边车”。路线决策：长期服务端模式（见 FIXES_ROUND2.md §0），A 路保留为未来可选项。】官方 ARM `.so` 要求 ~~`GLIBC_2.29`~~ `GLIBC_2.34`（音箱最高 2.25）且 `GLIBCXX_3.4.29`（音箱最高 3.4.22），`build-armv7.sh` 本轮重跑即打印 `WARNING: kws/vendor-arm/libsherpa-onnx-c-api.so requires GLIBC_2.29, speaker has glibc 2.25 — will NOT load on-device as-is`（GLIBCXX 同理）；且 musl 静态 Client 不支持 `dlopen`（x86_64 同构实测：musl 静态程序 `dlopen` 直接失败 `Dynamic loading not supported`，exit 2）。即：哪怕拿到版本兼容的 `.so`，不改 Client 链接方式也加载不了。出路二选一，待决策：(a) Client 改动态链接 musl（或 static-PIE）+ 交叉编译 musl 版 sherpa/ORT（ORT 没有 musl 预编译，需从源码编，工作量大）；或 (b) Client 改 `armv7-unknown-linux-gnueabihf`（glibc 2.25 目标，zig 可指定 `-target arm-linux-gnueabihf.2.25`）+ 从源码重编 sherpa（复用官方 `libonnxruntime.so`，~~它只要求 GLIBC_2.4~~【已被证伪，见上文勘误】；音箱自带 glibc 2.25 与 `/usr/lib/libasound.so.2`，glibc 路线有现成地基）。证据在 `client/kws/vendor-arm/SOURCE.md` 与 `client/kws/README.md`。在决策落地前，刷进音箱的 Client 在 FR-01 上仍是零能力（只会上报 RMS，永不产生 `wake` 事件），且 `cargo test --features sherpa-kws` 的 50 通过全部是 x86_64 宿主机上的验证，不能当作 ARM 真机唤醒的证据 |
 
 ### 本轮收尾工作（2026-11-17，不属于 12 项，是收尾补齐）
 
@@ -176,6 +178,8 @@
 | 补丁镜像 SHA 同步 | 镜像已重编（前一波 P0-2 修复改了补丁内容），新 SHA 已在磁盘上核实：LX06 38,453,248 字节 SHA256 `7266aba99b769947bd3ce937c23f0dc0443ad52883f04e4992eed45c0d7d97b3`；OH2P 30,179,328 字节 SHA256 `139de363d39d0a5472bf9b00c015effd9a24c379ca5fa2436cc21c43e8706415`；旧 SHA（LX06 `cc36b28e…54f06d`、OH2P `db00add0…f0423`）已被取代。`firmware-patch/FLASH_RUNBOOK.md` §1 与本节已同步新值 | `sha256sum firmware-patch/work/lx06_1.94.13/root-patched.squashfs firmware-patch/work/oh2p_1.58.6/root-patched.squashfs`；`./scripts/flash-check.sh <型号> <版本>` | `sha256sum` 输出与上表一致；`flash-check.sh` 两型号均 exit 0（见 P0-6 行，含旧值 WARN 提醒） | 通过（VM 内）；真机刷机仍 BLOCKED |
 
 ### 本轮重跑总表（2026-11-17，收尾后）
+
+（2026-11-18 P2 轮注：本节是 2026-11-17 收尾后的记录，数字未改；最新全量值见文末“P1 全量修复”（go 223、cargo 81/85、pytest 68、sidecar 25）与“音乐融合 B”（go 236）两节；P2 轮结束后再补一节最终重跑。）
 
 | 命令 | 精确输出 | 结果 |
 |---|---|---|
@@ -399,10 +403,24 @@ Hub 启动即报“唤醒服务暂不可用”。统一方案：**边车也走 h
 
 ### 重编部署二进制（Hub 代码变了）
 
-`go build -o deploy/hub-linux-amd64 ./cmd/hub`：**11,747,288 字节**，ELF 64-bit x86-64，
-SHA256 `1e4f6f6cc814597ad2fbc1de763207a06cc4bc0ec1d50552a156f68df54bc80a`（旧值
-`f12c09e0…`、11,534,848 字节已取代）。冒烟：`--help` exit 0；弱 Token
-（`CHANGE_ME`、短 Token）启动即 Fatal（`OPEN_XIAOAI_TOKEN 无效…至少 16 位`）exit 1。
+`go build -o deploy/hub-linux-amd64 ./cmd/hub`：**12,093,552 字节**，ELF 64-bit x86-64，
+SHA256 `95535eee9f1152547b3fe585aef731f33293f1040d09afe73a95b75444ead7de`（旧值
+`1e4f6f6c…c80a`、11,747,288 字节已取代）。2026-11-18 P2 轮从分支 `fix-p2-loose-ends`
+尖 996329c 的干净 HEAD worktree 编译（工作树里 hub/ 有他人未提交改动、不编译，
+故不用工作树编）；清单 `deploy/hub-linux-amd64.sha256` 已生成（`nas-install.sh` §0
+比对，不一致即 FAIL）。冒烟：`--help` exit 0；弱 Token
+（`CHANGE_ME`、短 Token）启动即 Fatal（`OPEN_XIAOAI_TOKEN 无效…至少 16 位`）exit 1；
+
+（【2026-11-18 协调员收尾：本节的 12,093,552 字节 / `95535eee…ead7de` 是 996329c
+尖的重编值；协调员收尾（删 streamFor 死代码 + kws 排空移到 hello 前）后又从分支尖
+afcdcf0 的干净 HEAD worktree 重编一次：**12,093,544 字节**，
+SHA256 `973a3b1fa2d34acab7a1feaa5c6fb146bc01167735b4c50ba408d1acd0213091`
+（两次编译 SHA 相同，可复现），清单已同步更新；冒烟同上（`--help` exit 0、
+弱 Token Fatal exit 1、`/api/status` 无 Token 401、带 Web Token 200、
+`kws_status: down` 为本机无边车的预期结果、`ldd` 只依赖 libc/libm）。】）
+设强 Token 后启动，`/api/status` 无 Token 返回 401、带 Web Token 返回 200
+（含 `wake_word`“你好小李”，`kws_status: down` 是本机无边车的预期结果）；
+`ldd` 只依赖 libc/libm。
 
 ### 全部重跑输出（2026-11-17，全绿）
 
@@ -521,3 +539,109 @@ CI 首次实跑（run 44063914126）：Rust ✓、Semgrep ✓；Go ✗、Python 
 - **网易云扫码登录（关口 7）**：仍需 bai 的网易云账号在 Hub Web 面板扫码；流程文档已写好 （`deploy/README.md` §网易云扫码登录融合 B 版、`deploy/NAS_CHECKLIST.md` §5），未实测。
 - **歌单/收藏浏览未做**：本轮无歌单/收藏浏览接口，FR-05 验收口径收窄为点歌/队列/歌词；是否补由 Friday 与 bai 另定。
 - 其余关口（刷机、NAS 部署、HA 联调、真人唤醒率等）见“硬件关口检查清单”，状态不变。
+
+## P2 全修轮（2026-11-18，分支 `fix-p2-loose-ends`，固件 / 部署 / CI 面）
+
+本节只记固件 / 部署 / CI 面的最终重跑值；Hub / 客户端 / 边车面的最终值以各面状态文件为准。
+
+### 全量测试（固件 / 部署 / CI 面工人重跑，2026-11-18）
+
+- `python3 -m pytest firmware-patch/tests/ -q`：**84 passed**（基线 68；本轮新增 16 项：
+  patch_firmware 幂等/.bak/SSH_PASSWORD_FILE、P2-31 回归、P2-39 inode 校验、
+  flash-check §4b/--strict、download-ota 参数校验）。
+- Go 全量：`go test ./... -count=1` 22 包全部 ok、**270 passed**、0 FAIL；
+  `go vet ./...` 干净；`gofmt -l hub scripts` 干净。
+  （本轮重跑时工作树里 hub/ 曾有他人未提交改动致 `go vet` 失败，收尾时已由 Hub 面修好；
+  Hub 二进制从干净 HEAD worktree（尖 996329c）重编，见下文。）
+- `cargo test`：**96 passed**、0 failed（客户端面本轮计数；基线 81/85 的拆分口径已变，以本次为准）。
+- `kws-sidecar` pytest（venv）：**55 passed**（基线 25；边车面本轮已扩到 55，固件面未动它）。
+- `scripts/lint.sh`：**FAIL，只红 golangci-lint 一步**——`hub/internal/kws/kws.go:463`
+  `func (*Client).streamFor is unused`（Hub 面已提交代码 611161d 引入，归 Hub 面修）；
+  其余步骤全过（规则 1 接线 40 项、规则 2 nil 守卫、规则 3 bounds、semgrep、
+  Rust vec! 检查、cargo fmt/clippy、bash -n）。`lint.sh shell` / `lint.sh rust` 各自全部通过。
+  （【2026-11-18 协调员收尾：`streamFor` 已删——它是 N-P2-2 修复后剩下的死代码，
+  无调用方；`golangci-lint run ./internal/kws/` 现为 exit 0。见下文“协调员收尾”。】）
+- `bash -n`：patch.sh / unpack.sh / flash-check.sh / nas-install.sh / lint.sh /
+  check-vec-len.sh 全部通过；compose 用 python yaml 解析验证（本机无 docker）：
+  7 服务、cap_drop ALL 全有、hub + kws-sidecar 的 user 均为 `1000:1000`。
+- `flash-check.sh` 四路（lx06 / oh2p × 默认 / --strict）**全部 exit 1**：这是预期的
+  旧镜像报告（§4b FAIL inittab P1-36 + WARN .bak/包装器/旧直行），不是回归；
+  现版 patch.sh 刚打出的镜像在 pytest 里通过（`test_flash_check_ok_on_fresh_build`）。
+  （【2026-11-18 协调员收尾：镜像已重编（见下文“协调员收尾：补丁镜像 2026-11-18 重编”），
+  四路现为 **全部 exit 0**，无 WARN。】）
+- `nas-install.sh` §0 Hub 清单校验：正向 PASS（12,093,552 字节与清单一致），
+  反向控制 PASS（改错清单即 FAIL）；其余 §0 项因本机无 deploy/.env 而 FAIL（预期内）。
+- Hub 二进制冒烟（2026-11-18 P2 轮收尾重编，12,093,544 字节、
+  SHA256 `973a3b1fa2d34acab7a1feaa5c6fb146bc01167735b4c50ba408d1acd0213091`，
+  从分支尖 afcdcf0 的干净 HEAD worktree 编译，两次编译 SHA 相同）：
+  `--help` exit 0；弱 Token 启动即 Fatal exit 1；设强 Token 后启动，
+  `/api/status` 无 Token 返回 401、带 Web Token 返回 200
+  （`kws_status: down` 是本机无边车的预期结果）；`ldd` 只依赖 libc/libm。
+
+### 本轮之后仍阻塞的（固件 / 部署 / CI 面）
+
+- **真机项**：刷机、NAS 部署、HA 联调、真人唤醒率、Dockerfile.hub 首次构建（本机无 docker）
+  均未验证，见 `FLASH_RUNBOOK.md` 与 `NAS_CHECKLIST.md`。
+- （已解决，不再阻塞）包内补丁镜像过期三缺口——2026-11-18 已重编，见下文“协调员收尾”。
+- （已解决，不再阻塞）lint 红 `streamFor` unused——已删，见下文。
+- （已解决，不再阻塞）OH2P 官方回滚包——已从 `work/` 拷入 `firmware/oh2p_1.58.6.bin`
+  并核对 SHA256 `1f351d87…c27b`（36,042,824 字节，与白名单一致）。
+
+### 协调员收尾：补丁镜像 2026-11-18 重编 + lint 修复（2026-11-18）
+
+- **决定**：固件面工人按任务“本轮不重编”把镜像过期三缺口留作定夺项；协调员定夺为**重编**
+  （RELEASE.md §0 的二选一里 (a)）。理由：缺口 1 是物理接触串口即可进 root shell
+  （P1-36），接受它再刷等于明知故犯；上机包的用途就是“刷机那天不用现找东西”，
+  一个自带 FAIL 的包不是可用的包。重编不改任何已定决策，不产生新密码（见下）。
+- **重编方法**：`patch.sh lx06 1.94.13` + `patch.sh oh2p 1.58.6`（现版脚本），
+  密码用一次性随机值走 `SSH_PASSWORD_FILE`（文件在 `/tmp`，用完即删，不进任何日志/报告）；
+  随后把两份新镜像的 shadow root 行**换回旧镜像的 `$6$` hash**（逐字节比对验证一致），
+  再用与 `patch.sh` 完全相同的参数重打包（`mksquashfs -comp xz -b 131072
+  -noappend -all-root -always-use-fragments -no-xattrs -no-exports`）。
+  结果：**root 密码未换**，bai 手里已有的密码继续有效；未生成、未记录、未传递任何新密码。
+- **新值**：LX06 38,457,344 字节、SHA256
+  `7dafb9507bdc4894715f2978ffaf5fd6a11af18ad61ed268f48c6309f0a05e21`；
+  OH2P 30,179,328 字节、SHA256
+  `fe2bab99eb15e423b689c24bace6fec1b665b1073dc12ec1c9fa2e4433b5c926`。
+  旧值（LX06 `7266aba9…d97b3`、OH2P `139de363…6415`）已作废。
+  同步位置：`FLASH_RUNBOOK.md` §1.1（含过期注改写）、`flash-check.sh`
+  `KNOWN_PATCHED_SHA256`（另把三处写死的“2026-11-17 实测值”字样改为不带日期的“记录值”）、
+  `docs/RELEASE.md` §0–§2、`~/workspace/speaker-open-xiaoai-rebuild/release/images/`。
+- **重编中修掉的两个管线缺口**（都是重编时实测触发的，不是顺带扩范围）：
+  1. `patch.sh` 从不传 `--cert-dir`：2026-11-17 的首版镜像是绕过 `patch.sh`、直接调
+     `patch_firmware.py --cert-dir` 打的；直接跑 `patch.sh` 会静默产出无 mTLS 证书的镜像。
+     现 `patch.sh` 默认用 `work/certs` 装入（`CERT_DIR` 可覆盖），目录不存在直接失败，
+     仅测试可设 `PATCH_NO_CERTS=1` 跳过；`flash-check.sh` §4b 新增证书核对
+     （ca.crt/client.crt 存在、client.key 0600，缺失即 FAIL）。
+     回归测试：`test_patch_sh_requires_cert_dir`（无证书目录即 FAIL 的 fail-closed 行为
+     + `PATCH_NO_CERTS=1` 跳过后走到 rootfs 检查）；e2e 测试改设 `PATCH_NO_CERTS=1`
+     （它只验打补丁，不验证书装入）。
+  2. `patch.sh` §6 验 `.bak` 用 "slave.pcm Capture" 标记法，OH2P 原厂 asound.conf 里就有
+     该行（mico_record/noop 出厂即走 Capture），重编 OH2P 时误杀致 `patch.sh` exit 1。
+     现改为与原始 root.squashfs 逐字节比对（“备份即原厂”的本来定义，与型号无关）。
+     附带发现：OH2P 解包出的 `work/oh2p_1.58.6/rootfs` 是 2026-11-17 被就地打过补丁的
+     （asound.conf 已含补丁内容），先用 `unpack.sh oh2p 1.58.6` 重新解出原厂 rootfs 才重编；
+     LX06 的 rootfs 是原厂态，未受影响。
+     回归测试：`test_oh2p_factory_asound_has_capture_marker_and_bak_matches`
+     （钉死 OH2P 原厂含该行的型号差异 + 重编镜像的 .bak 与原厂逐字节一致）。
+- **验证**：`flash-check.sh` 四路（lx06 / oh2p × 默认 / `--strict`）**全部 exit 0**，
+  无 WARN；两份新镜像的 shadow root 行与旧镜像逐字节一致（Python 比对）；
+  inittab `/bin/login`、.bak、init 包装器、证书 0600 均在 §4b 内核对通过。
+  固件 pytest 新增 2 项（`test_patch_sh_requires_cert_dir`、
+  `test_oh2p_factory_asound_has_capture_marker_and_bak_matches`），
+  本轮固件 pytest 总数 84 → **86 passed**（见下文最终重跑）。
+- **lint 修复**：删 `hub/internal/kws/kws.go:463` 的 `streamFor`（N-P2-2 修复后剩下的
+  死代码，无调用方）；`go vet ./internal/kws/` 干净，
+  `golangci-lint run ./internal/kws/` exit 0。生产行为不变（删的只是未被调用的函数）。
+- **kws -race flake 收尾**：Hub 面工人复现了 TestHelloTokenEnforced（16 遍 4 次 FAIL），
+  协调员已按测试侧修复（轮询等 Connected 归零，生产不动），61 遍 1 次 FAIL 后 51 连过；
+  协调员最终重跑 20 遍又抓到第二个 flake：TestReconnectAfterDrop（1 次 FAIL）——
+  根因是 N-P2-3 的重连排空放在发 hello 之后，测试收到 hello 后发的实时帧若落在
+  排空之前会被误当陈旧帧丢掉。修复：生产侧把排空移到发 hello 之前
+  （hello 是对端可观测的“已重连”信号，排空必须先于它；排空语义不变，
+  只排断线期积压帧，首次连接仍不排空）。修复后 `go test -race ./internal/kws/` 20 遍 0 FAIL。
+  另：TestArbiterWindow 既存 timing flake（Hub 面工人记录，1/5 FAIL，arbitration 未动）
+  仍为观察项，与本轮改动无关。
+- **OH2P 官方回滚包**：`work/oh2p_1.58.6.bin` 已拷入 `firmware/oh2p_1.58.6.bin`，
+  SHA256 `1f351d879c06ff3bd7bd4b4c68e2c8fa45eee1a82be5839e57899ae8f9b7c27b`、
+  36,042,824 字节，与白名单一致；`firmware/` 里现 LX06/OH2P 官方包齐全。

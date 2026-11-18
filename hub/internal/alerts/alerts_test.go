@@ -140,8 +140,8 @@ func TestInDoNotDisturb(t *testing.T) {
 		{"09:00-18:00", at(18, 0), false},  // 不跨午夜：结束整点
 		{"09:00-18:00", at(8, 59), false},  // 不跨午夜：开始前
 		{"", at(2, 0), false},              // 未配勿扰：永不跳过
-		{"bad", at(2, 0), false},           // 格式错：按不在算
-		{"23:00", at(2, 0), false},         // 格式错：按不在算
+		{"bad", at(2, 0), true},            // P2-25：格式错按在勿扰（fail-closed）
+		{"23:00", at(2, 0), true},          // P2-25：格式错按在勿扰
 	}
 	for _, c := range cases {
 		if got := InDoNotDisturb(c.spec, c.now); got != c.want {

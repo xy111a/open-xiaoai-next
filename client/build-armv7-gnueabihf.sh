@@ -30,6 +30,12 @@ export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER="$HOME/workspace/tools/
 # -L native 指链接期 libasound staging 目录（见下）。
 LINK_DIR="$PWD/.link-gnueabihf/lib"
 export RUSTFLAGS="-C link-self-contained=no -L native=$LINK_DIR -C link-arg=-Wl,-rpath,\$ORIGIN/lib"
+# P2-N7（可复现构建）：--remap-path-prefix 把构建机绝对路径（$HOME、$PWD）
+# 从 panic 位置等嵌入信息里抹掉，不同目录构建出的二进制才可能字节相同；
+# SOURCE_DATE_EPOCH 取当前提交时间（同一提交恒定），供构建脚本/工具链使用。
+# 工具链版本另由 client/rust-toolchain.toml 钉死（rustc 1.100.0）。
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || echo 0)}"
+export RUSTFLAGS="$RUSTFLAGS --remap-path-prefix $HOME=/home/build --remap-path-prefix $PWD=/client-src"
 
 # --- ALSA：链接音箱自带的 libasound.so.2（动态链接，不静态编）---
 # 音箱 rootfs（只读参考）里有 /usr/lib/libasound.so.2（libasound.so.2.0.0），

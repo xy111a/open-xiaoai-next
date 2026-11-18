@@ -276,6 +276,16 @@ func TestHelloTokenEnforced(t *testing.T) {
 		cBad.Close()
 		t.Fatal("错误 token 的 hello 应被边车拒绝，实际 3 秒内 0 次拒绝")
 	}
+	// 拒绝已观测到，但客户端 readPump 处理 1008 关闭是异步的：
+	// Connected 从 1 翻回 0 有个短暂窗口，立即断言会在 -race 下
+	// 偶发失败（2026-11-18 复现：16 遍 4 次 FAIL，见 .p2-status-hub.md）。
+	// 轮询等它归零；生产侧不改——握手关闭期间的瞬时 Connected=1
+	// 是异步关闭的固有行为，且状态终会归零（改生产侧“收到 ready
+	// 才置位”会改变 Connected 语义，还会掩盖“流活着但未就绪”的状态）。
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && cBad.Status().Connected != 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if st := cBad.Status(); st.Connected != 0 {
 		cBad.Close()
 		t.Fatalf("错误 token 时流不应连上，实际 %+v", st)

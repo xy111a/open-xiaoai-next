@@ -55,10 +55,21 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "==> downloading $MODEL_URL"
-curl -sSL --retry 2 -o "$TMP/model.tar.bz2" "$MODEL_URL"
+# SC-P2-13：curl 加 --fail——无 --fail 时 HTTP 404/403 也会写出一个
+# 错误页面文件并 exit 0，随后 SHA 校验失败才退出，报错是误导性的
+# “SHA256 校验失败”（会误以为上游重新打包）；--fail 让 HTTP 错误
+# 在下载这一步就失败，报错即真实原因。
+curl -sSLf --retry 2 -o "$TMP/model.tar.bz2" "$MODEL_URL"
 
-echo "==> verifying SHA256"
-echo "$MODEL_SHA256  $TMP/model.tar.bz2" | sha256sum -c -
+echo "==> verifying SHA256 ($(stat -c%s "$TMP/model.tar.bz2") bytes)"
+if ! echo "$MODEL_SHA256  $TMP/model.tar.bz2" | sha256sum -c -; then
+    # SC-P2-13：SHA 失败的报错同时打印文件大小，并说明下载本身已成功
+    # （HTTP 错误已被 --fail 拦下），避免误判为下载失败。
+    echo "ERROR: SHA256 mismatch for the downloaded model tarball (size: $(stat -c%s "$TMP/model.tar.bz2") bytes)." >&2
+    echo "The download itself succeeded (HTTP errors fail earlier via curl --fail);" >&2
+    echo "either the upstream release was repackaged (update MODEL_SHA256) or the file was damaged in transit." >&2
+    exit 1
+fi
 echo "==> extracting"
 tar --no-same-owner -xjf "$TMP/model.tar.bz2" -C "$TMP"
 

@@ -33,38 +33,49 @@ func TestNextDaily(t *testing.T) {
 
 func TestOnceFiresAndDeletes(t *testing.T) {
 	dir := t.TempDir()
-	var fired []Reminder
-	s := New(filepath.Join(dir, "r.json"), func(r Reminder) { fired = append(fired, r) })
+	fired := make(chan Reminder, 10)
+	s := New(filepath.Join(dir, "r.json"), func(r Reminder) { fired <- r })
 	id, err := s.Add(Reminder{Kind: KindOnce, Text: "吃药", Next: time.Now().Add(-time.Second)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	s.tick(time.Now())
-	if len(fired) != 1 || fired[0].Text != "吃药" {
-		t.Fatalf("一次性提醒应触发一次，实际 %+v", fired)
+	// P2-44：onFire 已改为异步（不阻塞调度），测试等回调而不是立即读。
+	select {
+	case r := <-fired:
+		if r.Text != "吃药" {
+			t.Fatalf("一次性提醒应触发“吃药”，实际 %+v", r)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("一次性提醒应触发一次，未收到回调")
 	}
 	if len(s.List()) != 0 {
 		t.Fatal("一次性提醒触发后应删除")
 	}
 	// 再 tick 一次不应重复触发。
 	s.tick(time.Now())
-	if len(fired) != 1 {
-		t.Fatalf("一次性提醒不应重复触发，实际 %d 次", len(fired))
+	select {
+	case r := <-fired:
+		t.Fatalf("一次性提醒不应重复触发，实际 %+v", r)
+	case <-time.After(300 * time.Millisecond):
 	}
 	_ = id
 }
 
 func TestDailyReschedules(t *testing.T) {
 	dir := t.TempDir()
-	var fired int
-	s := New(filepath.Join(dir, "r.json"), func(r Reminder) { fired++ })
+	fired := make(chan struct{}, 10)
+	s := New(filepath.Join(dir, "r.json"), func(r Reminder) { fired <- struct{}{} })
 	now := time.Now()
 	if _, err := s.Add(Reminder{Kind: KindDaily, Text: "吃药", At: "08:00", Next: now.Add(-time.Second)}); err != nil {
 		t.Fatal(err)
 	}
 	s.tick(now)
-	if fired != 1 {
-		t.Fatalf("每日提醒应触发，实际 %d 次", fired)
+	// P2-44：onFire 已改为异步，等回调。
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("每日提醒应触发，未收到回调")
 	}
 	list := s.List()
 	if len(list) != 1 {
@@ -77,15 +88,18 @@ func TestDailyReschedules(t *testing.T) {
 
 func TestIntervalAdvances(t *testing.T) {
 	dir := t.TempDir()
-	var fired int
-	s := New(filepath.Join(dir, "r.json"), func(r Reminder) { fired++ })
+	fired := make(chan struct{}, 10)
+	s := New(filepath.Join(dir, "r.json"), func(r Reminder) { fired <- struct{}{} })
 	now := time.Now()
 	if _, err := s.Add(Reminder{Kind: KindInterval, Text: "喝水", Every: 30, Next: now.Add(-time.Second)}); err != nil {
 		t.Fatal(err)
 	}
 	s.tick(now)
-	if fired != 1 {
-		t.Fatalf("间隔提醒应触发，实际 %d 次", fired)
+	// P2-44：onFire 已改为异步，等回调。
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("间隔提醒应触发，未收到回调")
 	}
 	list := s.List()
 	if len(list) != 1 || !list[0].Next.After(now.Add(29*time.Minute)) {
@@ -111,11 +125,11 @@ func TestCancelByTextAndPersistence(t *testing.T) {
 	if len(s2.List()) != 2 {
 		t.Fatalf("持久化后应读回 2 条，实际 %d", len(s2.List()))
 	}
-	if n := s2.CancelByText("吃药"); n != 2 {
-		t.Fatalf("按文本取消应删 2 条，实际 %d", n)
+	if n, err := s2.CancelByText("吃药"); err != nil || n != 2 {
+		t.Fatalf("按文本取消应删 2 条，实际 %d / %v", n, err)
 	}
-	if n := s2.CancelByText("不存在"); n != 0 {
-		t.Fatalf("取消不存在的应为 0，实际 %d", n)
+	if n, err := s2.CancelByText("不存在"); err != nil || n != 0 {
+		t.Fatalf("取消不存在的应为 0，实际 %d / %v", n, err)
 	}
 }
 
