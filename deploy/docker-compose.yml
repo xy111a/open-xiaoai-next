@@ -146,6 +146,8 @@ services:
     #（冒烟项见 NAS_CHECKLIST.md §8）；已存在的 root 属主旧卷仍需
     # nas-install.sh §4 的 chown one-shot 迁移；entrypoint 在下载前另有
     # 目录可写预检，写不进时给可读 FATAL 而不是在 cp 上失败。
+    # S-3：边车不启用 TLS（正式安全假设见 kws-sidecar/README.md），只绑
+    # 127.0.0.1，流量不出回环；`wss://` 一配就连不上（fail-closed）。
     user: "1000:1000"
     cap_drop:
       - ALL

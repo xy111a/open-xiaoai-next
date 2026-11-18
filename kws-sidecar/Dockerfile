@@ -4,7 +4,7 @@
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    KWS_HOST=0.0.0.0 \
+    KWS_HOST=127.0.0.1 \
     KWS_PORT=10400 \
     KWS_MODEL_DIR=/data/kws/models
 
