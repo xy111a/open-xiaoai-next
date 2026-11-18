@@ -164,7 +164,19 @@ def test_patch_sh_end_to_end(unpacked_work, tmp_path):
     idx = wireless.index("    identity=$4\n")
     assert 'echo "download_fail"' in wireless[idx:idx + 120]
     rc = (verify / "etc/rc.local").read_text()
-    assert '[ -f "/data/init.sh" ] && sh /data/init.sh >/dev/null 2>&1 &' in rc
+    # P2-34：rc.local 走包装器，不再直接执行 /data/init.sh。
+    wrapper_line = ('[ -x /etc/open-xiaoai/init.sh ] '
+                    '&& /etc/open-xiaoai/init.sh >/dev/null 2>&1 &')
+    assert wrapper_line in rc
+    assert '[ -f "/data/init.sh" ] && sh /data/init.sh' not in rc
+    wrapper = (verify / "etc/open-xiaoai/init.sh").read_text()
+    assert "sha256sum" in wrapper and "ls -ln" in wrapper
+    assert "init.sh.sha256" in wrapper
+    # P2-33：asound 原厂备份在镜像里（.bak 是原厂内容，不含补丁）。
+    for rel in ("etc/asound.conf", "etc/asound.conf.dts"):
+        bak = verify / (rel + ".bak")
+        assert bak.is_file(), f"缺 {rel}.bak"
+        assert "slave.pcm Capture" not in bak.read_text()
     asound = (verify / "etc/asound.conf").read_text()
     assert "slave.pcm Capture" in asound
     assert "period_size 384" in asound

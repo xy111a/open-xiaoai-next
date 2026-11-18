@@ -95,6 +95,31 @@ def _fake_scripts_dir(monkeypatch, tmp_path):
     return tmp_path / "work"
 
 
+def test_validate_ota_params_rejects_bad_format():
+    """P2-23：版本号的点是字面匹配——带 / 的输入不再放行（路径穿越口）。"""
+    from download_ota import validate_ota_params
+    for bad_model, bad_version, bad_channel, bad_sn in (
+            ("lx06", "1/94/13", "release", ""),   # 斜杠进版本号
+            ("lx06", "1.94.13 ", "release", ""),  # 尾空格
+            ("lx06", "1.94", "release", ""),      # 少一段
+            ("lx06", "v1.94.13", "release", ""),  # 前缀字母
+            ("LX06", "1.94.13", "release", ""),   # 型号大写
+            ("lx06/../x", "1.94.13", "release", ""),
+            ("lx06", "1.94.13", "re lease", ""),
+            ("lx06", "1.94.13", "release", "sn/../../etc/passwd"),
+            ("lx06", "1.94.13", "release", "a" * 65),
+    ):
+        with pytest.raises(ValueError):
+            validate_ota_params(bad_model, bad_version, bad_channel, bad_sn)
+    # 合法输入通过；build_ota_url 与 expected 也走同一校验。
+    validate_ota_params("lx06", "1.94.13", "release", "")
+    validate_ota_params("oh2p", "1.58.6", "release", "SN-123_abc")
+    with pytest.raises(ValueError, match="版本号格式不对"):
+        build_ota_url("lx06", "1/94/13", "release", "")
+    with pytest.raises(ValueError, match="版本号格式不对"):
+        download_ota.expected("lx06", "1/94/13")
+
+
 def test_build_ota_url_matches_rea_algorithm():
     """对已知输入算出的 otaInfo、s 与完整 URL 与 REA 记录一致（API 走 https）。"""
     got = build_ota_url("lx06", "1.94.13", "release", "", now_ms=FIXED_TIME_MS)

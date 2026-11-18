@@ -19,10 +19,11 @@
     复制到 work/<型号>_<版本>/squashfs-root 再传 --rootfs 进来。
 
 用法：
-  SSH_PASSWORD=xxx python3 patch_firmware.py --model lx06 --rootfs work/lx06_1.94.13/squashfs-root
+  SSH_PASSWORD=$(openssl rand -hex 16) python3 patch_firmware.py --model lx06 --rootfs work/lx06_1.94.13/squashfs-root
   python3 patch_firmware.py --model oh2p --rootfs ... --cert-dir work/certs  # 另装 mTLS 客户端证书
 
-密码来源（P0-2）：只从环境变量 SSH_PASSWORD 或交互式 getpass 读，
+密码来源（P0-2）：只从环境变量 SSH_PASSWORD（或 SSH_PASSWORD_FILE 指
+向的 0600 文件，一行一个密码，行尾换行会被去掉）、或交互式 getpass 读，
 未设置且非交互终端时直接失败退出；仓库里没有任何默认密码。
 密码 hash 为 sha512crypt（$6$，glibc 2.25 的 libcrypt 支持的最强算法，
 yescrypt 需 libxcrypt/glibc ≥2.36，固件的 glibc 2.25 不支持），
@@ -47,6 +48,52 @@ MAX_IMAGE_SIZE = 0x02800000            # 40MB 分区上限（REA_ANALYSIS.md）
 LIBXAUDIO_TARGET = b"hw:0,3"           # libxaudio_engine.so 里要改掉的设备名
 LIBXAUDIO_REPLACEMENT = b"noop\x00\x00"
 RC_LOCAL_LINE = '[ -f "/data/init.sh" ] && sh /data/init.sh >/dev/null 2>&1 &'
+# P2-34：rc.local 不再直接执行 /data/init.sh，改走包装器
+# （etc/open-xiaoai/init.sh）。旧直行只在迁移判断里用：已打过旧补丁的
+# rootfs 重跑 patch_start 时，旧行会被替换为包装器行。
+INIT_WRAPPER_PATH = "etc/open-xiaoai/init.sh"
+RC_LOCAL_WRAPPER_LINE = ('[ -x /etc/open-xiaoai/init.sh ] '
+                         '&& /etc/open-xiaoai/init.sh >/dev/null 2>&1 &')
+INIT_WRAPPER_SCRIPT = """#!/bin/sh
+# open-xiaoai-next 开机钩子包装器（P2-34）。
+# /data/init.sh 是客户端安装留下的开机钩子；rc.local 不再直接执行它，
+# 而是先由本包装器校验——直接执行等于无条件信任任何能写 /data 的一方。
+# 执行条件（缺一不可）：
+#   1. /data/init.sh 存在；
+#   2. 属主 uid 为 0（root），且组/全局均不可写（ls -ln 的权限串里
+#      第 6 位与第 9 位都不是 w；设备上没有 stat 命令，见下）；
+#   3. 若 /data/init.sh.sha256 存在，文件 SHA256 必须与其中第一字段一致
+#      （客户端安装流程写该文件来钉死钩子内容；没有该文件时只做 1+2）。
+# 任一条件不满足都拒绝执行，并把原因记到 /data/open-xiaoai-init.log。
+# 本文件烤进 squashfs（只读），改它要重打补丁重刷机。
+# 只用 busybox 自带命令（ls/sha256sum/cut/date 均在原厂 rootfs 里实测存在；
+# stat 不在 rootfs 里，所以属主与权限用 ls -ln 的输出判断）。
+INIT="/data/init.sh"
+PIN="/data/init.sh.sha256"
+LOG="/data/open-xiaoai-init.log"
+[ -f "$INIT" ] || exit 0
+set -- $(ls -ln "$INIT")
+# $1=权限串（如 -rw-r--r--），$3=属主 uid（-n 不支持时是名字 root，也接受）
+if [ "$3" != "0" ] && [ "$3" != "root" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') refuse: $INIT owner uid=$3 (want 0)" >> "$LOG" 2>/dev/null
+    exit 0
+fi
+case "$1" in
+    ?????w????|????????w?)
+        echo "$(date '+%Y-%m-%d %H:%M:%S') refuse: $INIT perms $1 group/world-writable" >> "$LOG" 2>/dev/null
+        exit 0
+        ;;
+esac
+if [ -f "$PIN" ]; then
+    want="$(cut -d' ' -f1 "$PIN" 2>/dev/null)"
+    got="$(sha256sum "$INIT" 2>/dev/null | cut -d' ' -f1)"
+    if [ -z "$want" ] || [ "$want" != "$got" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') refuse: $INIT sha256 mismatch" >> "$LOG" 2>/dev/null
+        exit 0
+    fi
+fi
+exec sh "$INIT"
+"""
 RATE_CONVERTER_LINE = 'defaults.pcm.rate_converter "speexrate_medium"'
 
 # Capture 录音链：dsnoop 直采 hw:0,3（来源：LX06/01-asound.patch 的效果）。
@@ -287,22 +334,33 @@ def sha512_crypt(password: str, salt: str | None = None, rounds: int = 5000) -> 
 
 
 def _password() -> str:
-    """读 root 密码：只从环境变量 SSH_PASSWORD 或交互式 getpass。
+    """读 root 密码：只从 SSH_PASSWORD_FILE、环境变量 SSH_PASSWORD 或交互式 getpass。
 
+    优先 SSH_PASSWORD_FILE（文件内容不进进程环境，/proc/<pid>/environ 里
+    看不到；P2-8 残留：环境变量对同机同用户进程可见，故文件方式更安全）。
     未设置且非交互终端时抛 PatchError（直接失败退出，永不 fallback
     到默认值）；密码短于 16 位、含 ':' 或换行时同样失败。
     """
-    pw = os.environ.get("SSH_PASSWORD", "")
-    if pw:
-        source = "环境变量 SSH_PASSWORD"
-    elif sys.stdin.isatty():
-        pw = getpass.getpass("root 密码（≥16 位，不回显）: ")
-        source = "交互式输入"
+    pw_file = os.environ.get("SSH_PASSWORD_FILE", "")
+    if pw_file:
+        try:
+            pw = Path(pw_file).read_text().strip("\r\n")
+        except OSError as exc:
+            raise PatchError(f"读 SSH_PASSWORD_FILE 失败：{pw_file}：{exc}")
+        source = "SSH_PASSWORD_FILE"
     else:
-        raise PatchError(
-            "未设置 SSH_PASSWORD 且非交互终端：拒绝使用默认密码。"
-            "请用强随机密码重跑，例如 SSH_PASSWORD=$(openssl rand -hex 16)"
-        )
+        pw = os.environ.get("SSH_PASSWORD", "")
+        if pw:
+            source = "环境变量 SSH_PASSWORD"
+        elif sys.stdin.isatty():
+            pw = getpass.getpass("root 密码（≥16 位，不回显）: ")
+            source = "交互式输入"
+        else:
+            raise PatchError(
+                "未设置 SSH_PASSWORD / SSH_PASSWORD_FILE 且非交互终端："
+                "拒绝使用默认密码。请用强随机密码重跑，例如 "
+                "SSH_PASSWORD=$(openssl rand -hex 16) python3 patch_firmware.py ..."
+            )
     if len(pw) < MIN_PASSWORD_LENGTH:
         raise PatchError(
             f"{source}的密码只有 {len(pw)} 位，至少 {MIN_PASSWORD_LENGTH} 位"
@@ -334,27 +392,40 @@ _DROPBEAR_MKDIR_LINE = "\tmkdir -p /data/etc/dropbear\n"
 
 
 def check_ssh(rootfs: Path) -> None:
+    """接受两种状态：原厂（enable=0 返回、蓝牙门控、ssh_en 门控都在）与
+    已打过本补丁（三个门控都已拆 + mkdir 行已在）；其他状态一律拒绝。
+
+    （P2-32：旧版只认原厂状态，已打过补丁的 rootfs 重跑 patch_ssh 必
+    在这里失败；与 7662dcf 修 patch_login 的做法一致。）
+    """
     p = _require(rootfs / "etc/init.d/dropbear", "SSH 启动脚本")
     text = _read(p)
-    _require_in(text, '[ "${enable}" = "0" ] && return 1', p)
-    if not _DROPBEAR_BLUETOOTH_RE.search(text):
-        raise PatchError(f"前置条件不满足：{p} 里找不到蓝牙模式不启动块")
-    if not _DROPBEAR_SSH_EN_RE.search(text):
-        raise PatchError(f"前置条件不满足：{p} 里找不到 /data/ssh_en 门控块")
+    has_enable = '[ "${enable}" = "0" ] && return 1' in text
+    has_bluetooth = bool(_DROPBEAR_BLUETOOTH_RE.search(text))
+    has_ssh_en = bool(_DROPBEAR_SSH_EN_RE.search(text))
     _require_in(text, "[ -s /data/etc/dropbear/dropbear_rsa_host_key ] || keygen", p)
+    factory = has_enable and has_bluetooth and has_ssh_en
+    patched = (not has_enable and not has_bluetooth and not has_ssh_en
+               and "mkdir -p /data/etc/dropbear" in text)
+    if not (factory or patched):
+        raise PatchError(
+            f"前置条件不满足：{p} 既不是原厂状态也不是已打补丁状态"
+            f"（enable={has_enable} 蓝牙={has_bluetooth} ssh_en={has_ssh_en}）")
 
 
 def patch_ssh(rootfs: Path) -> None:
-    """去掉 enable=0 返回、蓝牙模式不启动、/data/ssh_en 门控；启动时建目录。"""
+    """去掉 enable=0 返回、蓝牙模式不启动、/data/ssh_en 门控；启动时建目录。
+
+    已打过补丁时每一步都跳过（只做缺失的子步骤），重跑不报错。"""
     check_ssh(rootfs)
     p = rootfs / "etc/init.d/dropbear"
     text = _read(p)
     text = text.replace(_DROPBEAR_ENABLE_LINE, "")
     text, n = _DROPBEAR_BLUETOOTH_RE.subn("", text, count=1)
-    if n != 1:
+    if n not in (0, 1):
         raise PatchError(f"蓝牙模式块替换失败：{p}")
     text, n = _DROPBEAR_SSH_EN_RE.subn("", text, count=1)
-    if n != 1:
+    if n not in (0, 1):
         raise PatchError(f"ssh_en 门控块替换失败：{p}")
     if "mkdir -p /data/etc/dropbear" not in text:
         text = text.replace(_DROPBEAR_KEYGEN_LINE,
@@ -404,8 +475,8 @@ def patch_login(rootfs: Path) -> str:
     """换 root 密码 hash；串口仍走 /bin/login（需 root 密码，P1-36：
     原先改成 /bin/ash --login 是拆机串口即免密 root）；PAM 去 libmico、启用 pam_unix。
 
-    密码只从环境变量 SSH_PASSWORD 或交互式 getpass 读（见 _password），
-    hash 为 sha512crypt（$6$）+ 每次随机盐。返回实际写入的 hash，
+    密码只从 SSH_PASSWORD_FILE / 环境变量 SSH_PASSWORD 或交互式 getpass
+    读（见 _password），hash 为 sha512crypt（$6$）+ 每次随机盐。返回实际写入的 hash，
     供测试校验；调用方（main）不得打印它。
     """
     check_login(rootfs)
@@ -461,8 +532,19 @@ def patch_login(rootfs: Path) -> str:
 # 3. 禁 OTA：bin/ota、bin/flash.sh、etc/init.d/wireless（来源：03-ota.patch）
 # ---------------------------------------------------------------------------
 
+def _func_disabled(text: str, func_re: str, path: Path) -> bool:
+    """函数头后 80 字符内已有 return 1 即视为已禁（P2-32：重跑时跳过）。"""
+    m = re.search(func_re, text, re.MULTILINE)
+    if m is None:
+        raise PatchError(f"前置条件不满足：{path} 里找不到 {func_re}")
+    return "return 1" in text[m.end():m.end() + 80]
+
+
 def _insert_return1_after_func(text: str, func_re: str, path: Path) -> str:
-    """在 `name() {` 的下一行插入 return 1（函数开头直接返回）。"""
+    """在 `name() {` 的下一行插入 return 1（函数开头直接返回）。
+
+    已禁过时原样返回（不报错），由调用方按返回值判断是否改动；
+    找不到函数头时抛 PatchError。"""
     m = re.search(func_re, text, re.MULTILINE)
     if not m:
         raise PatchError(f"前置条件不满足：{path} 里找不到 {func_re}")
@@ -470,11 +552,13 @@ def _insert_return1_after_func(text: str, func_re: str, path: Path) -> str:
     rest = text[insert_at:]
     indent = "\t" if rest.startswith("\n\t") else "    "
     if rest.startswith(f"\n{indent}return 1\n"):
-        raise PatchError(f"前置条件不满足：{path} 里 {func_re} 已被禁过")
+        return text  # 已禁过：幂等跳过
     return text[:insert_at] + f"\n{indent}return 1" + text[insert_at:]
 
 
 def check_disable_ota(rootfs: Path) -> None:
+    """接受原厂与已禁两种状态（每处函数头必须在；已禁的函数不再要求
+    “未禁”。P2-32：旧版把“已被禁过”当成前置失败，重跑必炸。）"""
     ota = _require(rootfs / "bin/ota", "OTA 脚本")
     text = _read(ota)
     _require_in(text, "download_upgrade() {", ota)
@@ -512,10 +596,13 @@ def patch_disable_ota(rootfs: Path) -> None:
     m = re.search(header_re, text, re.MULTILINE)
     if not m:
         raise PatchError(f"ota() 函数头替换失败：{wireless}")
-    if text[m.end():m.end() + 40].startswith('    echo "download_fail"'):
-        raise PatchError(f"前置条件不满足：{wireless} 里 ota() 已被禁过")
-    text = text[:m.end()] + '\n    echo "download_fail"\n    exit 3\n' + text[m.end():]
-    _write(wireless, text)
+    if not text[m.end():m.end() + 60].startswith(
+            '\n    echo "download_fail"\n    exit 3'):
+        # 未禁过才插；已禁过跳过（P2-32 幂等）。
+        # 注意：m.end() 紧跟在 `identity=$4\n` 之后，插入块以 `\n` 开头，
+        # 所以判断也要带上开头的 `\n`（旧代码漏了它，判断恒为假，重跑会重复插）。
+        text = text[:m.end()] + '\n    echo "download_fail"\n    exit 3\n' + text[m.end():]
+        _write(wireless, text)
 
     # 校验
     after = _read(ota)
@@ -543,18 +630,38 @@ def check_start(rootfs: Path) -> None:
 
 
 def patch_start(rootfs: Path) -> None:
-    """rc.local 里在 exit 0 前加 /data/init.sh 启动行（已存在则不重复加）。"""
+    """rc.local 里在 exit 0 前加包装器启动行（P2-34），并装入包装器文件。
+
+    迁移：已有旧直行（RC_LOCAL_LINE）时替换为包装器行；已有包装器行
+    时不重复加；都没有时新加。包装器内容固定，不同即重写（0755）。
+    重跑不报错、不重复。"""
     check_start(rootfs)
+    wrapper = rootfs / INIT_WRAPPER_PATH
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    _write_bytes(wrapper, INIT_WRAPPER_SCRIPT.encode("utf-8"), 0o755)
     rc = rootfs / "etc/rc.local"
     text = _read(rc)
-    if RC_LOCAL_LINE not in text:
-        text = text.replace("exit 0", RC_LOCAL_LINE + "\n\nexit 0", 1)
+    if RC_LOCAL_WRAPPER_LINE in text:
+        pass  # 已有包装器行：不重复加
+    elif RC_LOCAL_LINE in text:
+        text = text.replace(RC_LOCAL_LINE, RC_LOCAL_WRAPPER_LINE, 1)
+        _write(rc, text)
+    else:
+        text = text.replace("exit 0", RC_LOCAL_WRAPPER_LINE + "\n\nexit 0", 1)
         _write(rc, text)
     after = _read(rc)
-    if after.count(RC_LOCAL_LINE) != 1:
-        raise PatchError(f"校验失败：{rc} 里 init.sh 启动行出现 {after.count(RC_LOCAL_LINE)} 次")
-    if after.index(RC_LOCAL_LINE) > after.index("exit 0"):
-        raise PatchError(f"校验失败：{rc} 里 init.sh 启动行在 exit 0 之后")
+    if after.count(RC_LOCAL_WRAPPER_LINE) != 1:
+        raise PatchError(f"校验失败：{rc} 里包装器启动行出现 "
+                         f"{after.count(RC_LOCAL_WRAPPER_LINE)} 次")
+    if RC_LOCAL_LINE in after:
+        raise PatchError(f"校验失败：{rc} 里仍有旧的 init.sh 直行")
+    if after.index(RC_LOCAL_WRAPPER_LINE) > after.index("exit 0"):
+        raise PatchError(f"校验失败：{rc} 里包装器启动行在 exit 0 之后")
+    wtext = wrapper.read_text(errors="surrogateescape")
+    for needle in ("ls -ln", "sha256sum", "init.sh.sha256", "exec sh"):
+        _require_in(wtext, needle, wrapper)
+    if (wrapper.stat().st_mode & 0o777) != 0o755:
+        raise PatchError(f"校验失败：{wrapper} 权限不是 0755")
 
 
 # ---------------------------------------------------------------------------
@@ -571,12 +678,20 @@ def check_asound(rootfs: Path) -> None:
 
 def patch_asound(rootfs: Path) -> list[str]:
     """两份 asound 配置：mico_record/noop 改走 Capture，补 Capture 块与
-    rate_converter（已存在则不重复加）。返回改动的文件列表。"""
+    rate_converter（已存在则不重复加）。返回改动的文件列表。
+
+    P2-33：第一次改动前先把原厂内容存为 <文件>.bak（只在 .bak 不存在时
+    写，绝不覆盖已有的备份——重跑时 .bak 里永远是原厂内容，设备端可
+    `cp asound.conf.bak asound.conf` 回滚，不用重解官方包）。"""
     check_asound(rootfs)
     changed = []
     for rel in ASOUND_FILES:
         p = rootfs / rel
         text = _read(p)
+        bak = rootfs / (rel + ".bak")
+        if not bak.is_file():
+            _write_bytes(bak, text.encode("utf-8", errors="surrogateescape"),
+                         p.stat().st_mode & 0o7777)
         text = _replace_pcm_block(text, "mico_record", MICO_RECORD_BLOCK, p)
         text = _replace_pcm_block(text, "noop", NOOP_BLOCK, p)
         had_capture = "pcm.Capture {" in text
@@ -632,13 +747,35 @@ def find_libxaudio_offset(rootfs: Path) -> int:
     return data.find(LIBXAUDIO_TARGET)
 
 
+def _libxaudio_state(rootfs: Path) -> tuple[str, int]:
+    """返回 ("factory", hw:0,3 偏移) 或 ("patched", noop 偏移)。
+
+    （P2-32：旧版只认 hw:0,3 恰好 1 次，已打过补丁的 rootfs
+    重跑必在 check_libxaudio 失败。）"""
+    p = _require(rootfs / "usr/lib/libxaudio_engine.so", "音频引擎库")
+    data = p.read_bytes()
+    n_target = data.count(LIBXAUDIO_TARGET)
+    n_noop = data.count(LIBXAUDIO_REPLACEMENT)
+    if n_target == 1 and n_noop == 0:
+        return "factory", data.find(LIBXAUDIO_TARGET)
+    if n_target == 0 and n_noop == 1:
+        return "patched", data.find(LIBXAUDIO_REPLACEMENT)
+    raise PatchError(f"前置条件不满足：{p} 里 hw:0,3 出现 {n_target} 次、"
+                     f"noop 出现 {n_noop} 次（要求恰好其一为 1、另一为 0）")
+
+
 def check_libxaudio(rootfs: Path) -> int:
-    return find_libxaudio_offset(rootfs)
+    """原厂与已打补丁态都接受，返回要改（或已改）的偏移。"""
+    return _libxaudio_state(rootfs)[1]
 
 
 def patch_libxaudio(rootfs: Path) -> int:
-    """把 hw:0,3 的 6 字节改成 noop\\x00\\x00。返回改动的偏移。"""
-    offset = find_libxaudio_offset(rootfs)
+    """把 hw:0,3 的 6 字节改成 noop\\x00\\x00。返回改动的偏移。
+
+    已打过补丁时不重写，直接返回已有的 noop 偏移。"""
+    state, offset = _libxaudio_state(rootfs)
+    if state == "patched":
+        return offset
     p = rootfs / "usr/lib/libxaudio_engine.so"
     data = bytearray(p.read_bytes())
     data[offset:offset + len(LIBXAUDIO_TARGET)] = LIBXAUDIO_REPLACEMENT
@@ -734,6 +871,8 @@ def preflight(rootfs: Path, model: str, cert_dir: Path | None = None) -> None:
 
 
 # patch_all 可能改动的文件（P1-30 回滚快照用；新增文件记为不存在）。
+# asound .bak（P2-33）与 init 包装器（P2-34）也是 patch 产物：失败回滚
+# 时一并恢复/删除，否则半打状态的 rootfs 里会留一份新文件。
 _PATCHED_FILES = (
     "etc/init.d/dropbear",
     "etc/shadow",
@@ -745,6 +884,9 @@ _PATCHED_FILES = (
     "etc/rc.local",
     "etc/asound.conf",
     "etc/asound.conf.dts",
+    "etc/asound.conf.bak",
+    "etc/asound.conf.dts.bak",
+    "etc/open-xiaoai/init.sh",
     "usr/lib/libxaudio_engine.so",
 )
 
@@ -785,6 +927,11 @@ def _restore(rootfs: Path, snap: dict[str, tuple[bytes | None, int | None]],
             (rootfs / CERT_DEST_DIR).rmdir()
         except OSError:
             pass
+    # 包装器目录（P2-34）同理：包装器删掉后若目录已空就删掉。
+    try:
+        (rootfs / "etc/open-xiaoai").rmdir()
+    except OSError:
+        pass
 
 
 def patch_all(rootfs: Path, model: str, cert_dir: Path | None = None) -> dict:
@@ -818,7 +965,7 @@ def _patch_all_apply(rootfs: Path, model: str,
     patch_disable_ota(rootfs)
     result["disable_ota"] = "bin/ota + flash.sh + wireless ota() 已禁"
     patch_start(rootfs)
-    result["start"] = "rc.local 已加 /data/init.sh"
+    result["start"] = "rc.local 已加包装器启动行 + etc/open-xiaoai/init.sh（P2-34：校验属主/权限/可选 SHA256 pin 后才执行 /data/init.sh）"
     result["asound"] = patch_asound(rootfs)
     if model == "lx06":
         result["libxaudio_offset"] = patch_libxaudio(rootfs)
