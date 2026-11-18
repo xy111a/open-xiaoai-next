@@ -1,9 +1,9 @@
 //! open-xiaoai-client — 音箱端薄客户端（Phase 1）。
 //!
 //! 职责只有五件，多一件都不做：
-//!   1. 录音：ALSA 采集 16kHz 单声道 PCM → Opus 编码 → 发往 Hub
+//!   1. 录音：ALSA 采集 16kHz 单声道 PCM → AEC 消回声 → Opus 编码 → 发往 Hub
 //!      （ALSA 已接线，见 audio.rs：无硬件时 capture 返回明确错误，录音任务
-//!      记日志退出、主循环继续跑传输；真机实测仍 BLOCKED）
+//!      按退避重开设备、不永久退出；真机实测仍 BLOCKED）
 //!   2. 放音：Hub 下发的 Opus 解码 → ALSA 播放（解码 + 写 ALSA 均已接线；
 //!      无硬件时 play_frame 返回明确错误，记日志丢帧，不崩溃）
 //!   3. 唤醒检测：按 `kws_mode` 分流（见 `config.rs`，默认 `"server"`）。
@@ -29,9 +29,15 @@
 //!   coderzc/open-xiaoai-bridge（服务端 Token 鉴权：OPEN_XIAOAI_TOKEN）
 
 use anyhow::Result;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::{info, warn};
 
+mod aec;
 mod audio;
 mod config;
 mod kws;
@@ -39,7 +45,8 @@ mod kws;
 mod sherpa;
 mod transport;
 
-use audio::Audio;
+use aec::Aec;
+use audio::{Audio, FailureThrottle};
 use kws::Kws;
 use transport::{HubMsg, RawFrame, Transport};
 
@@ -74,8 +81,27 @@ pub struct Session {
 /// TTS/对讲帧是连续流（20ms 一帧），2s 空闲足以判定播完；Hub 正常路径
 /// 发 `stop_play` 时会更早复位，超时只是兜底。
 pub const PLAYBACK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-/// 打断后丢弃在途音频帧的窗口（P1-16）。
+/// 打断后丢弃在途音频帧的窗口（P2-N1：`stop_playback` 已丢弃 ALSA 缓冲，
+/// 本窗口只拦住断线前已在途的帧，不重启播放）。
 pub const INTERRUPT_SUPPRESS: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// 录音任务重开 ALSA 的退避（P2-40）：100ms 起步翻倍，上限 5s。
+/// 启动瞬间驱动未就绪、偶发 XRUN 杀死采集时，任务按此退避重开设备，
+/// 不再死一次就永久失聪。
+pub const CAPTURE_BACKOFF_INITIAL_MS: u64 = 100;
+pub const CAPTURE_BACKOFF_MAX_MS: u64 = 5_000;
+
+/// 录音任务重开 ALSA 的退避：第 attempt 次重开前等待的时长，
+/// 100ms 起步翻倍，上限 5s（无 jitter：单台设备，无同步脉冲问题）。
+pub fn capture_backoff_delay(attempt: u32) -> std::time::Duration {
+    let base_ms = CAPTURE_BACKOFF_INITIAL_MS
+        .saturating_mul(1u64 << attempt.min(6))
+        .min(CAPTURE_BACKOFF_MAX_MS);
+    std::time::Duration::from_millis(base_ms)
+}
+
+/// Opus 编码连续失败多少次后重建编解码器（P2-N4）：50 帧 ≈ 1 秒持续失败。
+pub const ENCODE_REBUILD_AFTER: u32 = 50;
 
 /// Session 对一条 Hub 消息的反应：需要 main 循环代发/代做的动作。
 #[derive(Debug, PartialEq)]
@@ -470,50 +496,141 @@ async fn main() -> Result<()> {
         Some(_) => info!("kws_mode=local: local KWS backend loaded"),
     }
 
-    // 录音任务：采集 PCM 帧 →（local 模式）喂 KWS（算 RMS、命中发 WakeEvent）、
-    // （server 模式）跳过本地 KWS → 编码成 Opus 帧发给主循环（local 模式只在
-    // 仲裁赢了之后才往 Hub 推；server 模式持续推）。
-    // 无硬件时 Audio::capture_pcm 返回明确错误，任务记一条日志后退出，
-    // 主循环继续跑传输（不崩溃、不造假音频）。
+    // 录音任务：采集 PCM 帧 → AEC 消回声（播放参考见下）→（local 模式）
+    // 喂 KWS（算 RMS、命中发 WakeEvent）、（server 模式）跳过本地 KWS →
+    // 只在推流时编码成 Opus 帧发给主循环（P2-19：非推流时不编码）。
+    // P2-40：ALSA 打开/采集失败不再直接退出——按退避重开设备（启动瞬间
+    // 驱动未就绪、偶发 XRUN 都能恢复）；只有主循环退出（通道关闭）时
+    // 任务才结束。P2-N5：audio_tx 满时丢当前帧并计数，永不阻塞采集。
+    // P2-N4：编码失败节流记日志，连续失败 50 次后重建编解码器。
+    // 回声消除（Opus 级回声接线）：播放参考由 run_session 的 play_frame
+    // 解码产物经 ref 通道喂给录音任务的 Aec（见 aec.rs 模块头：为什么
+    // 接在客户端、而不是 Hub 侧）。
     let (wake_tx, mut wake_rx) = mpsc::channel::<kws::WakeEvent>(8);
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(32);
+    let (ref_tx, ref_rx) = mpsc::channel::<[i16; audio::FRAME_SAMPLES]>(16);
+    // P2-19：推流标志由 run_session（会话状态机所在处）维护，录音任务
+    // 只读。server 模式会话一建立即推流，初始值 true；local 模式 false。
+    let pushing = Arc::new(AtomicBool::new(cfg.is_server_kws_mode()));
+    let pushing_capture = pushing.clone();
     let capture_handle = tokio::spawn(async move {
-        // P0-N1：录音任务只开采集（`hw:0,0`），不碰播放 `hw:0,2`——
-        // 播放由会话的 playback-only 实例独占，两路不再双开抢设备。
-        let mut audio = match Audio::open_capture_only() {
-            Ok(a) => a,
-            Err(e) => {
-                warn!("audio open failed, capture task exiting: {e}");
-                return;
-            }
-        };
         let mut kws = kws;
+        let mut aec = Aec::new();
+        let mut ref_rx = ref_rx;
+        let mut encode_throttle =
+            FailureThrottle::new(std::time::Duration::from_secs(1), ENCODE_REBUILD_AFTER);
+        let mut dropped_frames: u64 = 0;
+        let mut last_drop_log: Option<std::time::Instant> = None;
+        let mut backoff_attempt: u32 = 0;
         loop {
-            match audio.capture_pcm() {
-                Ok(pcm) => {
-                    // server 模式：kws 为 None，不做本地唤醒检测，只编码推流。
-                    if let Some(k) = kws.as_mut() {
-                        match k.feed(&pcm) {
-                            Ok(Some(ev)) => {
-                                if wake_tx.send(ev).await.is_err() {
-                                    return;
+            let mut audio = match Audio::open_capture_only() {
+                Ok(a) => a,
+                Err(e) => {
+                    let delay = capture_backoff_delay(backoff_attempt);
+                    warn!(
+                        "audio open failed, retrying in {delay:?} (attempt {}): {e}",
+                        backoff_attempt + 1
+                    );
+                    tokio::time::sleep(delay).await;
+                    backoff_attempt = backoff_attempt.saturating_add(1);
+                    continue;
+                }
+            };
+            // 内层采集循环：任一采集错误都跳出重开设备（不是退出任务）。
+            loop {
+                // 非阻塞地收播放参考帧（run_session 的 play_frame 产物）。
+                while let Ok(frame) = ref_rx.try_recv() {
+                    aec.push_ref(frame);
+                }
+                match audio.capture_pcm() {
+                    Ok(pcm) => {
+                        // 采到一帧即证明设备恢复健康：退避计数清零。
+                        backoff_attempt = 0;
+                        // 回声消除先于 KWS 与编码：消回声后的 PCM 既喂
+                        // 本地 KWS（防播放声误触发），也进 Opus 编码。
+                        let pcm = aec.process_frame(&pcm);
+                        // server 模式：kws 为 None，不做本地唤醒检测，只编码推流。
+                        if let Some(k) = kws.as_mut() {
+                            match k.feed(&pcm) {
+                                Ok(Some(ev)) => {
+                                    if wake_tx.send(ev).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => warn!("kws feed failed: {e}"),
+                            }
+                        }
+                        // P2-19：未推流（local 模式无仲裁会话/对讲录音）
+                        // 时跳过 Opus 编码——编出来也是被主循环丢弃的帧。
+                        if !pushing_capture.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        match audio.encode_pcm(&pcm) {
+                            Ok(opus) => {
+                                encode_throttle.note_success();
+                                match audio_tx.try_send(opus) {
+                                    Ok(()) => {}
+                                    Err(TrySendError::Full(_)) => {
+                                        // P2-N5：通道满（Hub 消费慢/WS 抖动）
+                                        // 时丢当前帧并计数，绝不反压堵采集
+                                        // （否则 ALSA 采集缓冲 overrun →
+                                        // XRUN → 录音任务死，见 P2-40）。
+                                        dropped_frames += 1;
+                                        let now = std::time::Instant::now();
+                                        if last_drop_log
+                                            .map(|t| {
+                                                now.duration_since(t)
+                                                    > std::time::Duration::from_secs(5)
+                                            })
+                                            .unwrap_or(true)
+                                        {
+                                            warn!("audio_tx full, dropping Opus frames ({dropped_frames} dropped so far) — hub is consuming slowly, capture never blocks");
+                                            last_drop_log = Some(now);
+                                            dropped_frames = 0;
+                                        }
+                                    }
+                                    Err(TrySendError::Closed(_)) => return,
                                 }
                             }
-                            Ok(None) => {}
-                            Err(e) => warn!("kws feed failed: {e}"),
+                            Err(e) => {
+                                // P2-N4：编码失败不再静默吞掉——节流 warn
+                                // （1 秒一条 + 累计），连续失败 50 次后
+                                // 记 error 并重建编解码器。
+                                if encode_throttle.note_failure() {
+                                    warn!(
+                                        "opus encode failed ({} failures total, {} consecutive): {e}",
+                                        encode_throttle.total(),
+                                        encode_throttle.consecutive()
+                                    );
+                                }
+                                if encode_throttle.should_recover() {
+                                    tracing::error!(
+                                        "opus encode failed {} times in a row — rebuilding Opus codec",
+                                        encode_throttle.consecutive()
+                                    );
+                                    match audio.rebuild_codec() {
+                                        Ok(()) => {
+                                            info!("opus codec rebuilt after consecutive failures");
+                                        }
+                                        Err(re) => {
+                                            warn!("opus codec rebuild failed: {re}");
+                                        }
+                                    }
+                                    encode_throttle.reset();
+                                }
+                            }
                         }
                     }
-                    if let Ok(opus) = audio.encode_pcm(&pcm) {
-                        if audio_tx.send(opus).await.is_err() {
-                            return;
-                        }
+                    Err(e) => {
+                        warn!("capture failed, reopening audio device: {e}");
+                        break;
                     }
-                }
-                Err(e) => {
-                    warn!("capture unavailable, capture task exiting: {e}");
-                    return;
                 }
             }
+            let delay = capture_backoff_delay(backoff_attempt);
+            tokio::time::sleep(delay).await;
+            backoff_attempt = backoff_attempt.saturating_add(1);
         }
     });
 
@@ -522,6 +639,10 @@ async fn main() -> Result<()> {
     // 混音器硬件状态本身跨会话保持，这里只保证上报值与之一致）。
     let mut volume: u8 = 50;
     loop {
+        // P2-19：重连等待期间先清推流标志——旧会话已断，录音任务不
+        // 再为已死的会话编码；新会话建立后 run_session 入口会按新会话
+        // 状态重新同步（server 模式 true，local 模式 false 起步）。
+        pushing.store(false, Ordering::Relaxed);
         let mut session = if cfg.is_server_kws_mode() {
             Session::new_server_with_volume(volume)
         } else {
@@ -576,6 +697,8 @@ async fn main() -> Result<()> {
             &mut audio_rx,
             &mut status_tick,
             &mut audio,
+            &pushing,
+            &ref_tx,
         )
         .await;
 
@@ -602,6 +725,13 @@ enum SessionEnd {
 
 /// 一次会话的消息循环。返回 Disconnected（断线，重连）或 Shutdown（Ctrl-C）。
 /// 录音任务退出后 wake/audio 通道关闭，用 alive 标志禁用对应分支，避免空转。
+/// `pushing`：录音任务的推流标志（P2-19）——本函数在会话开始与每次 Hub
+/// 消息处理后按 `session.pushing_audio()` 同步它，录音任务据此决定是否编码。
+/// `ref_tx`：播放参考通道的发送端（Opus 级回声接线）——每次成功播出一帧
+/// 音频后，把解出的 PCM 发给录音任务的 Aec 作参考；通道满时丢弃（尽力而为）。
+// 8 个参数是会话循环的固有形态（transport/session/两个通道/节拍/音频/
+// 推流标志/播放参考），拆 struct 只会多一层间接，不拆，clippy 例外有据可查。
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     transport: &mut Transport,
     session: &mut Session,
@@ -609,6 +739,8 @@ async fn run_session(
     audio_rx: &mut mpsc::Receiver<Vec<u8>>,
     status_tick: &mut tokio::time::Interval,
     audio: &mut Option<Audio>,
+    pushing: &AtomicBool,
+    ref_tx: &mpsc::Sender<[i16; audio::FRAME_SAMPLES]>,
 ) -> SessionEnd {
     let mut wake_alive = true;
     let mut audio_alive = true;
@@ -627,6 +759,9 @@ async fn run_session(
             return SessionEnd::Disconnected;
         }
     }
+    // P2-19：会话开始即同步一次推流标志（server 模式 true，local 模式
+    // 按当前会话状态；此后每次 Hub 消息处理后都再同步一次）。
+    pushing.store(session.pushing_audio(), Ordering::Relaxed);
     loop {
         tokio::select! {
             // Hub 下行：文本消息 + 二进制音频帧。
@@ -639,6 +774,7 @@ async fn run_session(
                                 return SessionEnd::Disconnected;
                             }
                         }
+                        pushing.store(session.pushing_audio(), Ordering::Relaxed);
                     }
                     Ok(Some(RawFrame::Audio(opus))) => {
                         // 对讲/广播下发的语音帧：解码后写 ALSA 放音。
@@ -653,6 +789,15 @@ async fn run_session(
                             Some(a) => match a.play_frame(&opus) {
                                 Ok(pcm) => {
                                     session.note_played_frame();
+                                    // Opus 级回声接线：把刚播出的 PCM 作
+                                    // 播放参考发给录音任务的 Aec（通道满
+                                    // 时丢弃——参考是尽力而为的信号，
+                                    // 丢一帧只影响一帧的消除效果）。
+                                    if pcm.len() == audio::FRAME_SAMPLES {
+                                        let mut frame = [0i16; audio::FRAME_SAMPLES];
+                                        frame.copy_from_slice(&pcm);
+                                        let _ = ref_tx.try_send(frame);
+                                    }
                                     info!("played {}-sample frame via ALSA", pcm.len());
                                 }
                                 Err(e) => {
@@ -768,10 +913,24 @@ async fn apply_action(
         SessionAction::SendAudioStart => transport.send_audio_start().await,
         SessionAction::SendAudioEnd => transport.send_audio_end().await,
         SessionAction::StopPlayback => {
-            // P1-16：播放态已由 Interrupt 处理复位；这里只记日志。
-            // 注意（P2-N1，未修）：ALSA 缓冲里已写入的约 80ms 尾音仍会
-            // 放完——立即停播（pcm.drop + prepare）是 P2，不在本轮范围。
-            info!("interrupt: stopping playback immediately");
+            // P2-N1：立即停播——调 ALSA `snd_pcm_drop` 丢弃播放缓冲里
+            // 已写入的约 80ms 尾音，再 `prepare` 复位（下一帧可直接写）。
+            // 无播放设备时只记日志（打断本身的状态复位已由 Interrupt
+            // 处理完成）；停播失败时记 warn——尾音会放完，但状态机
+            // 不因此断线（打断失败不应杀掉整个会话）。
+            match audio.as_mut() {
+                Some(a) => match a.stop_playback() {
+                    Ok(()) => {
+                        info!("interrupt: stopping playback immediately (ALSA buffer dropped)");
+                    }
+                    Err(e) => {
+                        warn!("interrupt: stop_playback failed ({e}); buffered tail (~80ms) will play out");
+                    }
+                },
+                None => {
+                    info!("interrupt: stopping playback (no playback device in this session)");
+                }
+            }
             Ok(())
         }
         SessionAction::SetVolume { id, volume } => {
@@ -1344,6 +1503,8 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
             drop(wake_tx);
         });
+        let pushing = std::sync::atomic::AtomicBool::new(false);
+        let (ref_tx, _ref_rx) = mpsc::channel::<[i16; crate::audio::FRAME_SAMPLES]>(16);
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             run_session(
@@ -1353,6 +1514,8 @@ mod tests {
                 &mut audio_rx,
                 &mut status_tick,
                 &mut audio,
+                &pushing,
+                &ref_tx,
             ),
         )
         .await;
@@ -1418,6 +1581,8 @@ mod tests {
     struct TestAudioDevice {
         played_frames: std::sync::Arc<std::sync::Mutex<usize>>,
         last_volume: std::sync::Arc<std::sync::Mutex<Option<u8>>>,
+        /// P2-N1：stop_playback 被调过几次（经共享 Arc 读回）。
+        stop_calls: std::sync::Arc<std::sync::Mutex<usize>>,
     }
 
     impl crate::audio::AudioDevice for TestAudioDevice {
@@ -1438,6 +1603,12 @@ mod tests {
 
         fn set_volume(&mut self, volume: u8) -> anyhow::Result<()> {
             *self.last_volume.lock().unwrap() = Some(volume);
+            Ok(())
+        }
+
+        /// P2-N1：Fake 的 stop_playback 计数调用（模拟 ALSA drop 丢弃尾音）。
+        fn stop_playback(&mut self) -> anyhow::Result<()> {
+            *self.stop_calls.lock().unwrap() += 1;
             Ok(())
         }
     }
@@ -1542,11 +1713,13 @@ mod tests {
             let mut status_tick = tokio::time::interval(transport::STATUS_INTERVAL);
             let played = Arc::new(Mutex::new(0usize));
             let last_volume = Arc::new(Mutex::new(None));
+            let stop_calls = Arc::new(Mutex::new(0usize));
             let mut audio: Option<Audio> = if with_audio {
                 Some(
                     Audio::with_device(Box::new(TestAudioDevice {
                         played_frames: played.clone(),
                         last_volume: last_volume.clone(),
+                        stop_calls: stop_calls.clone(),
                     }))
                     .unwrap(),
                 )
@@ -1559,6 +1732,8 @@ mod tests {
                 drop(wake_tx);
                 drop(audio_tx);
             });
+            let pushing = std::sync::atomic::AtomicBool::new(false);
+            let (ref_tx, _ref_rx) = mpsc::channel::<[i16; crate::audio::FRAME_SAMPLES]>(16);
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
                 run_session(
@@ -1568,6 +1743,8 @@ mod tests {
                     &mut audio_rx,
                     &mut status_tick,
                     &mut audio,
+                    &pushing,
+                    &ref_tx,
                 ),
             )
             .await;
@@ -1698,10 +1875,12 @@ mod tests {
             let mut status_tick = tokio::time::interval(transport::STATUS_INTERVAL);
             let played = Arc::new(Mutex::new(0usize));
             let last_volume = Arc::new(Mutex::new(None));
+            let stop_calls = Arc::new(Mutex::new(0usize));
             let mut audio: Option<Audio> = Some(
                 Audio::with_device(Box::new(TestAudioDevice {
                     played_frames: played.clone(),
                     last_volume: last_volume.clone(),
+                    stop_calls: stop_calls.clone(),
                 }))
                 .unwrap(),
             );
@@ -1710,6 +1889,8 @@ mod tests {
                 drop(wake_tx);
                 drop(audio_tx);
             });
+            let pushing = std::sync::atomic::AtomicBool::new(false);
+            let (ref_tx, _ref_rx) = mpsc::channel::<[i16; crate::audio::FRAME_SAMPLES]>(16);
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
                 run_session(
@@ -1719,6 +1900,8 @@ mod tests {
                     &mut audio_rx,
                     &mut status_tick,
                     &mut audio,
+                    &pushing,
+                    &ref_tx,
                 ),
             )
             .await;
@@ -1866,6 +2049,8 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
             drop(wake_tx);
         });
+        let pushing = std::sync::atomic::AtomicBool::new(false);
+        let (ref_tx, _ref_rx) = mpsc::channel::<[i16; crate::audio::FRAME_SAMPLES]>(16);
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             run_session(
@@ -1875,6 +2060,8 @@ mod tests {
                 &mut audio_rx,
                 &mut status_tick,
                 &mut audio,
+                &pushing,
+                &ref_tx,
             ),
         )
         .await;
@@ -1902,5 +2089,149 @@ mod tests {
             recorded.iter().any(|e| e == "audio_end"),
             "hub must receive audio_end after stop_recording; got: {recorded:?}"
         );
+    }
+    #[test]
+    fn capture_backoff_delay_grows_then_caps_at_5s() {
+        // P2-40：100ms 起步翻倍、上限 5s。
+        assert_eq!(
+            capture_backoff_delay(0),
+            std::time::Duration::from_millis(100)
+        );
+        assert_eq!(
+            capture_backoff_delay(1),
+            std::time::Duration::from_millis(200)
+        );
+        assert_eq!(
+            capture_backoff_delay(3),
+            std::time::Duration::from_millis(800)
+        );
+        assert_eq!(
+            capture_backoff_delay(6),
+            std::time::Duration::from_millis(5000)
+        );
+        assert_eq!(
+            capture_backoff_delay(100),
+            std::time::Duration::from_secs(5)
+        );
+    }
+
+    /// P2-N1 端到端：fake Hub 发 2 帧音频（播出）→ 发 interrupt →
+    /// 客户端必须调一次设备的 stop_playback（丢弃 ALSA 缓冲尾音），
+    /// 且打断后 200ms 内的在途帧不再播出。真机上 drop/prepare 是否
+    /// 真把 80ms 尾音清掉仍需真机确认（BLOCKED），这里验证的是胶水层：
+    /// interrupt 确实一路调到了设备的 stop_playback，而不是只清标志。
+    #[tokio::test]
+    async fn interrupt_stops_playback_via_alsa_drop() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::tungstenite::Message;
+
+        const TEST_TOKEN: &str = "test-token-0123456789abcdef";
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let packets = sine_opus_packets(3);
+        let hub = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let first = ws.next().await.unwrap().unwrap();
+            assert!(matches!(first, Message::Text(_)));
+            ws.send(Message::Text(
+                serde_json::json!({"type": "hello_ok", "device_id": "e2e-device", "room": "客厅"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // 播 2 帧。
+            for pkt in packets.iter().take(2) {
+                let mut framed = vec![crate::audio::AUDIO_FRAME_TYPE];
+                framed.extend_from_slice(pkt);
+                ws.send(Message::Binary(framed.into())).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // 打断。
+            ws.send(Message::Text(
+                serde_json::json!({"type": "interrupt"}).to_string().into(),
+            ))
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // 打断后 100ms 内的在途帧（200ms 抑制窗内）：不应播出。
+            let mut framed = vec![crate::audio::AUDIO_FRAME_TYPE];
+            framed.extend_from_slice(&packets[2]);
+            ws.send(Message::Binary(framed.into())).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = ws.close(None).await;
+        });
+
+        let cfg = config::Config {
+            hub_url: format!("ws://{addr}"),
+            token: TEST_TOKEN.to_string(),
+            tls: false,
+            allow_insecure_ws: false,
+            kws_mode: "server".to_string(),
+            kws_model: "/tmp/no-such-model.onnx".to_string(),
+            kws_model_dir: "/tmp/no-such-kws-models".to_string(),
+            kws_lib: String::new(),
+            ..config::Config::default()
+        };
+        let mut transport = transport::connect_once(&cfg)
+            .await
+            .expect("fake hub connect must pass");
+        let mut session = Session::new_server();
+        let (wake_tx, mut wake_rx) = mpsc::channel::<crate::kws::WakeEvent>(8);
+        let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(32);
+        let mut status_tick = tokio::time::interval(transport::STATUS_INTERVAL);
+        let played = Arc::new(Mutex::new(0usize));
+        let last_volume = Arc::new(Mutex::new(None));
+        let stop_calls = Arc::new(Mutex::new(0usize));
+        let mut audio: Option<Audio> = Some(
+            Audio::with_device(Box::new(TestAudioDevice {
+                played_frames: played.clone(),
+                last_volume: last_volume.clone(),
+                stop_calls: stop_calls.clone(),
+            }))
+            .unwrap(),
+        );
+        let keepalive = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(wake_tx);
+            drop(audio_tx);
+        });
+        let pushing = std::sync::atomic::AtomicBool::new(false);
+        let (ref_tx, _ref_rx) = mpsc::channel::<[i16; crate::audio::FRAME_SAMPLES]>(16);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session(
+                &mut transport,
+                &mut session,
+                &mut wake_rx,
+                &mut audio_rx,
+                &mut status_tick,
+                &mut audio,
+                &pushing,
+                &ref_tx,
+            ),
+        )
+        .await;
+        assert!(result.is_ok(), "session must end when the fake hub closes");
+        keepalive.abort();
+        hub.abort();
+        assert_eq!(
+            *played.lock().unwrap(),
+            2,
+            "only the 2 pre-interrupt frames must be played; the in-flight frame after interrupt must be suppressed"
+        );
+        assert_eq!(
+            *stop_calls.lock().unwrap(),
+            1,
+            "interrupt must call the audio device stop_playback exactly once (not just clear the playing flag)"
+        );
+        assert!(!session.playing, "interrupt must clear the playing flag");
     }
 }

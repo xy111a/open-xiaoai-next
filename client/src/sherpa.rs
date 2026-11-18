@@ -454,6 +454,11 @@ impl SherpaSpotter {
 
     /// 喂一帧 20ms PCM（320 采样点 @16kHz）；命中返回关键词原文。
     /// 命中后自动 reset stream，下一句可独立检出。
+    /// P2-21：`is_ready` 排空循环带 100 次上限（`decode_ready_loop`）——
+    /// 超限时复位流并返回 Err（录音任务记节流 warn，见 `kws.rs` 的
+    /// P2-20；连续失败 50 次后停后端），不再永久阻塞。server 模式下
+    /// 本地 KWS 根本不走此路径（`init_kws` 返回 `Ok(None)`），
+    /// 本修复只对 local 模式生效。
     pub fn feed_frame(&mut self, pcm: &[i16; FRAME_SAMPLES]) -> Result<Option<String>> {
         let samples: Vec<c_float> = pcm.iter().map(|s| (*s as c_float) / 32768.0).collect();
         // SAFETY：stream 由 open() 创建且未销毁；samples 长度 320，指针有效。
@@ -464,8 +469,16 @@ impl SherpaSpotter {
                 samples.as_ptr(),
                 FRAME_SAMPLES as c_int,
             );
-            while (self.api.is_ready)(self.spotter, self.stream) != 0 {
-                (self.api.decode)(self.spotter, self.stream);
+            let api = &self.api;
+            let spotter = self.spotter;
+            let stream = self.stream;
+            if let Err(e) = decode_ready_loop(
+                || (api.is_ready)(spotter, stream) != 0,
+                || (api.decode)(spotter, stream),
+            ) {
+                // 超限：复位流（丢弃卡住的解码状态），再把错误向上传。
+                (self.api.reset_stream)(self.spotter, self.stream);
+                return Err(e);
             }
             let result = (self.api.get_result)(self.spotter, self.stream);
             if result.is_null() {
@@ -509,7 +522,31 @@ fn path_cstring(p: &Path) -> Result<CString> {
     CString::new(s).map_err(|_| anyhow!("model path contains NUL: {s}"))
 }
 
-/// 模型目录默认布局的文件名（供 `SherpaSpotter::open` 与下载脚本共用）。
+/// `is_ready` 排空循环的迭代上限（P2-21）：单帧最多 decode 这么多次。
+/// `is_ready` 因模型/音频异常恒为真时，循环到上限即报错并复位流——
+/// 录音任务不再永久阻塞。正常流式使用中每帧 decode 0–2 次，
+/// 100 次是数量级以上的余量，不是紧约束。
+pub const MAX_DECODE_ITERATIONS: usize = 100;
+
+/// 排空 `is_ready` 循环的可测试核心（P2-21）：`is_ready`/`decode` 由调用方
+/// 注入，循环带硬上限。返回实际 decode 的次数；超限返回 Err。
+/// `feed_frame` 用真实 FFI 闭包调本函数；测试用假闭包验证上限生效。
+fn decode_ready_loop(
+    mut is_ready: impl FnMut() -> bool,
+    mut decode: impl FnMut(),
+) -> Result<usize> {
+    let mut iterations = 0usize;
+    while is_ready() {
+        if iterations >= MAX_DECODE_ITERATIONS {
+            return Err(anyhow!(
+                "sherpa is_ready stayed true after {MAX_DECODE_ITERATIONS} decode iterations; the keyword stream may be stuck (resetting the stream)"
+            ));
+        }
+        decode();
+        iterations += 1;
+    }
+    Ok(iterations)
+}
 pub fn model_file_names() -> (&'static str, &'static str, &'static str, &'static str) {
     (
         "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
@@ -681,6 +718,36 @@ mod tests {
             }
         }
         assert_eq!(hit2, None, "neg3.wav must stay silent");
+    }
+
+    #[test]
+    fn decode_ready_loop_caps_stuck_is_ready() {
+        // P2-21：is_ready 恒为真时，循环必须在 100 次处停下并返回 Err，
+        // 而不是永久阻塞录音任务。
+        let mut calls = 0usize;
+        let err = decode_ready_loop(|| true, || calls += 1)
+            .expect_err("stuck is_ready must fail after the cap");
+        assert_eq!(calls, MAX_DECODE_ITERATIONS);
+        assert!(
+            err.to_string().contains("is_ready stayed true"),
+            "unexpected error: {err}"
+        );
+        // 正常情况：3 次 ready 后停，返回 3。
+        let mut remaining = 3usize;
+        let n = decode_ready_loop(
+            || {
+                if remaining == 0 {
+                    return false;
+                }
+                remaining -= 1;
+                true
+            },
+            || {},
+        )
+        .unwrap();
+        assert_eq!(n, 3);
+        // 一次都不 ready：0 次 decode，Ok。
+        assert_eq!(decode_ready_loop(|| false, || {}).unwrap(), 0);
     }
 
     #[test]

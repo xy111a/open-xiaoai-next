@@ -37,7 +37,7 @@
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 
-use crate::audio::{rms_linear, FRAME_SAMPLES};
+use crate::audio::{rms_linear, FailureThrottle, FRAME_SAMPLES};
 
 #[cfg(feature = "sherpa-kws")]
 use crate::sherpa::SherpaSpotter;
@@ -166,7 +166,18 @@ pub struct Kws {
     /// Sherpa-ONNX 后端（feature `sherpa-kws` 且模型加载成功时 Some）。
     #[cfg(feature = "sherpa-kws")]
     sherpa: Option<SherpaSpotter>,
+    /// 推理失败节流器（P2-20）：失败日志 1 秒一条 + 计数；连续失败
+    /// `KWS_FEED_DISABLE_AFTER` 次后停掉 sherpa 后端并报一次 error。
+    /// 非 sherpa 构建里不读它（feed 永不失败），allow 掉 dead_code。
+    #[allow(dead_code)]
+    feed_throttle: FailureThrottle,
 }
+
+/// 连续推理失败多少次后停掉 sherpa 后端（P2-20）：50 帧 ≈ 1 秒持续失败。
+/// 停后端后 `feed` 只算 RMS、不再调模型——持续失败的后端本来也检不出唤醒，
+/// 停掉它只少了每帧一条 warn，多了一条明确的 error（可恢复：重启进程）。
+#[cfg(feature = "sherpa-kws")]
+pub const KWS_FEED_DISABLE_AFTER: u32 = 50;
 
 impl Kws {
     /// 纯 RMS 构造函数。
@@ -221,6 +232,13 @@ impl Kws {
             rms_window: RmsWindow::new(),
             #[cfg(feature = "sherpa-kws")]
             sherpa: None,
+            feed_throttle: FailureThrottle::new(
+                std::time::Duration::from_secs(1),
+                #[cfg(feature = "sherpa-kws")]
+                KWS_FEED_DISABLE_AFTER,
+                #[cfg(not(feature = "sherpa-kws"))]
+                u32::MAX,
+            ),
         })
     }
 
@@ -248,6 +266,10 @@ impl Kws {
             last_rms_db: SILENCE_FLOOR_DB,
             rms_window: RmsWindow::new(),
             sherpa: Some(spotter),
+            feed_throttle: FailureThrottle::new(
+                std::time::Duration::from_secs(1),
+                KWS_FEED_DISABLE_AFTER,
+            ),
         })
     }
 
@@ -272,7 +294,9 @@ impl Kws {
     /// 对一段 16kHz PCM 做帧处理：按 320 采样点切帧，逐帧算 RMS。
     /// 有 sherpa 后端时每帧还过模型推理，命中返回 Some(WakeEvent)；
     /// 无模型时恒返回 None（但 RMS 与帧计数真实更新，供仲裁/调试用）。
-    /// 注意：推理失败（例如模型内部错误）只记 warn，不中断喂帧、不谎报。
+    /// 注意（P2-20）：推理失败只记节流 warn（1 秒一条 + 累计次数），
+    /// 不再每 20ms 一帧刷一条；连续失败 50 次后停掉 sherpa 后端并报
+    /// 一次 error（持续失败的后端本来也检不出唤醒），`feed` 退回只算 RMS。
     pub fn feed(&mut self, pcm: &[i16]) -> Result<Option<WakeEvent>> {
         self.pending.extend_from_slice(pcm);
         while self.pending.len() >= FRAME_SAMPLES {
@@ -287,6 +311,7 @@ impl Kws {
                     frame.as_slice().try_into().expect("frame is 320 samples");
                 match spotter.feed_frame(frame_arr) {
                     Ok(Some(keyword)) => {
+                        self.feed_throttle.note_success();
                         return Ok(Some(WakeEvent {
                             wake_word: keyword,
                             rms_db: self.wake_rms_db(),
@@ -296,8 +321,27 @@ impl Kws {
                                 .unwrap_or(0),
                         }));
                     }
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!("sherpa feed failed: {e}"),
+                    Ok(None) => {
+                        self.feed_throttle.note_success();
+                    }
+                    Err(e) => {
+                        if self.feed_throttle.note_failure() {
+                            tracing::warn!(
+                                "sherpa feed failed ({} failures total, {} consecutive): {e}",
+                                self.feed_throttle.total(),
+                                self.feed_throttle.consecutive()
+                            );
+                        }
+                        if self.feed_throttle.should_recover() {
+                            tracing::error!(
+                                "sherpa feed failed {} times in a row — disabling local KWS backend (RMS reporting only; restart the client to retry)",
+                                self.feed_throttle.consecutive()
+                            );
+                            self.sherpa = None;
+                            self.model_loaded = false;
+                            self.feed_throttle.reset();
+                        }
+                    }
                 }
             }
             #[cfg(not(feature = "sherpa-kws"))]

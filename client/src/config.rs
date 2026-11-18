@@ -252,10 +252,24 @@ pub fn load() -> Result<Config> {
 }
 
 pub fn load_from_path(path: &str) -> Result<Config> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => load_from_str(&text),
-        Err(_) => Ok(Config::default()),
-    }
+    // P2-42：配置文件缺失或不可读时明确报错退出，不再静默回退默认配置——
+    // 默认配置的 hub_url 是写死的 192.168.1.10、token 为空，静默回退只会
+    // 让一次部署失误（忘写 client.toml、路径写错、权限不足）变成“无限
+    // 重连一个不存在的 Hub + 一条容易误读的指纹缺失报错”。client.toml
+    // 是部署时手写的（见 client/README.md 部署清单），缺失就是部署未完成。
+    // 注意：文件存在但字段缺失时仍走字段默认值（旧 client.toml 兼容），
+    // 随后 `validate()` 会拦住无指纹/弱配置——那是另一层防线。
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        let hint = if e.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "config file not found at {path} — write client.toml there first (see client/README.md deployment checklist: hub_url, token, hub_ca_fingerprint)"
+            )
+        } else {
+            format!("cannot read config file at {path} (check permissions/path): {e}")
+        };
+        anyhow::anyhow!("{hint}")
+    })?;
+    load_from_str(&text)
 }
 
 pub fn load_from_str(text: &str) -> Result<Config> {
@@ -389,10 +403,18 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_falls_back_to_default() {
-        let cfg = load_from_path("/tmp/definitely-not-exist-open-xiaoai-client.toml").unwrap();
-        assert_eq!(cfg.hub_url, Config::default().hub_url);
-        assert!(cfg.tls);
+    fn missing_file_is_clear_error_not_silent_default() {
+        // P2-42：配置文件缺失必须明确报错（写清路径与补救方法），
+        // 不能静默回退默认配置（默认 hub_url 是写死的 192.168.1.10）。
+        let err = load_from_path("/tmp/definitely-not-exist-open-xiaoai-client.toml")
+            .expect_err("missing config file must fail loud");
+        let msg = err.to_string();
+        assert!(msg.contains("not found"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("/tmp/definitely-not-exist-open-xiaoai-client.toml"),
+            "error must name the missing path: {msg}"
+        );
+        assert!(msg.contains("client.toml"), "unexpected error: {msg}");
     }
 
     // --- P1-10 收紧 + P2-N3 / model / ram_mb 校验 ---

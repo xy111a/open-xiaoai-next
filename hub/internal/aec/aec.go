@@ -41,6 +41,15 @@ func (n *NLMS) SetMu(mu float64) {
 	}
 }
 
+// minRefNorm 是参考能量下限（P2-22）：256 点参考窗的能量范数低于此值时
+// 跳过自适应更新——参考全零/静默时步长 mu*e/(norm+eps) 不再爆炸，
+// 滤波器系数保持原样，只输出残差 mic-y（此时 y≈0，即原样输出 mic）。
+// maxStep 是步长钳制（第二道防线）：单次系数更新量不超过该值。
+const (
+	minRefNorm = 1e-9
+	maxStep    = 1.0
+)
+
 // Process 处理一对采样：ref 是当前播放的采样（参考），mic 是麦克风采样。
 // 返回消除回声后的人声估计。调用方必须保证 ref 与 mic 严格对齐（同帧同采样点）。
 func (n *NLMS) Process(ref, mic float64) float64 {
@@ -65,7 +74,17 @@ func (n *NLMS) Process(ref, mic float64) float64 {
 		}
 		norm += n.ref[idx] * n.ref[idx]
 	}
+	// P2-22：参考能量过低时跳过自适应更新（只输出残差，不动系数）。
+	if norm < minRefNorm {
+		n.pos = (n.pos + 1) % l
+		return e
+	}
 	step := n.mu * e / (norm + n.eps)
+	if step > maxStep {
+		step = maxStep
+	} else if step < -maxStep {
+		step = -maxStep
+	}
 	for i := 0; i < l; i++ {
 		idx := n.pos - i
 		if idx < 0 {

@@ -20,9 +20,11 @@ use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, Signatur
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{
-    connect_async, connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream,
+    connect_async_tls_with_config, connect_async_with_config, Connector, MaybeTlsStream,
+    WebSocketStream,
 };
 use tracing::{info, warn};
 
@@ -31,6 +33,19 @@ use crate::config::Config;
 
 /// hello 握手等待上限。
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+/// 入站 WS 帧大小上限（P2-N2）：64KB。协议里最大的帧是 Opus 音频帧
+/// （<1.3KB，含 1 字节帧头）与文本消息（<1KB），64KB 是数量级以上的余量；
+/// tungstenite 默认是 64MB 消息 / 16MB 帧——被攻陷或出 bug 的 Hub 发一条
+/// 超大帧就能打满 256MB 音箱内存。超限时 tungstenite 直接断开连接，
+/// `next_raw`/`next_msg` 返回 Err，主循环按断线重连处理。
+pub const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// 入站 WS 配置：只收紧消息/帧大小上限，其余沿用 tungstenite 默认值。
+pub fn ws_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_WS_MESSAGE_BYTES))
+}
 /// 定期状态上报间隔（协议：每 30s）。
 pub const STATUS_INTERVAL: Duration = Duration::from_secs(30);
 /// 重连退避：首次 100ms。
@@ -398,36 +413,46 @@ fn msg_type(v: &serde_json::Value) -> &str {
     v.get("type").and_then(|t| t.as_str()).unwrap_or("")
 }
 
-/// 解析一条 Hub 文本帧。返回 Err = 无法解析的 JSON（调用方记日志后忽略）。
+/// 解析一条 Hub 文本帧。返回 Err = 无法解析的 JSON（调用方记日志后忽略），
+/// 或协议必需字段缺失（P2-N6：缺字段不再静默接受空值——`hello_ok` 缺
+/// `device_id` 或为空时 Err，不跑半握手会话；`rpc` 缺 `id` 或 `method`
+/// 或为空时 Err，空 id 的 rpc_result Hub 侧无法匹配、空 method 只会回
+/// `unknown rpc method: `）。其余类型沿用旧行为：`ota`/`room_ok` 的空
+/// 字段只记日志（OTA 本阶段只记日志不执行，room 为空时 Session 不覆盖
+/// 已有房间）。
 pub fn parse_hub_text(text: &str) -> Result<HubMsg> {
     let v: serde_json::Value = serde_json::from_str(text).context("hub message is not JSON")?;
     Ok(match msg_type(&v) {
-        "hello_ok" => HubMsg::HelloOk {
-            device_id: v
-                .get("device_id")
-                .and_then(|d| d.as_str())
-                .unwrap_or("")
-                .to_string(),
-            room: v
-                .get("room")
-                .and_then(|r| r.as_str())
-                .map(|s| s.to_string()),
-        },
+        "hello_ok" => {
+            let device_id = v.get("device_id").and_then(|d| d.as_str()).unwrap_or("");
+            if device_id.is_empty() {
+                bail!("hello_ok is missing required field \"device_id\" (refusing a half-handshaked session)");
+            }
+            HubMsg::HelloOk {
+                device_id: device_id.to_string(),
+                room: v
+                    .get("room")
+                    .and_then(|r| r.as_str())
+                    .map(|s| s.to_string()),
+            }
+        }
         "wake_win" => HubMsg::WakeWin,
         "wake_lose" => HubMsg::WakeLose,
-        "rpc" => HubMsg::Rpc {
-            id: v
-                .get("id")
-                .and_then(|i| i.as_str())
-                .unwrap_or("")
-                .to_string(),
-            method: v
-                .get("method")
-                .and_then(|m| m.as_str())
-                .unwrap_or("")
-                .to_string(),
-            params: v.get("params").cloned().unwrap_or(serde_json::Value::Null),
-        },
+        "rpc" => {
+            let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            if id.is_empty() {
+                bail!("rpc is missing required field \"id\" (dropping: an rpc_result with an empty id cannot be matched by the hub)");
+            }
+            if method.is_empty() {
+                bail!("rpc is missing required field \"method\" (dropping)");
+            }
+            HubMsg::Rpc {
+                id: id.to_string(),
+                method: method.to_string(),
+                params: v.get("params").cloned().unwrap_or(serde_json::Value::Null),
+            }
+        }
         "interrupt" => HubMsg::Interrupt,
         "ota" => HubMsg::Ota {
             version: v
@@ -696,14 +721,14 @@ pub async fn connect_once(cfg: &Config) -> Result<Transport> {
         let tls_config = build_tls_config(cfg)?;
         connect_async_tls_with_config(
             url.as_str(),
-            None,
+            Some(ws_config()),
             false,
             Some(Connector::Rustls(tls_config)),
         )
         .await
         .map_err(|e| anyhow!("wss connect failed: {e}"))?
     } else {
-        connect_async(url.as_str())
+        connect_async_with_config(url.as_str(), Some(ws_config()), false)
             .await
             .map_err(|e| anyhow!("ws connect failed: {e}"))?
     };
@@ -741,6 +766,13 @@ pub async fn connect_once(cfg: &Config) -> Result<Transport> {
                 .and_then(|d| d.as_str())
                 .unwrap_or("")
                 .to_string();
+            // P2-N6：hello_ok 缺 device_id 或为空时直接报错断线（与
+            // parse_hub_text 同规则；这里是握手路径的另一份解析，不能
+            // 只靠 parse_hub_text 兜底）。
+            if device_id.is_empty() {
+                let _ = ws.close(None).await;
+                bail!("hello_ok is missing required field \"device_id\" (refusing a half-handshaked session)");
+            }
             let room = v
                 .get("room")
                 .and_then(|r| r.as_str())
@@ -1070,6 +1102,96 @@ mod tests {
             parse_hub_text(r#"{"type":"something_new"}"#).unwrap(),
             HubMsg::Unknown("something_new".to_string())
         );
+    }
+
+    // --- P2-N6：hello_ok / rpc 缺必需字段时拒绝，不静默接受空值 ---
+    #[test]
+    fn parse_hub_text_rejects_missing_required_fields() {
+        // hello_ok 缺 device_id / 为空 → Err。
+        for bad in [
+            r#"{"type":"hello_ok"}"#,
+            r#"{"type":"hello_ok","device_id":""}"#,
+            r#"{"type":"hello_ok","device_id":123}"#,
+        ] {
+            let err = parse_hub_text(bad).expect_err("hello_ok without device_id must fail");
+            assert!(
+                err.to_string().contains("device_id"),
+                "unexpected error: {err}"
+            );
+        }
+        // rpc 缺 id / 缺 method / 为空 → Err（不回空 id 的 rpc_result）。
+        for bad in [
+            r#"{"type":"rpc","method":"play_text","params":{}}"#,
+            r#"{"type":"rpc","id":"7","params":{}}"#,
+            r#"{"type":"rpc","id":"","method":"play_text","params":{}}"#,
+            r#"{"type":"rpc","id":"7","method":"","params":{}}"#,
+        ] {
+            let err = parse_hub_text(bad).expect_err("rpc without id/method must fail");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("\"id\"") || msg.contains("\"method\""),
+                "unexpected error: {msg}"
+            );
+        }
+        // 合法 rpc 仍通过（params 缺失时默认为 Null，不算缺必需字段）。
+        assert_eq!(
+            parse_hub_text(r#"{"type":"rpc","id":"7","method":"play_text"}"#).unwrap(),
+            HubMsg::Rpc {
+                id: "7".to_string(),
+                method: "play_text".to_string(),
+                params: serde_json::Value::Null,
+            }
+        );
+    }
+
+    // --- P2-N2：入站 WS 帧大小上限 64KB ---
+    #[test]
+    fn ws_config_limits_inbound_frames_to_64k() {
+        let cfg = ws_config();
+        assert_eq!(cfg.max_message_size, Some(MAX_WS_MESSAGE_BYTES));
+        assert_eq!(cfg.max_frame_size, Some(MAX_WS_MESSAGE_BYTES));
+        assert_eq!(MAX_WS_MESSAGE_BYTES, 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn oversized_inbound_frame_disconnects() {
+        // Fake Hub：握手成功后发一条 100KB 文本帧（>64KB 上限）；
+        // 客户端的 next_raw 必须返回 Err（连接被 tungstenite 按上限断开），
+        // 而不是把 100KB 帧读进内存再解析。
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let hub = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let first = ws.next().await.unwrap().unwrap();
+            assert!(matches!(first, Message::Text(_)));
+            ws.send(txt(
+                serde_json::json!({"type": "hello_ok", "device_id": "oversize-device"}).to_string(),
+            ))
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let big = "x".repeat(100 * 1024);
+            let _ = ws
+                .send(Message::Text(
+                    format!("{{\"type\":\"unknown_big\",\"pad\":\"{big}\"}}").into(),
+                ))
+                .await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let cfg = test_config(&format!("ws://{addr}"), TEST_TOKEN, false);
+        let mut t = connect_once(&cfg).await.expect("connect must pass");
+        assert_eq!(t.device_id.as_deref(), Some("oversize-device"));
+        let err = t
+            .next_raw()
+            .await
+            .expect_err("a 100KB inbound frame must be rejected by the 64KB limit");
+        assert!(
+            err.to_string().contains("ws recv failed"),
+            "unexpected error: {err}"
+        );
+        hub.abort();
     }
 
     #[test]

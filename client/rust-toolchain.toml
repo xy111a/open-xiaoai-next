@@ -1,0 +1,16 @@
+# P2-N7：钉死 Rust 工具链版本——构建不可字节复现的头号嫌疑就是
+# 浮动的 `stable`（上次重建产物 2,444,332 字节 / SHA e90c3058… 与上一版
+# 2,435,964 字节 / SHA 2da754d4… 不同时，工具链版本未记录、无从比对）。
+# 本文件让 client/ 下的一切 cargo 调用（宿主机测试、ARM 交叉构建）
+# 都用 rustc 1.100.0（2026-11-09，实测版本，见 `rustc --version`）。
+# 换版本时改这里一个数字，并重跑一次两遍构建 SHA 比对（见下）。
+#
+# 注意：rustup 按本文件自动切工具链；新机器上首次构建会自动下载
+# 1.100.0 + 两个 ARM target（约几分钟，只需一次）。
+# 配合两构建脚本里的 --remap-path-prefix（路径）与 SOURCE_DATE_EPOCH
+# （时间戳），同一提交在不同目录/不同时间构建应产出相同 SHA。
+# 验证方法：CARGO_TARGET_DIR 换两个不同目录各 clean 构建一次，比对
+# `sha256sum target/.../release/open-xiaoai-client`（ARM 用
+# build-armv7-gnueabihf.sh；宿主机用 cargo build --release）。
+[toolchain]
+channel = "1.100.0"

@@ -60,3 +60,35 @@ func TestProcessFrameLength(t *testing.T) {
 		t.Fatalf("ProcessFrame 应返回 320 点，实际 %d", len(out))
 	}
 }
+
+// P2-22：零能量参考信号时滤波器系数必须保持为零、输出等于输入，
+// 步长不再爆炸；极小参考下系数有界、输出有限。
+func TestZeroReferenceDoesNotExplode(t *testing.T) {
+	n := New(256)
+	// 全零参考 + 大麦克风信号：输出必须逐采样等于输入，系数全零。
+	for i := 0; i < 1000; i++ {
+		out := n.Process(0, 8000*math.Sin(2*math.Pi*300*float64(i)/16000))
+		want := 8000 * math.Sin(2*math.Pi*300*float64(i)/16000)
+		if math.Abs(out-want) > 1e-9 {
+			t.Fatalf("zero reference: output %v must equal mic %v at sample %d", out, want, i)
+		}
+	}
+	for i, w := range n.taps {
+		if w != 0 {
+			t.Fatalf("zero reference: tap %d must stay 0, got %v", i, w)
+		}
+	}
+	// 极小参考（1e-4 量级）+ 大麦克风信号：输出有限、系数有界。
+	n2 := New(256)
+	for i := 0; i < 1000; i++ {
+		out := n2.Process(1e-4, 8000)
+		if math.IsNaN(out) || math.IsInf(out, 0) {
+			t.Fatalf("tiny reference: output must stay finite, got %v at sample %d", out, i)
+		}
+	}
+	for i, w := range n2.taps {
+		if math.IsNaN(w) || math.IsInf(w, 0) || math.Abs(w) > 1.0 {
+			t.Fatalf("tiny reference: tap %d must stay bounded, got %v", i, w)
+		}
+	}
+}
