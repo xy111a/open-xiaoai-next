@@ -211,10 +211,41 @@ def test_patch_sh_rejects_bad_args(tmp_path):
     r = run(["bash", str(SCRIPTS / "patch.sh"), "lx06", "not-a-version"],
             env_extra=env)
     assert r.returncode != 0
+    # P2-9：带斜杠的版本号必须拒绝（旧 case 模式的 `.` 是通配符，会放行）。
+    r = run(["bash", str(SCRIPTS / "patch.sh"), "lx06", "1/94/13"],
+            env_extra=env)
+    assert r.returncode != 0
+    assert "版本号格式不对" in r.stderr
     # 无 rootfs 时失败，且不留下半成品镜像
     r = run(["bash", str(SCRIPTS / "patch.sh"), "lx06", "1.94.13"],
             env_extra=env)
     assert r.returncode != 0
+    assert not (work / "lx06_1.94.13" / "root-patched.squashfs").exists()
+
+
+def test_patch_sh_reports_missing_compression_explicitly(unpacked_work,
+                                                        tmp_path):
+    """P2-31 回归：file 读不到压缩信息时，必须报出明确错误再退出，
+    而不是在命令替换里静默死掉（set -euo pipefail 下 grep 无匹配会让
+    整条管道失败，set -e 直接退出，走不到 `[ -n … ] || fail`）。
+    构造：.bin 真实（过白名单），root.squashfs 换成 file 认不出的垃圾。
+    """
+    work = tmp_path / "work"
+    # symlinks=True：rootfs 里有悬空软链（如 bin/kill → 不存在的目标），
+    # 默认跟随复制会 ENOENT；只复制链接本身，与 copy_rootfs 同款做法。
+    shutil.copytree(unpacked_work / "lx06_1.94.13",
+                    work / "lx06_1.94.13", symlinks=True)
+    shutil.copyfile(unpacked_work / "lx06_1.94.13.bin",
+                    work / "lx06_1.94.13.bin")
+    (work / "lx06_1.94.13" / "root.squashfs").write_bytes(
+        b"garbage-not-a-squashfs")
+    env = {"PATCH_WORK_DIR": str(work),
+           "SSH_PASSWORD": "test-password-0123456789"}
+    r = run(["bash", str(SCRIPTS / "patch.sh"), "lx06", "1.94.13"],
+            env_extra=env, timeout=1200)
+    assert r.returncode != 0
+    assert "读不到压缩方式" in r.stderr, \
+        f"应报出明确错误，实际 stderr：{r.stderr!r}"
     assert not (work / "lx06_1.94.13" / "root-patched.squashfs").exists()
 
 

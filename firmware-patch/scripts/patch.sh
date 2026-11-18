@@ -4,7 +4,8 @@
 #
 # 已验证的补丁参数（证据见 ../../firmware/REA_ANALYSIS.md，别凭记忆改）：
 #   - 分区上限 40MB（0x02800000）：补丁后 squashfs 必须小于 40MB，否则刷机变砖
-#   - A/B 分区：system0 / system1；刷 boot0（补丁系统），boot1 保留原厂系统用于回滚
+#   - A/B 分区：system0 / system1；目标槽以 FLASH_RUNBOOK.md §3 决策表为准
+#     （按实测 boot_part 定，不要默认刷 boot0；boot1 不一定是原厂槽）
 #   - 禁用自动升级：OTA 升级入口在 /bin/ota，补丁后不再接受小米 OTA
 #   - asound.conf：录音链走 Capture（dsnoop hw:0,3，48kHz，S32_LE，8ch，
 #     period 384，buffer 6144）；DTS 链路刷机后不再启用，别修它
@@ -34,10 +35,11 @@ case "$MODEL" in
     lx06|oh2p) ;;
     *) echo "未知型号：$MODEL_RAW（只支持 lx06 / oh2p）" >&2; exit 1 ;;
 esac
-case "$VERSION" in
-    [0-9]*.[0-9]*.[0-9]*) ;;
-    *) echo "版本号格式不对：$VERSION（应为 x.y.z，如 1.94.13）" >&2; exit 1 ;;
-esac
+# P2-9：版本号必须严格是 x.y.z——case 的 `.` 是通配符，"1/94/13" 也能
+# 通过，拼进路径就是穿越；用正则锚定首尾。
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "版本号格式不对：$VERSION（应为 x.y.z，如 1.94.13）" >&2; exit 1
+fi
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="${PATCH_WORK_DIR:-$HERE/work}"
@@ -48,15 +50,17 @@ OUT="$DIR/root-patched.squashfs"
 MAX_SIZE=$((0x02800000))
 VERIFY_DIR=""
 
-# 失败出口：报错 + 删掉半成品镜像与验证目录，再非零退出。
+# 失败出口：报错 + 删掉半成品镜像、验证目录与工作副本，再非零退出。
+# 工作副本（SQFS_ROOT）是 SRC_ROOTFS 的复制，删了可重跑，不留半打状态。
 fail() {
     echo "失败：$*" >&2
     rm -f "$OUT"
     [ -n "$VERIFY_DIR" ] && rm -rf "$VERIFY_DIR"
+    [ -n "$SQFS_ROOT" ] && rm -rf "$SQFS_ROOT"
     exit 1
 }
-# 未经 fail() 的意外失败（set -e 触发）同样清理半成品镜像。
-trap 'rm -f "$OUT"; [ -n "$VERIFY_DIR" ] && rm -rf "$VERIFY_DIR"' ERR
+# 未经 fail() 的意外失败（set -e 触发）同样清理半成品镜像与工作副本。
+trap 'rm -f "$OUT"; [ -n "$VERIFY_DIR" ] && rm -rf "$VERIFY_DIR"; [ -n "$SQFS_ROOT" ] && rm -rf "$SQFS_ROOT"' ERR
 
 # P1-8：find 必须恰好命中一个；多个即失败（任选其一是任意的），
 # 零个也失败。只打印命中的唯一路径（与 unpack.sh 同款辅助函数）。
@@ -113,51 +117,138 @@ python3 "$HERE/scripts/patch_firmware.py" --model "$MODEL" --rootfs "$SQFS_ROOT"
 # --- 3. 用 file 读原始 root.squashfs 的压缩方式与 blocksize ---
 SQFS_INFO="$(file "$ORIG_SQFS")"
 echo "原始固件信息：$SQFS_INFO"
-COMPRESSION="$(printf '%s' "$SQFS_INFO" | grep -oE '(xz|gzip|lzo|lz4|zstd) compressed' | cut -d' ' -f1 | head -1)"
-BLOCKSIZE="$(printf '%s' "$SQFS_INFO" | grep -oE 'blocksize: [0-9]+' | grep -oE '[0-9]+' | head -1)"
+# P2-31：两条管道末尾必须加 `|| true`。set -euo pipefail 下，grep 无匹配
+# 时整条管道失败，set -e 直接退出，根本走不到下面的显式 `[ -n … ] || fail`——
+# 失败分支不可达，报错信息也出不来。加 `|| true` 让显式检查真正跑到。
+COMPRESSION="$(printf '%s' "$SQFS_INFO" | grep -oE '(xz|gzip|lzo|lz4|zstd) compressed' | cut -d' ' -f1 | head -1 || true)"
+BLOCKSIZE="$(printf '%s' "$SQFS_INFO" | grep -oE 'blocksize: [0-9]+' | grep -oE '[0-9]+' | head -1 || true)"
 [ -n "$COMPRESSION" ] || fail "读不到压缩方式：$SQFS_INFO"
 [ -n "$BLOCKSIZE" ] || fail "读不到 blocksize：$SQFS_INFO"
 echo "打包参数：-comp $COMPRESSION -b $BLOCKSIZE"
 
 # --- 4. mksquashfs 重新打包（与原始参数一致） ---
 command -v mksquashfs >/dev/null || fail "缺 mksquashfs（apt 装 squashfs-tools）"
+# P2-30：mksquashfs 参数与原厂不完全一致——原厂 xz 选项是 14 字节非默认
+# 值（超级块后 0c 80 00 00 02 00 14 00 09 00 90 00 40 00），stock 工具
+# 读不出，无法精确复现；当前镜像 38,453,248 字节，比原厂 +952,549。
+# `-Xbcj arm` 实测可再省约 1MB（37,380,096），但音箱内核是否支持 BCJ
+# 未证实，猜错会挂不上 rootfs——默认不开。首刷关口可在备用槽 A/B 测试：
+#   PATCH_XZ_BCJ=arm patch.sh lx06 1.94.13
+BCJ_ARGS=()
+if [ "${PATCH_XZ_BCJ:-}" = "arm" ]; then
+    [ "$COMPRESSION" = "xz" ] || fail "PATCH_XZ_BCJ 只对 xz 压缩有效，当前是 $COMPRESSION"
+    BCJ_ARGS=(-Xbcj arm)
+    echo "注意：PATCH_XZ_BCJ=arm 已开（实验性，未证实内核支持 BCJ；只刷备用槽）"
+fi
 echo "重新打包 → $OUT"
 mksquashfs "$SQFS_ROOT" "$OUT" \
     -comp "$COMPRESSION" -b "$BLOCKSIZE" \
     -noappend -all-root -always-use-fragments -no-xattrs -no-exports \
+    "${BCJ_ARGS[@]}" \
     || fail "mksquashfs 打包失败"
 
 # --- 5. 大小校验：必须 < 40MB，否则失败且不输出镜像 ---
 SIZE="$(stat -L -c %s "$OUT")"
-echo "补丁后大小：$SIZE 字节（上限 $MAX_SIZE）"
+ORIG_SIZE="$(stat -L -c %s "$ORIG_SQFS")"
+WARN_SIZE=$((38 * 1024 * 1024))  # 38MB = 上限的 95%，预警线
+echo "补丁后大小：$SIZE 字节（上限 $MAX_SIZE；原厂 $ORIG_SIZE，增长 $((SIZE - ORIG_SIZE))）"
 if [ "$SIZE" -ge "$MAX_SIZE" ]; then
     fail "补丁后 squashfs $SIZE 字节，超过 40MB 上限，拒绝输出镜像"
+fi
+# P2-30：38MB 预警 + 比原厂增长超 2MB 警告（当前基线 +952,549，未触发）。
+if [ "$SIZE" -ge "$WARN_SIZE" ]; then
+    echo "警告：补丁后大小 $SIZE 已超 38MB 预警线（上限 95%），下次加功能前先减体积" >&2
+fi
+if [ "$((SIZE - ORIG_SIZE))" -gt $((2 * 1024 * 1024)) ]; then
+    echo "警告：补丁后比原厂大 $((SIZE - ORIG_SIZE)) 字节（超 2MB），检查是否带了多余文件" >&2
 fi
 echo "大小检查通过，剩余 $((MAX_SIZE - SIZE)) 字节"
 
 # --- 6. 解开验证：关键文件存在且补丁都在 ---
 command -v unsquashfs >/dev/null || fail "缺 unsquashfs（apt 装 squashfs-tools）"
 VERIFY_DIR="$(mktemp -d)"
-# -no-exit-code：容器里建 /dev/* 设备节点会报 Operation not permitted
-# （非致命；原厂 rootfs 的 dev/ 本就是空的）。真正的门是下面的文件校验。
-unsquashfs -d "$VERIFY_DIR/rootfs" -f -no-exit-code "$OUT" >/dev/null \
+# P2-39：-no-exit-code 会掩盖解包错误（容器里建 /dev/* 设备节点会报
+# Operation not permitted，非致命；原厂 rootfs 的 dev/ 本就是空的）。
+# 所以把输出收到日志里单独校验：只允许“建设备节点失败（无权限）”与
+# “xz 压缩选项读不出”这两类良性行，其余含 error/failed 的行即 FAIL；
+# 再用 inode 数硬门：期望解出数 = unsquashfs -s 的 inodes − 建设备失败行数
+# （find 含根目录本身，inodes 也含根目录，两边口径一致，不用减 1）。
+UNSQUASH_LOG="$VERIFY_DIR/unsquashfs.log"
+unsquashfs -d "$VERIFY_DIR/rootfs" -f -no-exit-code "$OUT" >"$UNSQUASH_LOG" 2>&1 \
     || fail "unsquashfs 解开验证失败"
+EXPECT_INODES="$(unsquashfs -s "$OUT" 2>/dev/null | grep -oE 'Number of inodes [0-9]+' | grep -oE '[0-9]+$' || true)"
+DEV_FAILS="$(grep -cE 'failed to create (character|block) device .* Operation not permitted' "$UNSQUASH_LOG" || true)"
+FOUND="$(find "$VERIFY_DIR/rootfs" | wc -l)"
+if [ -n "$EXPECT_INODES" ]; then
+    EXPECT_FOUND="$((EXPECT_INODES - DEV_FAILS))"
+    [ "$FOUND" -eq "$EXPECT_FOUND" ] || fail "解包数量不符：解出 $FOUND，期望 $EXPECT_FOUND（inodes $EXPECT_INODES − 建设备失败 $DEV_FAILS）"
+else
+    echo "警告：读不到 unsquashfs -s 的 inode 数，跳过数量硬门" >&2
+fi
+# stderr 过滤：除两类良性行外，含 error/failed（不区分大小写）即 FAIL。
+if grep -iE 'error|failed' "$UNSQUASH_LOG" \
+    | grep -vE 'failed to create (character|block) device .* Operation not permitted|error reading stored compressor options' \
+    | grep -q .; then
+    grep -iE 'error|failed' "$UNSQUASH_LOG" >&2
+    fail "unsquashfs 日志里有非良性 error/failed 行（见上）"
+fi
 for f in etc/init.d/dropbear etc/shadow etc/inittab etc/pam.d/common-auth \
          bin/ota bin/flash.sh etc/init.d/wireless etc/rc.local \
-         etc/asound.conf etc/asound.conf.dts; do
+         etc/asound.conf etc/asound.conf.dts \
+         etc/asound.conf.bak etc/asound.conf.dts.bak \
+         etc/open-xiaoai/init.sh; do
     [ -f "$VERIFY_DIR/rootfs/$f" ] || fail "验证失败：解开后缺 $f"
 done
 # libxaudio_engine.so 只有 LX06 有；OH2P 没有这个文件（见 unpack.sh）。
 if [ "$MODEL" = "lx06" ]; then
     [ -f "$VERIFY_DIR/rootfs/usr/lib/libxaudio_engine.so" ] || fail "验证失败：解开后缺 usr/lib/libxaudio_engine.so"
 fi
-# 补丁标记抽查
+# 补丁标记抽查（P2-6：shadow / PAM / OTA 三处 / rc.local 包装器 / .bak / 包装器）
 grep -q 'mkdir -p /data/etc/dropbear' "$VERIFY_DIR/rootfs/etc/init.d/dropbear" \
     || fail "验证失败：dropbear 未打补丁"
+grep -q '\$6\$' "$VERIFY_DIR/rootfs/etc/shadow" \
+    || fail "验证失败：shadow 的 root 密码不是 \$6\$ sha512crypt"
+[ "$(stat -c %a "$VERIFY_DIR/rootfs/etc/shadow")" = "600" ] \
+    || fail "验证失败：shadow 权限不是 0600"
 grep -q 'ttyS0::askfirst:/bin/login' "$VERIFY_DIR/rootfs/etc/inittab" \
     || fail "验证失败：inittab 串口不是 /bin/login（P1-36：串口必须走密码登录）"
+grep -q '^# auth sufficient libmico-pam.so' "$VERIFY_DIR/rootfs/etc/pam.d/common-auth" \
+    || fail "验证失败：PAM 的 libmico 行未被注释"
+grep -q 'auth.*pam_unix.so nullok_secure' "$VERIFY_DIR/rootfs/etc/pam.d/common-auth" \
+    || fail "验证失败：PAM 未启用 pam_unix"
+# OTA 三处禁用：bin/ota 两个函数头后 return 1、flash.sh upgrade_param_check
+# 后 return 1、wireless ota() 里 download_fail + exit 3。
+# grep -A1 取“函数头 + 下一行”，第二行不是 return 1 即 FAIL；函数头本身
+# 缺失时第一段 grep 无输出，第二段也 FAIL（不静默通过）。
+for func in download_upgrade upgrade; do
+    grep -A1 "^$func() {$" "$VERIFY_DIR/rootfs/bin/ota" | grep -q 'return 1' \
+        || fail "验证失败：bin/ota 的 $func() 未禁用（函数头后不是 return 1）"
+done
+grep -A1 '^upgrade_param_check() {$' "$VERIFY_DIR/rootfs/bin/flash.sh" \
+    | grep -q 'return 1' \
+    || fail "验证失败：bin/flash.sh 的 upgrade_param_check() 未禁用"
+grep -q 'echo "download_fail"' "$VERIFY_DIR/rootfs/etc/init.d/wireless" \
+    || fail "验证失败：wireless ota() 未禁用"
 grep -q 'slave.pcm Capture' "$VERIFY_DIR/rootfs/etc/asound.conf" \
     || fail "验证失败：asound.conf 未打补丁"
+# rc.local 走包装器行（P2-34；旧直行是旧版补丁产物，这里只接受包装器行）。
+grep -q '^\[ -x /etc/open-xiaoai/init.sh \]' "$VERIFY_DIR/rootfs/etc/rc.local" \
+    || fail "验证失败：rc.local 里没有 init 包装器启动行"
+grep -q 'sha256sum' "$VERIFY_DIR/rootfs/etc/open-xiaoai/init.sh" \
+    || fail "验证失败：init 包装器里没有 sha256sum 校验"
+grep -q 'init.sh.sha256' "$VERIFY_DIR/rootfs/etc/open-xiaoai/init.sh" \
+    || fail "验证失败：init 包装器里没有 SHA256 pin 检查"
+[ "$(stat -c %a "$VERIFY_DIR/rootfs/etc/open-xiaoai/init.sh")" = "755" ] \
+    || fail "验证失败：init 包装器权限不是 0755"
+# .bak 里是原厂内容（不含补丁标记），否则备份无意义。
+# 注意：这里必须用 if 而不用 `grep … && fail`——grep 找不到时返回 1，
+# set -e 会直接退出，连 fail() 的报错都出不来（P2-31 同款坑）。
+if grep -q 'slave.pcm Capture' "$VERIFY_DIR/rootfs/etc/asound.conf.bak"; then
+    fail "验证失败：asound.conf.bak 里有补丁内容（备份应是原厂原文）"
+fi
+if grep -q 'slave.pcm Capture' "$VERIFY_DIR/rootfs/etc/asound.conf.dts.bak"; then
+    fail "验证失败：asound.conf.dts.bak 里有补丁内容（备份应是原厂原文）"
+fi
 if [ "$MODEL" = "lx06" ]; then
     if grep -q 'hw:0,3' "$VERIFY_DIR/rootfs/usr/lib/libxaudio_engine.so" 2>/dev/null; then
         fail "验证失败：libxaudio_engine.so 里仍有 hw:0,3"
