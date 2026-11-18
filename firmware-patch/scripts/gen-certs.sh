@@ -8,6 +8,11 @@
 #   client.crt / client.key 共享客户端证书（CN open-xiaoai-client，
 #                          clientAuth；两台音箱共用，要每台独立证书时
 #                          改 CN 重签，或调 tlscert.IssueClientCert）
+#   F-8：共用身份的含义——两台音箱是同一个 mTLS 身份，吊销/轮换没有
+#   隔离：一台的证书被吊销（或 --force 重建）会同时影响另一台；Hub
+#   也无法只禁其中一台。家用 + 局域网前提下接受这一点；如需按设备
+#   吊销，再按上面说的办法签发独立 client 证书（需同时改 patch.sh 的
+#   证书选取与 Hub 的客户端身份映射，并重刷两台镜像，属较大改动）。
 #   fingerprints.txt       各证书的 SHA-256 指纹（公开信息，可贴进
 #                          client.toml 的 hub_ca_fingerprint）
 #

@@ -115,7 +115,10 @@ if [ -n "$EXPECT_INODES" ]; then
     EXPECT_FOUND="$((EXPECT_INODES - DEV_FAILS))"
     [ "$FOUND" -eq "$EXPECT_FOUND" ] || { echo "解包失败：解出 $FOUND，期望 $EXPECT_FOUND（inodes $EXPECT_INODES − 建设备失败 $DEV_FAILS）" >&2; exit 1; }
 else
-    echo "警告：读不到 unsquashfs -s 的 inode 数，跳过数量硬门" >&2
+    # F-6：读不到 inode 数即失败（fail-closed，与 patch.sh §6 同款）——
+    # 只警告跳过会让数量硬门在 unsquashfs -s 输出格式变化时静默失效。
+    echo "解包失败：读不到 unsquashfs -s 的 inode 数，数量硬门无法校验" >&2
+    exit 1
 fi
 if grep -iE 'error|failed' "$UNSQUASH_LOG" \
     | grep -vE 'failed to create (character|block) device .* Operation not permitted|error reading stored compressor options' \
