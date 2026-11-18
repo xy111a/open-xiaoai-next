@@ -259,10 +259,15 @@ func (h *hubHandler) OnAudioFrame(deviceID string, data []byte) {
 // 边车 rms 是线性值（0..1，如 0.42）；仲裁只比大小，换算取 20*log10(rms)，
 // rms<=0 记 -100dB。timestamp_ms 只用于记边车延迟日志，
 // 仲裁窗口以 Hub 收到事件的时间为准（边车与 Hub 时钟可能不同步）。
+// S-1：仲裁优先用边车上报的 rms_peak（1s 窗口峰值，不被 trailing 静音
+// 稀释）；旧边车不发 rms_peak 时回退 rms 并记一条 warn。
 func (h *hubHandler) OnKWSWake(ev kws.WakeEvent) {
+	if ev.RMSPeak <= 0 {
+		log.Printf("kws: 设备 %s 唤醒 %q 缺少 rms_peak，回退用 rms %v 仲裁", ev.DeviceID, ev.Keyword, ev.RMS)
+	}
 	rmsdB := -100.0
-	if ev.RMS > 0 {
-		rmsdB = 20 * math.Log10(ev.RMS)
+	if rms := ev.EffectiveRMS(); rms > 0 {
+		rmsdB = 20 * math.Log10(rms)
 	}
 	if ev.TimestampMs > 0 {
 		if lag := time.Now().UnixMilli() - ev.TimestampMs; lag >= 0 && lag < 60000 {

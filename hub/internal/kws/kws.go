@@ -57,11 +57,23 @@ const logDropEvery = 100
 
 // WakeEvent 是边车上报的一次唤醒命中。
 type WakeEvent struct {
-	DeviceID    string
-	Keyword     string
-	RMS         float64 // 线性 RMS（0..1 量级，如 0.42）；仲裁换算 dB 由调用方做
+	DeviceID string
+	Keyword  string
+	RMS      float64 // 线性 RMS（0..1 量级，如 0.42）；仲裁换算 dB 由调用方做
+	RMSPeak  float64 // 同一 1s 窗口内单帧 RMS 的峰值（S-1，边车发 rms_peak）；
+	// rms 是均值，会被检出后的 trailing 静音稀释，仲裁应优先用峰值。
 	TimestampMs int64
 	ReceivedAt  time.Time
+}
+
+// EffectiveRMS 是仲裁用的线性强度：优先用边车上报的 1s 窗口峰值
+// rms_peak（不受检出延迟导致的静音稀释影响）；旧边车不发 rms_peak
+// （<=0）时回退到均值 rms。
+func (ev WakeEvent) EffectiveRMS() float64 {
+	if ev.RMSPeak > 0 {
+		return ev.RMSPeak
+	}
+	return ev.RMS
 }
 
 // Options 是 Client 的可选项。
@@ -800,6 +812,7 @@ func (s *stream) handleMessage(data []byte) {
 			DeviceID    string  `json:"device_id"`
 			Keyword     string  `json:"keyword"`
 			RMS         float64 `json:"rms"`
+			RMSPeak     float64 `json:"rms_peak"`
 			TimestampMs int64   `json:"timestamp_ms"`
 		}
 		if err := json.Unmarshal(data, &m); err != nil {
@@ -818,6 +831,7 @@ func (s *stream) handleMessage(data []byte) {
 			DeviceID:    s.deviceID,
 			Keyword:     m.Keyword,
 			RMS:         m.RMS,
+			RMSPeak:     m.RMSPeak,
 			TimestampMs: m.TimestampMs,
 			ReceivedAt:  time.Now(),
 		}
