@@ -95,6 +95,20 @@
 | 重启后指纹变了 / 提醒没了 | hub-data 卷挂错位置（P1-31 复发），先查 `docker compose config \| grep -A3 hub-data` |
 | 认领房间后重启就丢 / Web 改配置报 500 | config.yaml 仍是只读挂载（P1-32 复发），先查 `docker compose config \| grep config.yaml` |
 
+## 8. S-2 冒烟：全新卷直接 `compose up`（2026-11-18 补）
+
+**状态：未在真 NAS 上验证（BLOCKED，无 NAS 实测；本机无 docker，
+只审过 Dockerfile 与 entrypoint 逻辑）。** 本节只在 NAS 上跑，
+不要在本机猜结果。目的：证明不走 `nas-install.sh` 的 chown
+one-shot、只 `compose up` 全新卷也能起来（SC-P2-12 半修的回归项）。
+
+| # | 做什么 | 预期结果 |
+|---|---|---|
+| 8.1 | 先停边车并删掉它的卷（**只删 kws-data，别用 `down -v`**，那会连 hub-data 一起删）：`docker compose stop kws-sidecar; docker compose rm -f kws-sidecar; docker volume rm open-xiaoai-next_kws-data`（卷名前缀是 compose 项目名，先 `docker volume ls \| grep kws-data` 核对） | 卷已删；`docker volume ls \| grep kws-data` 无输出 |
+| 8.2 | 不跑 `nas-install.sh`，直接：`cd $NAS_DIR/deploy && docker compose up -d kws-sidecar`，等 60 秒（首次要下载约 5.6MB 模型） | `up` 无报错；`docker compose ps kws-sidecar` 是 `Up`，不是 `Restarting` |
+| 8.3 | `docker compose logs kws-sidecar \| tail -20` 与 `curl -s -m 5 http://127.0.0.1:10400/health` | 日志出现 `KWS model ready` 与监听 `ws://127.0.0.1:10400/v1/kws`；`/health` 返回 `{"status":"ok","model_loaded":true}` |
+| 8.4 | 若 8.2/8.3 任一项不对 | 看日志里的 FATAL 行：`is not writable` 说明卷属主仍是 root——按 FATAL 里给的命令跑 chown one-shot（`docker compose run --rm --user root --no-deps --entrypoint /bin/chown kws-sidecar -R 1000:1000 /data/kws/models`）再重起；`does not exist and cannot be created` 说明卷挂载本身有问题，先查 `docker compose config \| grep -A2 kws-data`。把日志原样贴回来，不要猜着往下走 |
+
 ## 故障速查
 
 | 现象 | 先查 |
@@ -105,7 +119,7 @@
 | `curl /api/*` 返回 401 | `.env` 里 `OPEN_XIAOAI_WEB_TOKEN` 未填、太弱或与容器里的不一致：先在 NAS 上 `docker compose config \| grep WEB_TOKEN` 看传没传进去，再核对 `.env` 里的值（两个 Token 必须不同）；改完重 `up` |
 | Hub 日志一直 `Wyoming STT/TTS 连接失败` | `docker compose ps` 看 whisper/piper 是否 Up；`curl` 10300/10200 端口；首次启动等够 1 分钟（下载模型） |
 | Hub 日志 `唤醒服务暂不可用` 或 `/api/status` 里 `kws_status: down` | 先 `curl http://127.0.0.1:10400/health`：不通/503 → `docker compose logs kws-sidecar` 看模型下载是否失败（失败会明确报错退出；`kws-data` 卷文件不全时重起会重新下载）；通且 `model_loaded:true` 但 Hub 仍报不可用 → 看 Hub 日志里的边车地址是不是 `ws://127.0.0.1:10400/v1/kws`（写成容器名 `kws-sidecar` 时 host 网络解析不到，见 §1.2） |
-| `docker compose up` 时 kws-sidecar 反复重启 | `docker compose logs kws-sidecar`：模型下载失败（网络/SHA 校验）会直接退出；NAS 出网有问题时先确认能访问 `github.com`（模型在 GitHub releases 上） |
+| `docker compose up` 时 kws-sidecar 反复重启 | `docker compose logs kws-sidecar`：模型下载失败（网络/SHA 校验）会直接退出；卷目录写不进时 entrypoint 会先报可读的 `FATAL: ... is not writable`（S-2 预检，含修复命令），不要只看最后的 `cp` 报错；NAS 出网有问题时先确认能访问 `github.com`（模型在 GitHub releases 上） |
 | 10400 端口被占 | kws-sidecar 走 host 网络，10400 被占就起不来：`ss -tlnp \| grep 10400` 查占用者，先停掉再 `up` |
 | 搜不到网易云歌 / 报 301 需要登录 | Cookie 过期（约 1–2 个月），回 Hub Web 面板重新扫码（§5）；或在 NAS 上 `curl http://127.0.0.1:3000/login/status` 看登录态（3000 只绑 127.0.0.1，NAS 外打不开是正常的） |
 | 面板点生成二维码没反应 / `/api/netease/*` 返回 404 | Hub 二进制还没接网易云登录路由（融合 B 的 Hub 面工作）：先确认 Hub 是不是最新构建（`docker compose logs hub` 看启动行），再按 MUSIC_FUSION.md“待 Hub 面确认”核对 |

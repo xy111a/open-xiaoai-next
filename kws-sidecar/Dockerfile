@@ -20,6 +20,16 @@ COPY server.py entrypoint.sh ./
 COPY scripts/ ./scripts/
 RUN chmod +x entrypoint.sh scripts/download-model.sh
 
+# S-2（2026-11-18 第三轮审计 P1）：镜像内建好模型目录并改属主
+# 1000:1000——全新具名卷首次挂载时 Docker 把镜像里该目录的属主
+# copy-up 进卷，uid 1000 的 entrypoint 才能写模型；只靠 compose 的
+# user: "1000:1000" 不够（SC-P2-12 半修：旧镜像里根本没有这一步）。
+# 注意顺序：这一步必须在下面的 VOLUME 声明之前，VOLUME 之后再改
+# 目录内容会被丢弃。已存在的 root 属主旧卷不受 copy-up 影响，仍需
+# nas-install.sh §4 的 chown one-shot 迁移；entrypoint 在下载前另
+# 有目录可写预检（见 entrypoint.sh），写不进时给可读 FATAL。
+RUN mkdir -p /data/kws/models && chown 1000:1000 /data/kws/models
+
 VOLUME /data/kws/models
 EXPOSE 10400
 

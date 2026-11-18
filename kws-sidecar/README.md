@@ -95,6 +95,18 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
 卷，容器重建不重复下载。SHA256 与上游地址见脚本头注释
 （与 `client/scripts/download-kws-model.sh` 同源同 SHA）。
 
+卷属主（S-2，2026-11-18 第三轮审计 P1）：`docker-compose.yml` 让
+边车以 uid 1000 运行，但全新 `kws-data` 卷默认是 root 属主——光靠
+`user: "1000:1000"` 写不进卷。修复分两层：① `Dockerfile` 里
+`RUN mkdir -p /data/kws/models && chown 1000:1000 /data/kws/models`
+（必须在 `VOLUME` 声明之前），全新卷首次挂载时 Docker 把镜像里该
+目录的属主 copy-up 进卷，不走 `nas-install.sh` 也能直接
+`docker compose up -d kws-sidecar`（冒烟项见
+`deploy/NAS_CHECKLIST.md` §8）；② `entrypoint.sh` 在下载前预检
+卷目录可写，写不进时给可读 FATAL（含修复命令）再退出，而不是在
+`download-model.sh` 的 `cp` 上失败。已存在的 root 属主旧卷不受
+copy-up 影响，仍需 `nas-install.sh` §4 的 chown one-shot 迁移。
+
 ## 运行
 
 ```bash
