@@ -445,14 +445,44 @@ def test_patch_rejects_multiple_orig_sqfs(unpacked_work, tmp_path):
 
 # --- P0-6：flash-check.sh 干跑检查 ---
 
-def test_flash_check_ok_on_real_work():
-    """P0-6：真实 work 目录干跑检查通过（lx06 与 oh2p）。"""
+def test_flash_check_reports_stale_shipped_image():
+    """FW-P2-5：仓库 work/ 里的已交付补丁镜像（SHA 7266aba9…/139de363…）
+    是 2026-11-17 打的，早于 P1-36（inittab 串口 /bin/login）、P2-33
+    （asound .bak）、P2-34（init 包装器）——§4b 内容验证必须报出来，
+    不能让它静默通过。两个型号都一样：inittab FAIL，rc.local/.bak/
+    包装器 WARN。下一轮重编镜像后，这两个 FAIL/WARN 应消失，届时把
+    本测试改回“通过”期望并同步更新 KNOWN_PATCHED_SHA256。"""
     require_patched_work()  # work/ 是 gitignore 的本地构建产物：CI 里跳过
     for model, version in (("lx06", "1.94.13"), ("oh2p", "1.58.6")):
         r = run(["bash", str(SCRIPTS / "flash-check.sh"), model, version])
-        assert r.returncode == 0, f"flash-check.sh {model} 失败：\n{r.stdout}\n{r.stderr}"
-        assert "干跑检查通过" in r.stdout
-        assert "BLOCKED" in r.stdout
+        assert r.returncode != 0, f"flash-check.sh {model} 应报出镜像过期：\n{r.stdout}"
+        assert "inittab 串口不是 /bin/login" in r.stdout
+        assert "旧直行" in r.stdout
+        assert "asound.conf.bak" in r.stdout
+        assert "open-xiaoai/init.sh" in r.stdout
+
+
+def test_flash_check_ok_on_fresh_build(unpacked_work, tmp_path):
+    """FW-P2-5 正面控制：现版 patch.sh 刚打出的镜像，flash-check（默认）
+    通过——§4b 全部标记都在。注意：新镜像 SHA 与记录值不同（多了 .bak、
+    包装器、inittab 改动），所以这里用默认模式（SHA 只警告）；--strict
+    要等 KNOWN_PATCHED_SHA256 随重编同步更新后才通过。"""
+    work = tmp_path / "work"
+    shutil.copytree(unpacked_work / "lx06_1.94.13",
+                    work / "lx06_1.94.13", symlinks=True)
+    shutil.copyfile(unpacked_work / "lx06_1.94.13.bin",
+                    work / "lx06_1.94.13.bin")
+    env = {"PATCH_WORK_DIR": str(work),
+           "SSH_PASSWORD": "test-password-0123456789"}
+    r = run(["bash", str(SCRIPTS / "patch.sh"), "lx06", "1.94.13"],
+            env_extra=env, timeout=1200)
+    assert r.returncode == 0, f"patch.sh 失败：\n{r.stdout}\n{r.stderr}"
+    r2 = run(["bash", str(SCRIPTS / "flash-check.sh"), "lx06", "1.94.13"],
+             env_extra={"PATCH_WORK_DIR": str(work)})
+    assert r2.returncode == 0, f"flash-check.sh 新镜像失败：\n{r2.stdout}\n{r2.stderr}"
+    assert "干跑检查通过" in r2.stdout
+    assert "镜像内补丁标记核对通过" in r2.stdout
+    assert "SHA256 与记录值不同" in r2.stdout  # 新镜像 SHA 必然不同，只警告
 
 
 def test_flash_check_rejects_tampered_image(tmp_path):
@@ -483,3 +513,72 @@ def test_flash_check_fails_without_patched_image(tmp_path):
             env_extra={"PATCH_WORK_DIR": str(work)})
     assert r.returncode != 0
     assert "找不到补丁镜像" in r.stdout
+
+
+def _repack_patched_image(tmp_path, edit=None):
+    """解开真实补丁镜像，按 edit(rootfs) 改动后重新打包，返回 work 目录。
+    FW-P2-5 测试用：构造“魔数/超块正常、但内容被改过”的镜像。"""
+    require_patched_work()  # work/ 是 gitignore 的本地构建产物：CI 里跳过
+    work = tmp_path / "work"
+    src = FIRMWARE_PATCH / "work" / "lx06_1.94.13"
+    (work / "lx06_1.94.13").mkdir(parents=True)
+    for name in ("root.squashfs", "mico_version"):
+        shutil.copyfile(src / name, work / "lx06_1.94.13" / name)
+    rootfs = tmp_path / "rootfs"
+    r = run(["unsquashfs", "-d", str(rootfs), "-f", "-no-exit-code",
+             str(src / "root-patched.squashfs")], timeout=600)
+    assert r.returncode == 0, r.stderr
+    if edit is not None:
+        edit(rootfs)
+    out = work / "lx06_1.94.13" / "root-patched.squashfs"
+    r = run(["mksquashfs", str(rootfs), str(out), "-comp", "xz", "-b", "131072",
+             "-noappend", "-all-root", "-always-use-fragments",
+             "-no-xattrs", "-no-exports"], timeout=600)
+    assert r.returncode == 0, r.stderr
+    return work
+
+
+def test_flash_check_strict_fails_on_repacked_image(tmp_path):
+    """FW-P2-5：--strict 下 SHA 与记录值不同即 FAIL；默认模式只警告、不失败
+    （内容标记都在，只是重编过）。
+    注意：重打包的底子是已交付镜像（inittab 还是旧的 /bin/ash），所以
+    _harmless_edit 顺带把 inittab 改成 /bin/login，否则 §4b 会先 FAIL，
+    就测不到 SHA 这一项。"""
+    def _harmless_edit(rootfs):
+        p = rootfs / "etc/rc.local"
+        p.write_text(p.read_text() + "\n# repack test\n")
+        inittab = rootfs / "etc/inittab"
+        inittab.write_text(inittab.read_text().replace(
+            "ttyS0::askfirst:/bin/ash --login",
+            "ttyS0::askfirst:/bin/login"))
+
+    work = _repack_patched_image(tmp_path, edit=_harmless_edit)
+    r = run(["bash", str(SCRIPTS / "flash-check.sh"), "--strict",
+             "lx06", "1.94.13"], env_extra={"PATCH_WORK_DIR": str(work)})
+    assert r.returncode != 0
+    assert "SHA256 与记录值不同" in r.stdout
+    r2 = run(["bash", str(SCRIPTS / "flash-check.sh"), "lx06", "1.94.13"],
+             env_extra={"PATCH_WORK_DIR": str(work)})
+    assert r2.returncode == 0, f"默认模式应只警告：\n{r2.stdout}"
+    assert "SHA256 与记录值不同" in r2.stdout
+
+
+def test_flash_check_rejects_missing_patch_marker(tmp_path):
+    """FW-P2-5：镜像内补丁标记被抹掉时干跑检查失败（不只验 SHA/魔数）。"""
+    def _remove_dropbear_marker(rootfs):
+        p = rootfs / "etc/init.d/dropbear"
+        p.write_text(p.read_text().replace(
+            "mkdir -p /data/etc/dropbear", "# marker removed"))
+
+    work = _repack_patched_image(tmp_path, edit=_remove_dropbear_marker)
+    r = run(["bash", str(SCRIPTS / "flash-check.sh"), "lx06", "1.94.13"],
+            env_extra={"PATCH_WORK_DIR": str(work)})
+    assert r.returncode != 0
+    assert "dropbear 未打补丁" in r.stdout
+
+
+def test_flash_check_rejects_slash_version(tmp_path):
+    """P2-9：带斜杠的版本号必须拒绝。"""
+    r = run(["bash", str(SCRIPTS / "flash-check.sh"), "lx06", "1/94/13"])
+    assert r.returncode != 0
+    assert "版本号格式不对" in r.stderr

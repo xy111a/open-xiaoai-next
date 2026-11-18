@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # 刷机前干跑检查（P0-6）：只做 VM 上能做的本地校验，不碰真机。
 #
-# 用法：flash-check.sh lx06 1.94.13
+# 用法：flash-check.sh [--strict] lx06 1.94.13
 #   环境：PATCH_WORK_DIR 可覆盖 work 目录（测试用）；
 #         OTA_BIN 可直接指定官方 .bin 路径。
+#   --strict：补丁镜像 SHA256 与记录值不一致时 FAIL（默认只警告）；
+#         刷机当天用 --strict 跑一遍，防止刷错重编的镜像。
 #
 # 检查（硬检查失败即 exit 1；警告不影响退出码）：
 #   1. 官方 .bin 若找得到（OTA_BIN → work/<型号>_<版本>.bin →
@@ -12,14 +14,19 @@
 #   3. mico_version 若在，须含型号与版本
 #   4. 补丁镜像 root-patched.squashfs 必须存在、< 40MB、squashfs 魔数
 #      hsq s、unsquashfs -s 可解析（无 unsquashfs 时只警告）
+#   4b. 解开补丁镜像核对补丁标记（FW-P2-5）：dropbear / inittab / shadow /
+#       PAM / asound / OTA 三处 / rc.local / libxaudio；缺失即 FAIL
+#       （.bak 与 init 包装器是 P2-33/P2-34 新加的，旧版镜像里没有，缺失只警告）
 #   5. 打印补丁镜像 SHA256：与 FLASH_RUNBOOK.md 记录的 2026-11-17 实测值
-#      一致则提示一致；不一致只警告（镜像可能已重编），请核对重编来源
+#      一致则提示一致；不一致默认只警告（镜像可能已重编），--strict 则失败
 # 设备侧检查（读 boot_part、/proc/mtd、刷后校验）无法在 VM 上跑，
 # 统一列在最后的 BLOCKED 清单里，按 FLASH_RUNBOOK.md 在真机上执行。
 set -uo pipefail
 
-MODEL_RAW="${1:?用法: flash-check.sh lx06 1.94.13}"
-VERSION="${2:?用法: flash-check.sh lx06 1.94.13}"
+STRICT=0
+if [ "${1:-}" = "--strict" ]; then STRICT=1; shift; fi
+MODEL_RAW="${1:?用法: flash-check.sh [--strict] lx06 1.94.13}"
+VERSION="${2:?用法: flash-check.sh [--strict] lx06 1.94.13}"
 MODEL="$(printf '%s' "$MODEL_RAW" | tr 'A-Z' 'a-z')"
 MODEL_UPPER="$(printf '%s' "$MODEL" | tr 'a-z' 'A-Z')"
 
@@ -27,10 +34,11 @@ case "$MODEL" in
     lx06|oh2p) ;;
     *) echo "未知型号：$MODEL_RAW（只支持 lx06 / oh2p）" >&2; exit 1 ;;
 esac
-case "$VERSION" in
-    [0-9]*.[0-9]*.[0-9]*) ;;
-    *) echo "版本号格式不对：$VERSION（应为 x.y.z，如 1.94.13）" >&2; exit 1 ;;
-esac
+# P2-9：版本号必须严格是 x.y.z——case 的 `.` 是通配符，"1/94/13" 也能
+# 通过，拼进路径就是穿越；用正则锚定首尾（与 patch.sh / unpack.sh 同款）。
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "版本号格式不对：$VERSION（应为 x.y.z，如 1.94.13）" >&2; exit 1
+fi
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="${PATCH_WORK_DIR:-$HERE/work}"
@@ -113,6 +121,10 @@ else
     else
         bad "补丁镜像大小 $SIZE 不在 (0, 40MB) 内"
     fi
+    # P2-30：38MB 预警线（上限 95%），与 patch.sh §5 同值。
+    if [ "$SIZE" -ge $((38 * 1024 * 1024)) ]; then
+        warn "补丁镜像 $SIZE 字节已超 38MB 预警线（上限 95%）"
+    fi
     MAGIC="$(head -c 4 "$PATCHED" | od -A n -t x1 | tr -d ' \n')"
     if [ "$MAGIC" = "68737173" ]; then
         ok "squashfs 魔数 hsq s"
@@ -133,10 +145,65 @@ else
     if [ -n "$KNOWN_PATCHED_SHA256" ]; then
         if [ "$PSHA" = "$KNOWN_PATCHED_SHA256" ]; then
             ok "补丁镜像 SHA256 与 2026-11-17 实测值一致"
+        elif [ "$STRICT" -eq 1 ]; then
+            bad "补丁镜像 SHA256 与记录值不同（--strict：拒绝继续，请核对重编来源）"
         else
             warn "补丁镜像 SHA256 与记录值不同（镜像可能已重编）；请核对重编来源与 FLASH_RUNBOOK.md §1 的记录，再决定是否刷"
         fi
     fi
+
+    # --- 4b. 镜像内补丁内容验证（FW-P2-5）：解开核对补丁标记 ---
+    # .bak 与 init 包装器是 P2-33/P2-34 新加的：旧版 patch_firmware.py
+    # 打出的镜像里没有，缺失只警告（下次重编会带上）；其余标记缺失即 FAIL。
+    VDIR="$(mktemp -d)"
+    FAIL_BEFORE_4B="$FAIL"
+    if unsquashfs -d "$VDIR/rootfs" -f -no-exit-code "$PATCHED" >/dev/null 2>&1; then
+        RF="$VDIR/rootfs"
+        grep -q 'mkdir -p /data/etc/dropbear' "$RF/etc/init.d/dropbear" \
+            || bad "镜像内补丁缺失：dropbear 未打补丁"
+        grep -q 'ttyS0::askfirst:/bin/login' "$RF/etc/inittab" \
+            || bad "镜像内补丁缺失：inittab 串口不是 /bin/login"
+        grep -q '\$6\$' "$RF/etc/shadow" \
+            || bad "镜像内补丁缺失：shadow 的 root 密码不是 \$6\$"
+        grep -q '^# auth sufficient libmico-pam.so' "$RF/etc/pam.d/common-auth" \
+            || bad "镜像内补丁缺失：PAM 的 libmico 行未被注释"
+        grep -q 'slave.pcm Capture' "$RF/etc/asound.conf" \
+            || bad "镜像内补丁缺失：asound.conf 未打补丁"
+        for func in download_upgrade upgrade; do
+            grep -A1 "^$func() {$" "$RF/bin/ota" | grep -q 'return 1' \
+                || bad "镜像内补丁缺失：bin/ota 的 $func() 未禁用"
+        done
+        grep -A1 '^upgrade_param_check() {$' "$RF/bin/flash.sh" | grep -q 'return 1' \
+            || bad "镜像内补丁缺失：bin/flash.sh 的 upgrade_param_check() 未禁用"
+        grep -q 'echo "download_fail"' "$RF/etc/init.d/wireless" \
+            || bad "镜像内补丁缺失：wireless ota() 未禁用"
+        # rc.local：包装器行或旧直行均接受（旧版补丁产物）。
+        if grep -q '^\[ -x /etc/open-xiaoai/init.sh \]' "$RF/etc/rc.local"; then
+            ok "rc.local 走 init 包装器（P2-34）"
+        elif grep -q 'sh /data/init.sh' "$RF/etc/rc.local"; then
+            warn "rc.local 仍是旧直行 /data/init.sh（旧版补丁产物；下次重编会换成包装器）"
+        else
+            bad "镜像内补丁缺失：rc.local 里既无包装器行也无旧直行"
+        fi
+        for rel in etc/asound.conf.bak etc/asound.conf.dts.bak; do
+            [ -f "$RF/$rel" ] || warn "镜像里缺 $rel（旧版补丁产物；下次重编会带上）"
+        done
+        if [ -f "$RF/etc/open-xiaoai/init.sh" ]; then
+            grep -q 'sha256sum' "$RF/etc/open-xiaoai/init.sh" \
+                || warn "init 包装器里没有 sha256sum 校验"
+        else
+            warn "镜像里缺 etc/open-xiaoai/init.sh（旧版补丁产物；下次重编会带上）"
+        fi
+        if [ "$MODEL" = "lx06" ]; then
+            if grep -q 'hw:0,3' "$RF/usr/lib/libxaudio_engine.so" 2>/dev/null; then
+                bad "镜像内补丁缺失：libxaudio_engine.so 里仍有 hw:0,3"
+            fi
+        fi
+        [ "$FAIL" -eq "$FAIL_BEFORE_4B" ] && ok "镜像内补丁标记核对通过"
+    else
+        bad "解开补丁镜像失败，无法验证镜像内补丁内容"
+    fi
+    rm -rf "$VDIR"
 fi
 
 echo
