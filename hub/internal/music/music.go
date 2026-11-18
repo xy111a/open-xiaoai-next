@@ -1,5 +1,6 @@
 // Package music 是音乐平面：Snapcast 融进 Hub（分组 + 延迟校准），
-// 音源唯一指定网易云：Music Assistant + NeteaseCloudMusicApi。
+// 音源唯一指定网易云：Hub 直连 NeteaseCloudMusicApi，播到 MPD →
+// snapfifo → Snapcast（融合 B，Music Assistant 已移除）。
 //
 // 与语音平面分离：语音走 Opus 16kHz 低延迟；音乐走 Snapcast 48kHz 同步。
 // 语音点歌（“播放周杰伦的青花瓷”）3s 内出声；歌词/暂停/下一首可用。
@@ -8,18 +9,12 @@
 // （楼上组 / 楼下组 / 全屋组），验收时测“同一台进两个组”。
 // 延迟校准：起始值客厅 0ms / 卧室 +15ms，实测后自动校准，目标延迟差 ≤10ms。
 //
-// Music Assistant API（已核实，music-assistant.io/api 与实测记录）：
-//
-//	HTTP POST http://<host>:8095/api，Bearer Token，body {"command": "...", "message_id": N, ...}
-//	命令：players/all、player_queues/play_media（queue_id + media[uri] + option）、
-//	player_queues/play、player_queues/pause、music/track_by_name。
-//	注意：MA 默认端口是 8095；WS 版 auth 是 in-band，不走 Authorization 头。
-//	本客户端走 HTTP 版（无状态，好测），queue_id 未分组时等于 player_id。
+// 网易云登录：扫码登录走 netease-api 的 /login/qr/*（见 netease_auth.go），
+// cookie 只存在 Hub 数据卷，不进仓库/配置/日志；VIP 歌取地址时带上它。
 package music
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -27,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -82,7 +78,7 @@ const maxSnapLineBytes = 64 << 10
 // 超过即报错，避免异常服务端用通知流把调用拖死。
 const maxSnapNotifications = 10
 
-// maxUpstreamBody 是 MA/网易云上游响应体的读取上限（P1-6/P2-7）：
+// maxUpstreamBody 是网易云上游响应体的读取上限（P1-6/P2-7）：
 // 超过即截断，错误信息里只拼截断后的摘要，永不全文回显。
 const maxUpstreamBody = 1 << 20
 
@@ -212,6 +208,10 @@ type NeteaseSong struct {
 type NeteaseClient struct {
 	baseURL string
 	http    *http.Client
+	// cookie 是扫码登录后的网易云 Cookie（netease_auth.go 管存取）：
+	// VIP 歌取地址时带上；为空表示未登录，只能放免费歌。
+	cookieMu sync.RWMutex
+	cookie   string
 }
 
 // NewNetease 新建客户端。
@@ -219,14 +219,32 @@ func NewNetease(baseURL string) *NeteaseClient {
 	return &NeteaseClient{baseURL: strings.TrimSuffix(baseURL, "/"), http: &http.Client{Timeout: 15 * time.Second}}
 }
 
-// Search 搜歌（type=1 单曲），返回前 limit 首。
-func (c *NeteaseClient) Search(ctx context.Context, keywords string, limit int) ([]NeteaseSong, error) {
-	u := fmt.Sprintf("%s/search?keywords=%s&type=1&limit=%d", c.baseURL, url.QueryEscape(keywords), limit)
+// SetCookie 设置登录 Cookie（空字符串表示清除，登出时用）。
+func (c *NeteaseClient) SetCookie(cookie string) {
+	c.cookieMu.Lock()
+	defer c.cookieMu.Unlock()
+	c.cookie = cookie
+}
+
+// get 发一个带登录 Cookie（有的话）的 GET 请求。
+func (c *NeteaseClient) get(ctx context.Context, u string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.http.Do(req)
+	c.cookieMu.RLock()
+	cookie := c.cookie
+	c.cookieMu.RUnlock()
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	return c.http.Do(req)
+}
+
+// Search 搜歌（type=1 单曲），返回前 limit 首。
+func (c *NeteaseClient) Search(ctx context.Context, keywords string, limit int) ([]NeteaseSong, error) {
+	u := fmt.Sprintf("%s/search?keywords=%s&type=1&limit=%d", c.baseURL, url.QueryEscape(keywords), limit)
+	resp, err := c.get(ctx, u)
 	if err != nil {
 		return nil, err
 	}
@@ -262,11 +280,7 @@ func (c *NeteaseClient) Search(ctx context.Context, keywords string, limit int) 
 // SongURL 取一首歌的可播地址（level=standard；VIP 歌需 VIP 账号 Cookie）。
 func (c *NeteaseClient) SongURL(ctx context.Context, id int64) (string, error) {
 	u := fmt.Sprintf("%s/song/url/v1?id=%d&level=standard", c.baseURL, id)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := c.http.Do(req)
+	resp, err := c.get(ctx, u)
 	if err != nil {
 		return "", err
 	}
@@ -288,14 +302,15 @@ func (c *NeteaseClient) SongURL(ctx context.Context, id int64) (string, error) {
 	return out.Data[0].URL, nil
 }
 
+// cappedBodyDecoder 限长解 JSON（网易云上游响应体上限，P2-7 顺带）。
+func cappedBodyDecoder(resp *http.Response) *json.Decoder {
+	return json.NewDecoder(io.LimitReader(resp.Body, maxUpstreamBody))
+}
+
 // Lyric 取歌词。
 func (c *NeteaseClient) Lyric(ctx context.Context, id int64) (string, error) {
 	u := fmt.Sprintf("%s/lyric?id=%d", c.baseURL, id)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := c.http.Do(req)
+	resp, err := c.get(ctx, u)
 	if err != nil {
 		return "", err
 	}
@@ -312,153 +327,6 @@ func (c *NeteaseClient) Lyric(ctx context.Context, id int64) (string, error) {
 		return "", err
 	}
 	return out.Lrc.Lyric, nil
-}
-
-// ==================== Music Assistant HTTP API ====================
-
-// MAClient 是 Music Assistant 的 HTTP 客户端（POST /api，Bearer Token）。
-type MAClient struct {
-	baseURL string
-	token   string
-	http    *http.Client
-	seq     int
-	mu      sync.Mutex
-}
-
-// NewMA 新建客户端。token 为空表示无认证（局域网默认）。
-func NewMA(baseURL, token string) *MAClient {
-	return &MAClient{baseURL: strings.TrimSuffix(baseURL, "/"), token: token, http: &http.Client{Timeout: 15 * time.Second}}
-}
-
-func (c *MAClient) command(ctx context.Context, command string, args map[string]any) (json.RawMessage, error) {
-	c.mu.Lock()
-	c.seq++
-	id := c.seq
-	c.mu.Unlock()
-	body := map[string]any{"command": command, "message_id": id}
-	for k, v := range args {
-		body[k] = v
-	}
-	b, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api", bytes.NewReader(b))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	// P1-6/P2-7：上游响应体限长读取，错误信息里只拼截断后的摘要，
-	// 永不把上游响应全文拼进错误（旧代码 io.ReadAll 无上限 + 全文回显）。
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamBody))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("ma: %s 返回 %d: %s", command, resp.StatusCode, truncateForError(string(raw), 512))
-	}
-	var out struct {
-		MessageID int             `json:"message_id"`
-		Result    json.RawMessage `json:"result"`
-		Error     *struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error,omitempty"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, err
-	}
-	if out.Error != nil {
-		return nil, fmt.Errorf("ma: %s: %s", out.Error.Code, out.Error.Message)
-	}
-	return out.Result, nil
-}
-
-// truncateForError 把上游错误摘要截到 n 字节（P1-6：错误里不回显全文）。
-func truncateForError(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if len(s) > n {
-		return s[:n] + "…（已截断）"
-	}
-	return s
-}
-
-// cappedBodyDecoder 限长解 JSON（网易云上游响应体上限，P2-7 顺带）。
-func cappedBodyDecoder(resp *http.Response) *json.Decoder {
-	return json.NewDecoder(io.LimitReader(resp.Body, maxUpstreamBody))
-}
-
-type Player struct {
-	PlayerID string `json:"player_id"`
-	Name     string `json:"name"`
-}
-
-// Players 取全部播放器。
-func (c *MAClient) Players(ctx context.Context) ([]Player, error) {
-	raw, err := c.command(ctx, "players/all", nil)
-	if err != nil {
-		return nil, err
-	}
-	var players []Player
-	if err := json.Unmarshal(raw, &players); err != nil {
-		return nil, err
-	}
-	return players, nil
-}
-
-// PlayMedia 在指定 queue 上播媒体（media 是 library:// URI 列表）。
-// option: replace（替换队列）/ play / next / add。
-func (c *MAClient) PlayMedia(ctx context.Context, queueID string, media []string, option string) error {
-	_, err := c.command(ctx, "player_queues/play_media", map[string]any{
-		"queue_id": queueID, "media": media, "option": option,
-	})
-	return err
-}
-
-// PlayTrackByName 按歌名找歌并播（先 music/track_by_name 拿 URI，再 play_media）。
-func (c *MAClient) PlayTrackByName(ctx context.Context, queueID, track, artist string) error {
-	raw, err := c.command(ctx, "music/track_by_name", map[string]any{
-		"track": track, "artist": artist,
-	})
-	if err != nil {
-		return err
-	}
-	var item struct {
-		URI string `json:"uri"`
-	}
-	if err := json.Unmarshal(raw, &item); err != nil {
-		return err
-	}
-	if item.URI == "" {
-		return fmt.Errorf("ma: 找不到歌曲 %s %s", track, artist)
-	}
-	return c.PlayMedia(ctx, queueID, []string{item.URI}, "replace")
-}
-
-// QueuePlay / QueuePause / QueueNext 控制队列。
-func (c *MAClient) QueuePlay(ctx context.Context, queueID string) error {
-	_, err := c.command(ctx, "player_queues/play", map[string]any{"queue_id": queueID})
-	return err
-}
-
-// QueuePause 暂停队列。
-func (c *MAClient) QueuePause(ctx context.Context, queueID string) error {
-	_, err := c.command(ctx, "player_queues/pause", map[string]any{"queue_id": queueID})
-	return err
-}
-
-// QueueNext 下一首。
-func (c *MAClient) QueueNext(ctx context.Context, queueID string) error {
-	_, err := c.command(ctx, "player_queues/next", map[string]any{"queue_id": queueID})
-	return err
 }
 
 // ==================== MPD ====================
@@ -502,24 +370,34 @@ func (c *MPDClient) Close() error {
 }
 
 func (c *MPDClient) cmd(format string, args ...any) error {
+	_, err := c.query(format, args...)
+	return err
+}
+
+// query 发一条 MPD 命令，返回 OK 之前的所有响应行（ACK 即报错）。
+// cmd() 是它的丢弃响应版；status/currentsong/playlistinfo/search 用它取值。
+func (c *MPDClient) query(format string, args ...any) ([]string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err := fmt.Fprintf(c.conn, format+"\n", args...); err != nil {
-		return err
+		return nil, err
 	}
 	_ = c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var lines []string
 	for {
 		line, err := c.r.ReadString('\n')
 		if err != nil {
-			return err
+			return nil, err
 		}
+		line = strings.TrimRight(line, "\r\n")
 		if strings.HasPrefix(line, "OK") {
-			return nil
+			return lines, nil
 		}
 		if strings.HasPrefix(line, "ACK") {
-			return fmt.Errorf("mpd: %s", strings.TrimSpace(line))
+			return nil, fmt.Errorf("mpd: %s", line)
 		}
+		lines = append(lines, line)
 	}
 }
 
@@ -544,9 +422,15 @@ func validateMPDURL(url string) error {
 	if url == "" {
 		return fmt.Errorf("mpd: URL 为空")
 	}
-	for _, r := range url {
+	return validateMPDArg(url)
+}
+
+// validateMPDArg 拒绝含换行/控制字符的 MPD 参数（URL 或本地文件路径共用）：
+// MPD 是行协议，参数里的换行会注入任意命令。
+func validateMPDArg(s string) error {
+	for _, r := range s {
 		if r == '\r' || r == '\n' || r < 0x20 || r == 0x7f {
-			return fmt.Errorf("mpd: URL 含非法控制字符 %q", r)
+			return fmt.Errorf("mpd: 参数含非法控制字符 %q", r)
 		}
 	}
 	return nil
@@ -573,4 +457,204 @@ func (c *MPDClient) Next() error {
 // Stop 停止。
 func (c *MPDClient) Stop() error {
 	return c.cmd("stop")
+}
+
+// Play 从当前曲目开始播放（暂停后继续也可用它；明确“继续”语义时用 Resume）。
+func (c *MPDClient) Play() error {
+	return c.cmd("play")
+}
+
+// Resume 继续播放（pause 0；暂停后恢复用它，不是从头播）。
+func (c *MPDClient) Resume() error {
+	return c.Pause(false)
+}
+
+// Previous 上一首。
+func (c *MPDClient) Previous() error {
+	return c.cmd("previous")
+}
+
+// MPDStatus 是 MPD 的播放状态（status 命令）。
+type MPDStatus struct {
+	State    string  `json:"state"`    // play / pause / stop
+	Song     int     `json:"song"`     // 当前曲在队列里的位置，无曲时 -1
+	SongID   int     `json:"songid"`   // 当前曲 ID，无曲时 -1
+	Elapsed  float64 `json:"elapsed"`  // 已播秒数
+	Duration float64 `json:"duration"` // 总时长秒数
+	Volume   int     `json:"volume"`   // 0–100，未知时 -1
+	Repeat   bool    `json:"repeat"`
+	Random   bool    `json:"random"`
+}
+
+// MPDSong 是队列里的一首歌（currentsong / playlistinfo 的一项）。
+type MPDSong struct {
+	ID     int    `json:"id"`
+	Pos    int    `json:"pos"`
+	File   string `json:"file"`
+	Title  string `json:"title"`
+	Artist string `json:"artist"`
+	Name   string `json:"name"`
+}
+
+// Status 取播放状态。
+func (c *MPDClient) Status() (MPDStatus, error) {
+	lines, err := c.query("status")
+	if err != nil {
+		return MPDStatus{}, err
+	}
+	st := MPDStatus{Song: -1, SongID: -1, Volume: -1}
+	kv := parseMPDKV(lines)
+	st.State = kv["state"]
+	if v, ok := kv["song"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			st.Song = n
+		}
+	}
+	if v, ok := kv["songid"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			st.SongID = n
+		}
+	}
+	if v, ok := kv["elapsed"]; ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			st.Elapsed = f
+		}
+	}
+	if v, ok := kv["duration"]; ok {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			st.Duration = f
+		}
+	}
+	if v, ok := kv["volume"]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			st.Volume = n
+		}
+	}
+	st.Repeat = kv["repeat"] == "1"
+	st.Random = kv["random"] == "1"
+	return st, nil
+}
+
+// CurrentSong 取当前曲目（没在放时 File 为空）。
+func (c *MPDClient) CurrentSong() (MPDSong, error) {
+	lines, err := c.query("currentsong")
+	if err != nil {
+		return MPDSong{}, err
+	}
+	songs := parseMPDSongs(lines)
+	if len(songs) == 0 {
+		return MPDSong{}, nil
+	}
+	return songs[0], nil
+}
+
+// Queue 取当前队列（playlistinfo）。
+func (c *MPDClient) Queue() ([]MPDSong, error) {
+	lines, err := c.query("playlistinfo")
+	if err != nil {
+		return nil, err
+	}
+	return parseMPDSongs(lines), nil
+}
+
+// SearchFile 按文件名在 MPD 本地曲库里找歌（子串匹配），返回文件路径列表
+// （相对 MPD music 目录）。直连 URL 失败时的本地兜底用它。
+func (c *MPDClient) SearchFile(query string) ([]string, error) {
+	if err := validateMPDArg(query); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(query) == "" {
+		return nil, fmt.Errorf("mpd: 搜索词为空")
+	}
+	// MPD search 参数用双引号包起来，里面的反斜杠与双引号要转义。
+	esc := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(query)
+	lines, err := c.query(`search filename "%s"`, esc)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, l := range lines {
+		if v, ok := strings.CutPrefix(l, "file: "); ok {
+			files = append(files, v)
+		}
+	}
+	return files, nil
+}
+
+// PlayFile 清空队列、加入本地曲库文件并播放（直连失败时的本地兜底）。
+func (c *MPDClient) PlayFile(file string) error {
+	if file == "" {
+		return fmt.Errorf("mpd: 文件路径为空")
+	}
+	if err := validateMPDArg(file); err != nil {
+		return err
+	}
+	if err := c.cmd("clear"); err != nil {
+		return err
+	}
+	if err := c.cmd("add %s", file); err != nil {
+		return err
+	}
+	return c.cmd("play")
+}
+
+// parseMPDKV 把 "key: value" 行解析成 map（单块响应，如 status）。
+func parseMPDKV(lines []string) map[string]string {
+	kv := make(map[string]string, len(lines))
+	for _, l := range lines {
+		if k, v, ok := strings.Cut(l, ": "); ok {
+			kv[k] = v
+		}
+	}
+	return kv
+}
+
+// parseMPDSongs 把 currentsong / playlistinfo 的响应解析成歌列表：
+// 每首歌以 "file: ..." 开头，后面跟 Title/Artist/Name/Id/Pos 等行。
+func parseMPDSongs(lines []string) []MPDSong {
+	var songs []MPDSong
+	var cur *MPDSong
+	flush := func() {
+		if cur != nil {
+			songs = append(songs, *cur)
+			cur = nil
+		}
+	}
+	for _, l := range lines {
+		k, v, ok := strings.Cut(l, ": ")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "file":
+			flush()
+			cur = &MPDSong{File: v}
+		case "Title":
+			if cur != nil {
+				cur.Title = v
+			}
+		case "Artist":
+			if cur != nil {
+				cur.Artist = v
+			}
+		case "Name":
+			if cur != nil {
+				cur.Name = v
+			}
+		case "Id":
+			if cur != nil {
+				if n, err := strconv.Atoi(v); err == nil {
+					cur.ID = n
+				}
+			}
+		case "Pos":
+			if cur != nil {
+				if n, err := strconv.Atoi(v); err == nil {
+					cur.Pos = n
+				}
+			}
+		}
+	}
+	flush()
+	return songs
 }

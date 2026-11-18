@@ -52,10 +52,23 @@ func startFakeMPD(t *testing.T) *fakeMPD {
 					if err != nil {
 						return
 					}
+					cmd := strings.TrimSpace(line)
 					f.mu.Lock()
-					f.cmds = append(f.cmds, strings.TrimSpace(line))
+					f.cmds = append(f.cmds, cmd)
 					f.mu.Unlock()
-					_, _ = c.Write([]byte("OK\n"))
+					// 查询类命令回 canned 数据行再回 OK；其余命令只回 OK。
+					switch {
+					case cmd == "status":
+						_, _ = c.Write([]byte("volume: 80\nrepeat: 0\nrandom: 0\nstate: play\nsong: 0\nsongid: 5\nelapsed: 12.5\nduration: 240.0\nOK\n"))
+					case cmd == "currentsong":
+						_, _ = c.Write([]byte("file: http://music.example.com/12345.mp3\nTitle: 青花瓷\nArtist: 周杰伦\nName: 青花瓷\nId: 5\nPos: 0\nOK\n"))
+					case cmd == "playlistinfo":
+						_, _ = c.Write([]byte("file: http://music.example.com/12345.mp3\nTitle: 青花瓷\nArtist: 周杰伦\nId: 5\nPos: 0\nfile: 青花瓷.mp3\nTitle: 青花瓷\nArtist: 周杰伦\nId: 6\nPos: 1\nOK\n"))
+					case strings.HasPrefix(cmd, "search "):
+						_, _ = c.Write([]byte("file: 青花瓷.mp3\nOK\n"))
+					default:
+						_, _ = c.Write([]byte("OK\n"))
+					}
 				}
 			}(conn)
 		}
@@ -426,23 +439,31 @@ func TestHomeAssistantRefusesLock(t *testing.T) {
 	}
 }
 
-func TestMusicViaMA(t *testing.T) {
+func TestMusicDirect(t *testing.T) {
 	deps, _, _, _ := testDeps(t)
-	// 假 MA：track_by_name 成功。
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// 直连主路：网易云搜歌 → SongURL → MPD.PlayURL（不再经 MA）。
+	ne := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"message_id":1,"result":{"uri":"library://track/1"}}`)
+		if strings.HasPrefix(r.URL.Path, "/search") {
+			fmt.Fprint(w, `{"code":200,"result":{"songs":[{"id":12345,"name":"青花瓷","artists":[{"name":"周杰伦"}]}]}}`)
+			return
+		}
+		fmt.Fprint(w, `{"code":200,"data":[{"id":12345,"url":"http://music.example.com/12345.mp3"}]}`)
 	}))
-	defer srv.Close()
-	deps.MA = music.NewMA(srv.URL, "")
-	deps.QueueID = "p1"
+	defer ne.Close()
+	deps.Netease = music.NewNetease(ne.URL)
+	mpdLn := startFakeMPD(t)
+	deps.MPD = mpdLn.client(t)
 	r := New(deps, nil)
 	reply, err := r.Route(context.Background(), "lx06-1", "播放青花瓷")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(reply, "正在播放青花瓷") {
-		t.Fatalf("MA 点歌回复不对: %q", reply)
+	if !strings.Contains(reply, "正在播放周杰伦的青花瓷") {
+		t.Fatalf("直连点歌回复不对: %q", reply)
+	}
+	if got := mpdLn.commands(); len(got) != 3 || got[0] != "clear" || got[1] != "add http://music.example.com/12345.mp3" || got[2] != "play" {
+		t.Fatalf("MPD 应收到 clear/add/play，实际 %v", got)
 	}
 }
 

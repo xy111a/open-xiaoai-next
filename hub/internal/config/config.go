@@ -29,7 +29,8 @@ type Config struct {
 	// Key 是 Hub 分配的设备 ID，IP 由 mDNS/ARP 扫描得到。
 	Devices map[string]Device `yaml:"devices" json:"devices"`
 
-	// MusicFolder 音乐文件夹，默认 /volume1/music；启动时自动校验，不存在再问。
+	// MusicFolder 音乐文件夹，默认 /volume1/music；不存在时只警告，
+	// 本地曲库兜底不可用（点歌仍走网易云直连，不阻塞启动）。
 	MusicFolder string `yaml:"music_folder" json:"music_folder"`
 
 	// HomeAssistant 地址，例如 ws://192.168.1.10:8123，Token 走环境变量 HASS_TOKEN。
@@ -38,7 +39,8 @@ type Config struct {
 	// Agents 可用的 Agent（OpenAI 兼容 /v1/chat/completions）。
 	Agents map[string]Agent `yaml:"agents" json:"agents"`
 
-	// Netease 网易云：Music Assistant 地址 + NeteaseCloudMusicApi 地址。
+	// Netease 网易云：NeteaseCloudMusicApi 地址（Hub 直连，不再经
+	// Music Assistant；扫码登录走 Web 面板 /api/netease/*）。
 	Netease Netease `yaml:"netease" json:"netease"`
 
 	// HAEntities 是 HA 实体别名表：{"客厅灯": "light.living_room"}。
@@ -85,8 +87,7 @@ type Agent struct {
 
 // Netease 是网易云接入参数。
 type Netease struct {
-	MusicAssistant string `yaml:"music_assistant" json:"music_assistant"` // 例如 http://music-assistant:8099
-	API            string `yaml:"api" json:"api"`                         // 例如 http://netease-api:3000
+	API string `yaml:"api" json:"api"` // 例如 http://netease-api:3000
 }
 
 // Hub 是 Hub 自身的运行参数。
@@ -106,7 +107,8 @@ type Hub struct {
 	TTSVoice string `yaml:"tts_voice" json:"tts_voice"`
 	// Snapcast 是 Snapcast JSON-RPC 地址，例如 localhost:1705。
 	Snapcast string `yaml:"snapcast" json:"snapcast"`
-	// MPD 是 MPD 地址，例如 localhost:6600（网易云 URL 直播降级路径用，P1-26）。
+	// MPD 是 MPD 地址，例如 localhost:6600（网易云直连播 URL、队列控制、
+	// 本地曲库兜底都走 MPD）。
 	MPD string `yaml:"mpd" json:"mpd"`
 	// SnapcastLatencies 是 Snapcast 延迟补偿（ms，P1-26）：key 为 Snapcast
 	// 客户端 ID，未知 ID 时也可按客户端显示名（如“客厅”）配；点歌成功后
@@ -191,9 +193,6 @@ func (c *Config) Validate() error {
 		if err := validateDownstreamURL("agents["+name+"].base_url", a.BaseURL, "http", "https"); err != nil {
 			return err
 		}
-	}
-	if err := validateDownstreamURL("netease.music_assistant", c.Netease.MusicAssistant, "http", "https"); err != nil {
-		return err
 	}
 	if err := validateDownstreamURL("netease.api", c.Netease.API, "http", "https"); err != nil {
 		return err
@@ -320,21 +319,31 @@ func validateWebListen(addr string) error {
 	return nil
 }
 
-// ValidateStartup 做启动时才跑的检查（P1-45）：music_folder 必须存在且为目录。
-// 与 Validate 分开：Web PUT 不做文件系统检查（面板环境的路径未必存在），
-// 启动时 main.go 调它，缺失即启动报错（不要等点歌时才发现没音乐）。
+// ValidateStartup 做启动时才跑的检查（融合 B：music_folder 缺失不再 Fatal，
+// 只警告——本地曲库兜底不可用，点歌仍走网易云直连；警告文本见
+// MusicFolderWarning，main.go 启动时打出来）。
+// music_folder 为空仍是配置错误（Validate 已先拦一道，这里也报错）。
 func (c *Config) ValidateStartup() error {
 	if c.MusicFolder == "" {
 		return fmt.Errorf("music_folder 为空")
 	}
+	return nil
+}
+
+// MusicFolderWarning 返回 music_folder 不可用时的警告（可用时返回 ""）：
+// 不存在或不是目录都只警告，不阻塞启动。
+func (c *Config) MusicFolderWarning() string {
+	if c.MusicFolder == "" {
+		return ""
+	}
 	fi, err := os.Stat(c.MusicFolder)
 	if err != nil {
-		return fmt.Errorf("music_folder 不存在：%q", c.MusicFolder)
+		return fmt.Sprintf("music_folder 不存在：%q，本地曲库兜底不可用，点歌只走网易云直连", c.MusicFolder)
 	}
 	if !fi.IsDir() {
-		return fmt.Errorf("music_folder 不是目录：%q", c.MusicFolder)
+		return fmt.Sprintf("music_folder 不是目录：%q，本地曲库兜底不可用，点歌只走网易云直连", c.MusicFolder)
 	}
-	return nil
+	return ""
 }
 
 // validateListenAddr 校验 listen 地址可解析为 host:port（":4399" 这种全接口形式也合法）。
@@ -411,9 +420,14 @@ func isPrivateHost(host string) bool {
 }
 
 // Load 读 config.yaml；缺失的 Hub 参数用默认值补齐。
+// 旧配置里还留着 netease.music_assistant 时明确报错（融合 B：MA 已移除），
+// 不要静默忽略——否则用户以为 MA 还在管音乐。
 func Load(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkDeprecatedMusicAssistant(b); err != nil {
 		return nil, err
 	}
 	var cfg Config
@@ -422,6 +436,24 @@ func Load(path string) (*Config, error) {
 	}
 	cfg.applyDefaults()
 	return &cfg, nil
+}
+
+// checkDeprecatedMusicAssistant 检查原始 YAML 里是否还写着
+// netease.music_assistant（Config 结构体已删该字段，普通 Unmarshal
+// 会静默丢掉，必须单独查）。
+func checkDeprecatedMusicAssistant(b []byte) error {
+	var raw map[string]any
+	if err := yaml.Unmarshal(b, &raw); err != nil {
+		return nil // 语法错误留给正式 Unmarshal 去报
+	}
+	ne, ok := raw["netease"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	if _, ok := ne["music_assistant"]; ok {
+		return fmt.Errorf("netease.music_assistant 已废弃：MA 已移除，Hub 改为直连网易云（请从 config.yaml 删除 music_assistant 这一行）")
+	}
+	return nil
 }
 
 // ApplyDefaults 补齐缺失的 Hub 参数（Web 面板 PUT 后保存前调）。

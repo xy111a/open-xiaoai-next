@@ -98,11 +98,16 @@ func TestValidateEmptyDeviceIPAllowed(t *testing.T) {
 }
 
 func TestValidateStartupMusicFolder(t *testing.T) {
+	// 融合 B：不存在的 music_folder 不再阻塞启动（只警告），本地曲库
+	// 兜底不可用，点歌仍走网易云直连。
 	dir := t.TempDir()
 	c := validP1Config()
 	c.MusicFolder = filepath.Join(dir, "music")
-	if err := c.ValidateStartup(); err == nil {
-		t.Fatal("不存在的 music_folder 启动检查应失败")
+	if err := c.ValidateStartup(); err != nil {
+		t.Fatalf("不存在的 music_folder 启动检查应通过（只警告），实际 %v", err)
+	}
+	if w := c.MusicFolderWarning(); w == "" {
+		t.Fatal("不存在的 music_folder 应有警告")
 	}
 	if err := os.Mkdir(c.MusicFolder, 0755); err != nil {
 		t.Fatal(err)
@@ -110,14 +115,20 @@ func TestValidateStartupMusicFolder(t *testing.T) {
 	if err := c.ValidateStartup(); err != nil {
 		t.Fatalf("存在的 music_folder 启动检查应通过，实际 %v", err)
 	}
-	// 是文件不是目录：失败。
+	if w := c.MusicFolderWarning(); w != "" {
+		t.Fatalf("存在的 music_folder 不应有警告，实际 %q", w)
+	}
+	// 是文件不是目录：同样只警告，不阻塞启动。
 	f := filepath.Join(dir, "notdir")
 	if err := os.WriteFile(f, []byte("x"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	c.MusicFolder = f
-	if err := c.ValidateStartup(); err == nil {
-		t.Fatal("music_folder 是文件时启动检查应失败")
+	if err := c.ValidateStartup(); err != nil {
+		t.Fatalf("music_folder 是文件时启动检查也应通过（只警告），实际 %v", err)
+	}
+	if w := c.MusicFolderWarning(); w == "" {
+		t.Fatal("music_folder 是文件时应有警告")
 	}
 }
 

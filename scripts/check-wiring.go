@@ -2,8 +2,11 @@
 //
 // 规则 1：hub/cmd/hub/main.go 里 new 出来的关键依赖，必须在 *_test.go 里有
 // 对应构造/调用断言；且 AUDIT_REPORT 要求的关键接线（MPD/Snapcast 拨号、
-// OTA ConfirmHello/Sweep、intercom Start/Sweep、QueueID 非空）必须在生产代码
+// OTA ConfirmHello/Sweep、intercom Start/Sweep）必须在生产代码
 // 里真实存在，不能只停留在包内单测。
+//
+// 2026-11-18 音乐融合 B：music.NewMA 与 router.Deps QueueID 两项随 MA 删除
+// 而摘掉（MA 已砍，QueueID 是 MA 的队列概念，直连改走 MPD 队列）。
 //
 // 用法：
 //
@@ -67,7 +70,6 @@ var table = []entry{
 	{"ha.Dial", `ha\.Dial\s*\(`, "", `Dial\s*\(`, `Dial\s*\(`, "internal/ha", "HA 连接"},
 	{"wyoming.NewDialer (STT/TTS 懒拨号)", `wyoming\.NewDialer\s*\(`, "", `NewDialer\s*\(`, `NewDialer\s*\(`, "internal/wyoming", "AUDIT P1-2/P1-27：STT/TTS 懒拨号接线（旧 wyoming.Dial 已随 P1-27 改为 NewDialer）"},
 	{"agent.New", `agent\.New\s*\(`, "", `agent\.New\s*\(`, `New\s*\(`, "internal/agent", "Agent 客户端"},
-	{"music.NewMA", `music\.NewMA\s*\(`, "", `NewMA\s*\(`, `NewMA\s*\(`, "internal/music", "Music Assistant 客户端"},
 	{"music.NewNetease", `music\.NewNetease\s*\(`, "", `NewNetease\s*\(`, `NewNetease\s*\(`, "internal/music", "网易云客户端"},
 	{"DialSnap 调用 (Snapcast)", `DialSnap\s*\(`, "internal/music", `DialSnap\s*\(`, `DialSnap\s*\(`, "internal/music", "AUDIT P1-1/P1-26：Snapcast 必须在 main/router 里拨号，不只是定义"},
 	{"DialMPD 调用 (MPD)", `DialMPD\s*\(`, "internal/music", `DialMPD\s*\(`, `DialMPD\s*\(`, "internal/music", "AUDIT P1-26：MPD 必须在 main/router 里拨号，不只是定义"},
@@ -148,12 +150,6 @@ func main() {
 		}
 	}
 
-	// QueueID 专项：main.go 的 router.Deps 里 QueueID 不许写死 ""。
-	checked++
-	if q := queueIDStatus(prodText); q != "" {
-		fail("router.Deps QueueID：%s（AUDIT：QueueID 写死 \"\" 会导致 MA 播歌永远走降级）", q)
-	}
-
 	// main.go 扫描：凡 internal 包的 New*/Dial* 调用，都要有测试覆盖。
 	n, f := scanMain(*hubDir, testFiles)
 	checked += n
@@ -165,19 +161,6 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("rule1: OK（%d 项接线检查全部通过）\n", checked)
-}
-
-// queueIDStatus 检查生产代码里的 QueueID 赋值：缺失、写死 "" 都算问题。
-func queueIDStatus(prodText string) string {
-	re := regexp.MustCompile(`QueueID:\s*("[^"]*"|[A-Za-z0-9_.()\[\]]+)`)
-	m := re.FindStringSubmatch(prodText)
-	if m == nil {
-		return "生产代码里没有给 router.Deps 设置 QueueID"
-	}
-	if m[1] == `""` {
-		return "QueueID 被写死为空字符串 \"\"，应取自配置/MA Players() 结果"
-	}
-	return ""
 }
 
 // scanMain 解析 hub/cmd/hub/main.go，收集 internal 包的 New*/Dial* 调用，

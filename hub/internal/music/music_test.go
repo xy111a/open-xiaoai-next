@@ -173,96 +173,6 @@ func TestNeteaseSearchURLLyric(t *testing.T) {
 	}
 }
 
-// ---------- Music Assistant 假 API ----------
-
-func fakeMA(t *testing.T) (*httptest.Server, *[]string) {
-	var got []string
-	var mu sync.Mutex
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api" || r.Method != http.MethodPost {
-			http.NotFound(w, r)
-			return
-		}
-		if r.Header.Get("Authorization") != "Bearer ma-token" {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		cmd, _ := body["command"].(string)
-		mu.Lock()
-		got = append(got, cmd)
-		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		switch cmd {
-		case "players/all":
-			fmt.Fprint(w, `{"message_id":1,"result":[{"player_id":"p1","name":"客厅"}]}`)
-		case "music/track_by_name":
-			fmt.Fprint(w, `{"message_id":2,"result":{"uri":"library://track/12345"}}`)
-		case "player_queues/play_media":
-			fmt.Fprint(w, `{"message_id":3,"result":{}}`)
-		case "player_queues/play", "player_queues/pause":
-			fmt.Fprint(w, `{"message_id":4,"result":{}}`)
-		default:
-			fmt.Fprint(w, `{"message_id":0,"error":{"code":"unknown","message":"no such command"}}`)
-		}
-	}))
-	return srv, &got
-}
-
-func TestMAPlayersAndPlay(t *testing.T) {
-	srv, got := fakeMA(t)
-	defer srv.Close()
-	c := NewMA(srv.URL, "ma-token")
-	ctx := context.Background()
-
-	players, err := c.Players(ctx)
-	if err != nil {
-		t.Fatalf("Players: %v", err)
-	}
-	if len(players) != 1 || players[0].PlayerID != "p1" {
-		t.Fatalf("Players 不对: %+v", players)
-	}
-	if err := c.PlayTrackByName(ctx, "p1", "青花瓷", "周杰伦"); err != nil {
-		t.Fatalf("PlayTrackByName: %v", err)
-	}
-	if err := c.QueuePlay(ctx, "p1"); err != nil {
-		t.Fatalf("QueuePlay: %v", err)
-	}
-	if err := c.QueuePause(ctx, "p1"); err != nil {
-		t.Fatalf("QueuePause: %v", err)
-	}
-	for _, cmd := range []string{"players/all", "music/track_by_name", "player_queues/play", "player_queues/pause"} {
-		found := false
-		for _, g := range *got {
-			if g == cmd {
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("MA 未收到命令 %s，实际收到 %v", cmd, *got)
-		}
-	}
-}
-
-func TestMAErrorSurfaces(t *testing.T) {
-	// 始终返回 error 的 MA：客户端应把错误透传出来，而不是吞掉。
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"message_id":1,"error":{"code":"player_not_found","message":"no such player"}}`)
-	}))
-	defer srv.Close()
-	c := NewMA(srv.URL, "ma-token")
-	if _, err := c.Players(context.Background()); err == nil {
-		t.Fatal("MA 返回 error 时 Players 应返回错误")
-	} else if !strings.Contains(err.Error(), "player_not_found") {
-		t.Fatalf("错误应透传 MA 的 code，实际: %v", err)
-	}
-}
-
 // ---------- MPD 假服务器 ----------
 
 type fakeMPD struct {
@@ -299,10 +209,23 @@ func (f *fakeMPD) handle(conn net.Conn) {
 		if err != nil {
 			return
 		}
+		cmd := strings.TrimSpace(line)
 		f.mu.Lock()
-		f.cmds = append(f.cmds, strings.TrimSpace(line))
+		f.cmds = append(f.cmds, cmd)
 		f.mu.Unlock()
-		_, _ = conn.Write([]byte("OK\n"))
+		// 查询类命令回 canned 数据行再回 OK；其余命令只回 OK。
+		switch {
+		case cmd == "status":
+			_, _ = conn.Write([]byte("volume: 80\nrepeat: 0\nrandom: 0\nstate: play\nsong: 0\nsongid: 5\nelapsed: 12.5\nduration: 240.0\nOK\n"))
+		case cmd == "currentsong":
+			_, _ = conn.Write([]byte("file: http://music.example.com/12345.mp3\nTitle: 青花瓷\nArtist: 周杰伦\nName: 青花瓷\nId: 5\nPos: 0\nOK\n"))
+		case cmd == "playlistinfo":
+			_, _ = conn.Write([]byte("file: http://music.example.com/12345.mp3\nTitle: 青花瓷\nArtist: 周杰伦\nId: 5\nPos: 0\nfile: 青花瓷.mp3\nTitle: 青花瓷\nArtist: 周杰伦\nId: 6\nPos: 1\nOK\n"))
+		case strings.HasPrefix(cmd, "search "):
+			_, _ = conn.Write([]byte("file: 青花瓷.mp3\nOK\n"))
+		default:
+			_, _ = conn.Write([]byte("OK\n"))
+		}
 	}
 }
 

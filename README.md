@@ -14,7 +14,7 @@ Agent 随便换，Home Assistant 管设备，网易云管音乐。
 |---|---|---|
 | 小爱音箱 Pro LX06（带 DTS 老批次） | 256MB | 必须拆机一次（Micro USB 调试口在主板上）；刷后 DTS 音效回不来，NAS 侧 EQ 补约 80% |
 | 小米智能音箱 Pro OH2P | 256MB | 底部 Type-C，免拆机 |
-| NAS | UGREEN DXP6800 Pro，64GB | Hub + Whisper + Piper + Snapcast + Music Assistant 的宿主 |
+| NAS | UGREEN DXP6800 Pro，64GB | Hub + Whisper + Piper + Snapcast + MPD + NeteaseCloudMusicApi 的宿主 |
 
 只支持这两款。LX05 / L15A（x509 加密分区）不碰。不带 DTS 的新款 LX06（128MB）跑不了本地唤醒词，
 本项目没有这款机器，不做精简 KWS。
@@ -25,7 +25,7 @@ Agent 随便换，Home Assistant 管设备，网易云管音乐。
 音箱 (thin client, Rust)                NAS (Hub, Go)                     服务
 ┌──────────────────────┐   wss + Opus   ┌──────────────────────┐
 │ 录音 16kHz → Opus    │ ◄────────────► │ Device Registry      │ ──► Home Assistant (8123, WebSocket)
-│ 播放 ← Opus          │   Token+mTLS   │ Arbitration (250ms)  │ ──► 网易云 (Music Assistant + NeteaseCloudMusicApi)
+│ 播放 ← Opus          │   Token+mTLS   │ Arbitration (250ms)  │ ──► 网易云 (Hub 直连 NeteaseCloudMusicApi)
 │ 本地 KWS “你好小李”  │                │ Voice Pipeline       │ ──► LLM: DeepSeek / Qwen / Ollama
 │ OTA 自更新           │                │ Music Plane (Snapcast)│ ──► Agent: Hermes / OpenClaw
 └──────────────────────┘                │ MQTT + Wyoming       │

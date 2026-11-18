@@ -2,6 +2,15 @@
 
 按时间倒序。每个决策写清“定了什么、为什么、谁定的”，改了就追加一条，不改旧条。
 
+## 2026-11-18：音乐融合 B——砍 Music Assistant，Hub 直连网易云（bai 定）
+
+- 砍掉 Music Assistant 容器（`ghcr.io/music-assistant/server`、`ma-data` 卷、8095 端口全部删除）；
+  主路改为 Hub 直连 NeteaseCloudMusicApi（`127.0.0.1:3000`）→ MPD → Snapcast，登录收进 Hub Web 面板扫码。
+- `music_folder` 从“不存在即 Fatal”改为可选本地兜底：缺了只警告，不阻塞启动。
+  本条取代 2026-11-17“房间自动发现”条里“启动时自动校验，不存在再问”的说法，旧条不改。
+- 代价：HA 里没了现成的音乐 `media_player`；语音点歌与 Hub Web 控制不受影响。
+  详见仓库根目录 `MUSIC_FUSION.md`（盘点、改动清单、迁移说明、待 Hub 面确认项）。
+
 ## 2026-11-17：方案选 B，从零重写（bai 定）
 
 - 选 B 不选 A（Fork OwnDing/coderzc 继续改）或 C（只做 Hub）。

@@ -1,4 +1,4 @@
-# open-xiaoai-next NAS 部署（部署包，2026-11-17 修订）
+# open-xiaoai-next NAS 部署（部署包，2026-11-18 修订，音乐融合 B）
 # 宿主：UGREEN DXP6800 Pro（UGOS + Docker），64GB 内存
 # 用法：cp .env.example .env，填好 NAS_IP / HASS_TOKEN / LLM 密钥 / OPEN_XIAOAI_TOKEN，
 # 再按 deploy/NAS_CHECKLIST.md 逐步操作，或跑 deploy/nas-install.sh。
@@ -9,17 +9,22 @@
 #     compose 原来没传 → 已补上；
 #  3) netease-api 原来写 binarytorch/neteasecloudmusicapi，Docker Hub 查无此仓库（404）→
 #     改为官方镜像 binaryify/netease_cloud_music_api（Docker Hub 页面已验证）。
-# 第一次 up 出错（最可能是 UGOS Docker 路径、/volume1/music 不存在、端口占用）请把报错贴回来。
+# 第一次 up 出错（最可能是 UGOS Docker 路径、端口占用）请把报错贴回来。
+# music_folder 是可选本地兜底：/volume1/music 不存在只警告，不阻塞启动。
 # 2026-11-17 晚 P1 修复（FW-P1-1 / P1-4 / P1-37 / P1-46）：
 #   - hub 传 OPEN_XIAOAI_WEB_TOKEN（Web 面板鉴权，见 .env.example）；
 #   - whisper/piper/netease 只绑 127.0.0.1（Hub 走 host 网络，本机回环可达）；
-#     MA 的 8095 仍向局域网发布（浏览器开 NAS_IP:8095 做网易云扫码登录，用户直面入口）；
 #   - mosquitto 已删：Hub 代码里没有任何 MQTT 引用，它只是预留；匿名 broker 暴露 1883
 #     不如删掉，需要时再加带密码配置的版本；
 #   - 各服务加 TZ=Asia/Shanghai 与 deploy.resources 限额（起始值，NAS 上按实测再调）；
 #   - 镜像仍用 :latest、未钉 digest：本机到 registry-1.docker.io 的 manifest 接口
 #     超时（token 接口通），无法可信解析 digest；钉死前先在能访问 Docker Hub 的
 #     机器上取各镜像 latest 的 Docker-Content-Digest 再填。
+# 2026-11-18 音乐融合 B：Music Assistant 已砍（见 MUSIC_FUSION.md）——
+#   - music-assistant 服务与 ma-data 卷全部删除，8095 端口不再发布、不再占用；
+#   - 网易云主路改为 Hub 直连 netease-api（127.0.0.1:3000）→ MPD → Snapcast，
+#     登录收进 Hub Web 面板扫码（/api/netease/*），Cookie 存 hub-data 卷；
+#   - netease-api 仍只绑 127.0.0.1（只给 Hub 用）。
 
 services:
   hub:
@@ -170,32 +175,15 @@ services:
           cpus: "0.5"
           memory: 512M
     volumes:
-      # 音乐文件夹：默认 /volume1/music；Hub 启动时自动校验，不存在再问
+      # 音乐文件夹（可选本地兜底）：默认 /volume1/music；不存在只警告，
+      # 不阻塞启动（网易云直连是主路）。缺了也不用建目录。
       - ${MUSIC_FOLDER:-/volume1/music}:/music:ro
       - snapfifo:/tmp/snapfifo
       - mpd-data:/var/lib/mpd
 
-  # 网易云：Music Assistant + NeteaseCloudMusicApi（官方镜像，见 README 镜像核实表）
-  # P1-4：MA 的 8095 仍向局域网发布——浏览器开 http://NAS_IP:8095 做网易云扫码
-  # 登录是用户直面入口，绑 127.0.0.1 会断掉扫码流程；MA 自带首次设置向导，
-  # 接受该暴露并记在这里。netease-api 只给 MA 与 Hub 用，绑 127.0.0.1。
-  music-assistant:
-    image: ghcr.io/music-assistant/server:latest
-    container_name: oxn-music-assistant
-    restart: unless-stopped
-    ports:
-      - "8095:8095"
-    volumes:
-      - ma-data:/data
-    environment:
-      - TZ=Asia/Shanghai
-      - LOG_LEVEL=INFO
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 2G
-
+  # 网易云：只留 NeteaseCloudMusicApi（官方镜像，见 README 镜像核实表）。
+  # Music Assistant 已砍（2026-11-18 融合 B）：Hub 直连本 API，
+  # 登录由 Hub Web 面板扫码完成，Cookie 存 hub-data 卷；API 本身不保存登录态。
   netease-api:
     image: binaryify/netease_cloud_music_api:latest
     container_name: oxn-netease-api
@@ -217,4 +205,3 @@ volumes:
   kws-data:
   snapfifo:
   mpd-data:
-  ma-data:

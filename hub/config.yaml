@@ -37,7 +37,8 @@ devices:
     ip: ""
     room: ""
 
-# 音乐文件夹，默认 /volume1/music；启动时自动校验，不存在再问。
+# 音乐文件夹，默认 /volume1/music；不存在时只警告，本地曲库兜底不可用
+#（点歌仍走网易云直连，不阻塞启动）。
 music_folder: /volume1/music
 
 # Home Assistant：Token 走环境变量 HASS_TOKEN，不要写进文件。
@@ -54,9 +55,9 @@ agents:
     base_url: "http://openclaw:18789/v1"
     model: "deepseek-chat"
 
-# 网易云：Music Assistant + NeteaseCloudMusicApi
+# 网易云：NeteaseCloudMusicApi 地址（Hub 直连，MA 已移除；扫码登录走
+# Web 面板 /api/netease/*，cookie 存在 hub-data/netease-cookie.json）。
 netease:
-  music_assistant: "http://music-assistant:8095"
   api: "http://netease-api:3000"
 
 # 家电实体别名表：语音只认这里配了的别名；门锁/燃气/热水器不配进来。
@@ -73,7 +74,8 @@ hub:
   tts: "localhost:10200"
   tts_voice: "zh_CN-huayan-medium"
   snapcast: "localhost:1705"
-  # MPD 地址（P1-26）：网易云 URL 直播降级路径用；MPD 跑在 host 网络，填 localhost:6600。
+  # MPD 地址：网易云直连播 URL、队列控制、本地曲库兜底都走 MPD；
+  # MPD 跑在 host 网络，填 localhost:6600。
   mpd: "localhost:6600"
   # 点歌成功后按此切 Snapcast（P1-26）：分组 ID 见 snapserver 的 Server.GetStatus，
   # 为空表示不强制切流；流名见 deploy/snapserver.conf（NAS音乐）。

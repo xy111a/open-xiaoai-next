@@ -8,7 +8,9 @@
 //     房间认领（P1-39）：“我在客厅” → 记房间；“我在这里” → 确认当前房间。
 //  3. 提醒（FR-14）：“每天 8 点提醒我吃药”“每 30 分钟提醒我喝水”“2 小时后提醒我关灯”“取消吃药提醒”
 //  4. 场景/记忆（FR-09）：“记住空调 26 度”“我回来了”（跑 HA 场景）；“你还记得什么”读记忆
-//  5. 音乐（FR-05）：“播放周杰伦的青花瓷” → 网易云搜歌 → MA 播（MA 不可用时走 MPD 直播 URL）
+//  5. 音乐（FR-05）：“播放周杰伦的青花瓷” → 网易云搜歌 → SongURL 取地址 →
+//     MPD 直播（融合 B，MA 已移除）；直连失败 → MPD 本地曲库同名歌 → 明说放不了。
+//     “暂停/继续/下一首/上一首/歌词”走 MPD 队列 + Hub 内存里的当前曲。
 //  6. 家电（FR-06）：“关客厅灯” → 查 HA 实体别名表 → 先查状态再调服务；“灯开着吗”只查不调
 //  7. 默认：Agent 对话（按唤醒词路由多 Agent，见 P1-38）
 //
@@ -23,6 +25,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -38,15 +41,15 @@ import (
 
 // Deps 是 Router 依赖的下游（都可为 nil；为 nil 的路会被跳过并在回复里说明）。
 type Deps struct {
-	HA        *ha.Client
-	MA        *music.MAClient
-	Netease   *music.NeteaseClient
-	MPD       *music.MPDClient
-	Agent     *agent.Client
-	Reminders *reminders.Store
-	Memory    *Memory
-	// QueueID 是 MA 播放队列（未分组时等于 player_id）。
-	QueueID string
+	HA      *ha.Client
+	Netease *music.NeteaseClient
+	MPD     *music.MPDClient
+	Agent   *agent.Client
+	// MusicFolder 是本地曲库目录（config.music_folder）：直连 URL 失败时
+	// 的本地兜底只在它存在且为目录时才尝试；不存在时点歌明说“本地曲库还没配好”。
+	MusicFolder string
+	Reminders   *reminders.Store
+	Memory      *Memory
 	// Snap 是 Snapcast 控制客户端（P1-26）：点歌成功后按配置调延迟/切流。
 	// 为 nil 表示 Snapcast 未接通，点歌本身不受影响。
 	Snap *music.SnapClient
@@ -88,7 +91,7 @@ type Router struct {
 	deps     Deps
 	entities map[string]string // 别名 → HA entity_id
 
-	// depsMu 保护运行时可替换的 deps 字段（MPD/Snap/QueueID）：main.go 的
+	// depsMu 保护运行时可替换的 deps 字段（MPD/Snap）：main.go 的
 	// 后台重试在下游晚到时调 SetMPD/SetSnap 补接，music() 读时持读锁。
 	depsMu sync.RWMutex
 
@@ -100,9 +103,21 @@ type Router struct {
 	// 不是拨出时限——PLAN 要求触发后 10s 内拨出/推送送达，那是 Notify 下游的事。
 	EmergencyTimeout time.Duration
 
+	// currentMu 保护内存里的当前曲（融合 B：播放状态归 Hub 管——MPD 队列
+	// 是队列真相，current 是最近一次点歌成功的曲名/歌手，供歌词与
+	// Web /api/music/status 用；不另起数据库，重启后清空）。
+	currentMu sync.Mutex
+	current   *currentTrack
+
 	// wakeWords 是设备最近一次唤醒词（P1-38：多 Agent 路由用）。
 	wakeMu    sync.Mutex
 	wakeWords map[string]string
+}
+
+// currentTrack 是 Hub 内存里的当前曲（最近一次点歌成功的结果）。
+type currentTrack struct {
+	song   music.NeteaseSong
+	source string // "netease" 直连 / "local" 本地曲库
 }
 
 // SetWakeWord 记录某设备最近一次唤醒词（P1-38：OnWake 调）。
@@ -194,23 +209,6 @@ func New(deps Deps, entities map[string]string) *Router {
 	}
 }
 
-// DefaultQueueID 查 MA 的 Players() 取默认播放器 ID 作 QueueID（P1-26，
-// main.go 启动时调）：MA 未配置、查不到播放器、一个播放器都没有都返回
-// “MA 未就绪”错误，调用方记日志后点歌走 MPD 降级路径。
-func DefaultQueueID(ctx context.Context, ma *music.MAClient) (string, error) {
-	if ma == nil {
-		return "", fmt.Errorf("MA 未就绪：Music Assistant 未配置")
-	}
-	players, err := ma.Players(ctx)
-	if err != nil {
-		return "", fmt.Errorf("MA 未就绪：查播放器失败: %w", err)
-	}
-	if len(players) == 0 {
-		return "", fmt.Errorf("MA 未就绪：没有可用播放器")
-	}
-	return players[0].PlayerID, nil
-}
-
 // SetMPD 在 MPD 晚到（后台重试连上）时补接 MPD（P1-26）。
 func (r *Router) SetMPD(c *music.MPDClient) {
 	r.depsMu.Lock()
@@ -223,14 +221,6 @@ func (r *Router) SetSnap(c *music.SnapClient) {
 	r.depsMu.Lock()
 	defer r.depsMu.Unlock()
 	r.deps.Snap = c
-}
-
-// SetQueueID 在 MA 播放器晚到时补设 QueueID（P1-26；main.go 暂未用后台
-// 重试 MA，见 P1-27，留给以后）。
-func (r *Router) SetQueueID(queueID string) {
-	r.depsMu.Lock()
-	defer r.depsMu.Unlock()
-	r.deps.QueueID = queueID
 }
 
 // applySnapcast 在点歌成功后按配置调 Snapcast（P1-26）：先按
@@ -706,9 +696,55 @@ func (r *Router) sceneMemory(ctx context.Context, deviceID, text string) (string
 
 // ---- 4. 音乐（FR-05）----
 
-var playRe = regexp.MustCompile(`^(?:播放|放一首|来一首|点一首)\s*(.+)$`)
+// 点歌与播放控制的命令词（融合 B：全部走 MPD 队列，Hub 内存记当前曲）。
+var (
+	playRe   = regexp.MustCompile(`^(?:播放|放一首|来一首|点一首)\s*(.+)$`)
+	pauseRe  = regexp.MustCompile(`^(?:暂停|暂停音乐|暂停播放)\s*$`)
+	resumeRe = regexp.MustCompile(`^(?:继续|继续播放|恢复播放)\s*$`)
+	nextRe   = regexp.MustCompile(`^下一首\s*$`)
+	prevRe   = regexp.MustCompile(`^上一首\s*$`)
+	lyricRe  = regexp.MustCompile(`^(?:歌词|显示歌词|歌词是什么)\s*$`)
+)
 
+// music 处理点歌与播放控制。点歌降级顺序（融合 B，直连主路）：
+//  1. 网易云搜歌 → 逐首取 SongURL → MPD.PlayURL（成功即播，记当前曲）；
+//  2. 直连全失败 → MPD 本地曲库同名歌（search filename → PlayFile）；
+//  3. 本地也没有 → 明确回复放不了（不静默失败、不落到 Agent 闲聊）。
+//
+// 搜歌本身失败时也先试本地兜底，再明说。
 func (r *Router) music(ctx context.Context, deviceID, text string) (string, bool, error) {
+	// 播放控制先于点歌：MPD 未接时明说，不要落到 Agent。
+	if pauseRe.MatchString(text) {
+		if err := r.MusicPause(ctx); err != nil {
+			return "音乐还没接好，暂停不了：" + err.Error(), true, nil
+		}
+		return "音乐已暂停。", true, nil
+	}
+	if resumeRe.MatchString(text) {
+		if err := r.MusicResume(ctx); err != nil {
+			return "音乐还没接好，继续不了：" + err.Error(), true, nil
+		}
+		return "继续播放。", true, nil
+	}
+	if nextRe.MatchString(text) {
+		if err := r.MusicNext(ctx); err != nil {
+			return "音乐还没接好，切不了下一首：" + err.Error(), true, nil
+		}
+		return "下一首。", true, nil
+	}
+	if prevRe.MatchString(text) {
+		if err := r.MusicPrevious(ctx); err != nil {
+			return "音乐还没接好，切不了上一首：" + err.Error(), true, nil
+		}
+		return "上一首。", true, nil
+	}
+	if lyricRe.MatchString(text) {
+		lyric, err := r.MusicLyric(ctx, 0)
+		if err != nil {
+			return err.Error(), true, nil
+		}
+		return truncateLyric(lyric), true, nil
+	}
 	m := playRe.FindStringSubmatch(text)
 	if m == nil {
 		return "", false, nil
@@ -717,61 +753,246 @@ func (r *Router) music(ctx context.Context, deviceID, text string) (string, bool
 	if query == "" {
 		return "", false, nil
 	}
-	// 快照运行时可替换的依赖（MPD/Snap/QueueID 可能被后台重试补接）。
+	// 快照运行时可替换的依赖（MPD/Snap 可能被后台重试补接）。
 	r.depsMu.RLock()
-	ma := r.deps.MA
-	queueID := r.deps.QueueID
 	netease := r.deps.Netease
 	mpd := r.deps.MPD
 	r.depsMu.RUnlock()
-	// 优先 MA（有队列/歌词/收藏）；MA 不可用时降级 MPD 直播网易云 URL。
-	if ma != nil && queueID != "" {
-		// P2-50 顺带：“周杰伦的青花瓷”拆歌手/歌名，artist 不再恒为空。
-		artist, track := splitArtistTrack(query)
-		if err := ma.PlayTrackByName(ctx, queueID, track, artist); err == nil {
-			r.applySnapcast()
-			return "正在播放" + query + "。", true, nil
-		} else {
-			// P2-11 顺带：MA 失败记一条 warn，否则降级原因无迹可查。
-			log.Printf("ma: 点歌 %q 失败，走 MPD 降级: %v", query, err)
-		}
-		// MA 失败则继续走降级路径，不直接报错。
-	}
-	// MA 已配但没有可用播放器（启动时 Players() 查不到）：MPD 也没有时
-	// 明确报“MA 未就绪”，而不是含糊的“播放器未配置”；MPD 在时走降级。
-	if ma != nil && queueID == "" && mpd == nil {
-		return "MA 未就绪（Music Assistant 没有可用播放器），请检查 MA 与播放器。", true, nil
-	}
 	if netease == nil {
 		return "音乐服务没接好（网易云未配置）。", true, nil
 	}
-	songs, err := netease.Search(ctx, query, 1)
+	if mpd == nil {
+		return "音乐服务没接好（播放器未配置）。", true, nil
+	}
+	songs, err := netease.Search(ctx, query, 3)
 	if err != nil {
-		return "", true, err
+		log.Printf("netease: 搜歌 %q 失败，先试本地兜底: %v", query, err)
+		if reply, ok := r.playLocal(ctx, query); ok {
+			return reply, true, nil
+		}
+		return "网易云搜歌失败，本地曲库里也没有这首歌，请稍后再试。", true, nil
 	}
 	if len(songs) == 0 {
+		if reply, ok := r.playLocal(ctx, query); ok {
+			return reply, true, nil
+		}
 		return "没搜到“" + query + "”，换个歌名试试？", true, nil
 	}
-	song := songs[0]
-	if mpd != nil {
+	var lastErr error
+	for _, song := range songs {
 		u, err := netease.SongURL(ctx, song.ID)
 		if err != nil {
-			return "", true, err
+			lastErr = err
+			continue
 		}
 		if err := mpd.PlayURL(u); err != nil {
-			return "", true, err
+			lastErr = err
+			continue
 		}
+		r.setCurrent(song, "netease")
 		r.applySnapcast()
-		name := song.Name
-		if song.Artist != "" {
-			name = song.Artist + "的" + song.Name
-		}
-		return "正在播放" + name + "。", true, nil
+		return "正在播放" + displaySongName(song) + "。", true, nil
 	}
-	return "音乐服务没接好（播放器未配置）。", true, nil
+	log.Printf("netease: 直连点歌 %q 失败（%v），走本地兜底", query, lastErr)
+	if reply, ok := r.playLocal(ctx, query); ok {
+		return reply, true, nil
+	}
+	if !r.localMusicAvailable() {
+		return "这首歌暂时放不了（网易云没有可播地址，本地曲库还没配好），换一首试试？", true, nil
+	}
+	return "这首歌暂时放不了（网易云没有可播地址，本地曲库里也没有），换一首试试？", true, nil
 }
 
-// splitArtistTrack 把“周杰伦的青花瓷”拆成歌手 + 歌名（P2-50 顺带）；
+// playLocal 是点歌的本地兜底：MPD 本地曲库按文件名找同名歌，找到即播。
+// 返回 (回复, 是否播出)：本地曲库没配好、搜不到、播失败都返回 false，
+// 由调用方按 localMusicAvailable() 组织明确回复。
+func (r *Router) playLocal(ctx context.Context, query string) (string, bool) {
+	if !r.localMusicAvailable() {
+		return "", false
+	}
+	r.depsMu.RLock()
+	mpd := r.deps.MPD
+	r.depsMu.RUnlock()
+	if mpd == nil {
+		return "", false
+	}
+	artist, track := splitArtistTrack(query)
+	for _, term := range []string{track, query} {
+		if strings.TrimSpace(term) == "" {
+			continue
+		}
+		files, err := mpd.SearchFile(term)
+		if err != nil {
+			log.Printf("mpd: 本地搜歌 %q 失败: %v", term, err)
+			continue
+		}
+		if len(files) == 0 {
+			continue
+		}
+		if err := mpd.PlayFile(files[0]); err != nil {
+			log.Printf("mpd: 本地播 %q 失败: %v", files[0], err)
+			return "", false
+		}
+		name := track
+		if artist != "" {
+			name = artist + "的" + track
+		}
+		r.setCurrent(music.NeteaseSong{Name: track, Artist: artist}, "local")
+		r.applySnapcast()
+		return "正在播放本地版" + name + "。", true
+	}
+	return "", false
+}
+
+// localMusicAvailable 判断本地曲库是否可用：music_folder 配了且是目录。
+func (r *Router) localMusicAvailable() bool {
+	r.depsMu.RLock()
+	folder := r.deps.MusicFolder
+	r.depsMu.RUnlock()
+	if folder == "" {
+		return false
+	}
+	fi, err := os.Stat(folder)
+	return err == nil && fi.IsDir()
+}
+
+// mpd 取当前 MPD 客户端（看门狗热换后是最新的；nil 表示未接通）。
+func (r *Router) mpd() *music.MPDClient {
+	r.depsMu.RLock()
+	defer r.depsMu.RUnlock()
+	return r.deps.MPD
+}
+
+// MusicPause 暂停播放（Web /api/music/pause 与语音“暂停”共用）。
+func (r *Router) MusicPause(_ context.Context) error {
+	mpd := r.mpd()
+	if mpd == nil {
+		return fmt.Errorf("MPD 未连接")
+	}
+	return mpd.Pause(true)
+}
+
+// MusicResume 继续播放（Web /api/music/resume 与语音“继续”共用）。
+func (r *Router) MusicResume(_ context.Context) error {
+	mpd := r.mpd()
+	if mpd == nil {
+		return fmt.Errorf("MPD 未连接")
+	}
+	return mpd.Resume()
+}
+
+// MusicNext 下一首（Web /api/music/next 与语音“下一首”共用）。
+func (r *Router) MusicNext(_ context.Context) error {
+	mpd := r.mpd()
+	if mpd == nil {
+		return fmt.Errorf("MPD 未连接")
+	}
+	return mpd.Next()
+}
+
+// MusicPrevious 上一首（Web /api/music/previous 与语音“上一首”共用）。
+func (r *Router) MusicPrevious(_ context.Context) error {
+	mpd := r.mpd()
+	if mpd == nil {
+		return fmt.Errorf("MPD 未连接")
+	}
+	return mpd.Previous()
+}
+
+// PlaybackState 取 Hub 侧的播放状态：MPD status + 当前曲 + 队列。
+// state 是 MPD 的状态（play/pause/stop）；MPD 未接时返回错误。
+func (r *Router) PlaybackState(_ context.Context) (state string, current music.MPDSong, queue []music.MPDSong, err error) {
+	mpd := r.mpd()
+	if mpd == nil {
+		return "", music.MPDSong{}, nil, fmt.Errorf("MPD 未连接")
+	}
+	st, err := mpd.Status()
+	if err != nil {
+		return "", music.MPDSong{}, nil, err
+	}
+	cur, err := mpd.CurrentSong()
+	if err != nil {
+		return "", music.MPDSong{}, nil, err
+	}
+	q, err := mpd.Queue()
+	if err != nil {
+		return "", music.MPDSong{}, nil, err
+	}
+	return st.State, cur, q, nil
+}
+
+// MusicQueue 取当前队列（Web /api/music/queue 用）。
+func (r *Router) MusicQueue(_ context.Context) ([]music.MPDSong, error) {
+	mpd := r.mpd()
+	if mpd == nil {
+		return nil, fmt.Errorf("MPD 未连接")
+	}
+	return mpd.Queue()
+}
+
+// MusicLyric 取歌词（Web /api/music/lyric 与语音“歌词”共用）：
+// id==0 时用内存里当前曲的 ID；没有在放的歌时明确报错。
+func (r *Router) MusicLyric(ctx context.Context, id int64) (string, error) {
+	if id == 0 {
+		if song, _, ok := r.CurrentTrack(); ok {
+			id = song.ID
+		}
+	}
+	if id == 0 {
+		return "", fmt.Errorf("还没在放歌，先点一首吧")
+	}
+	r.depsMu.RLock()
+	netease := r.deps.Netease
+	r.depsMu.RUnlock()
+	if netease == nil {
+		return "", fmt.Errorf("音乐服务没接好（网易云未配置）")
+	}
+	lyric, err := netease.Lyric(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(lyric) == "" {
+		return "", fmt.Errorf("这首歌没有歌词")
+	}
+	return lyric, nil
+}
+
+// setCurrent 记下最近一次点歌成功的曲（内存状态，重启清空）。
+func (r *Router) setCurrent(song music.NeteaseSong, source string) {
+	r.currentMu.Lock()
+	defer r.currentMu.Unlock()
+	r.current = &currentTrack{song: song, source: source}
+}
+
+// CurrentTrack 取内存里的当前曲（ok==false 表示还没点过歌）。
+func (r *Router) CurrentTrack() (music.NeteaseSong, string, bool) {
+	r.currentMu.Lock()
+	defer r.currentMu.Unlock()
+	if r.current == nil {
+		return music.NeteaseSong{}, "", false
+	}
+	return r.current.song, r.current.source, true
+}
+
+// displaySongName 把歌拼成“歌手 + 的 + 歌名”（歌手为空时只剩歌名）。
+func displaySongName(song music.NeteaseSong) string {
+	if song.Artist != "" {
+		return song.Artist + "的" + song.Name
+	}
+	return song.Name
+}
+
+// truncateLyric 截短歌词再播报：语音回复读全文太长，只读前面一部分。
+func truncateLyric(lyric string) string {
+	const maxRunes = 600
+	runes := []rune(lyric)
+	if len(runes) <= maxRunes {
+		return lyric
+	}
+	return string(runes[:maxRunes]) + "……（歌词太长，只读前面一部分）"
+}
+
+// splitArtistTrack 把“周杰伦的青花瓷”拆成歌手 + 歌名；
 // 没“的”或任一侧为空时整句当歌名、歌手为空。
 func splitArtistTrack(query string) (artist, track string) {
 	i := strings.Index(query, "的")
