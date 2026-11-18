@@ -789,6 +789,121 @@ def patch_libxaudio(rootfs: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 打包后验证（F-1）：补丁标记断言——只认补丁特有的标记
+#
+# patch.sh §6 与 flash-check.sh §4b 共用本函数（两处不再各写一套 grep，
+# 改一处即同步）。原厂 rootfs 跑本函数必须失败：
+#   - dropbear：三门控已删（enable=0 返回、蓝牙门控、ssh_en 门控）。
+#     `mkdir -p /data/etc/dropbear` 单独不能作标记——原厂 keygen() 里
+#     已有该行（第 104 行），只查它会空转；这里只把它当文件完整性检查。
+#   - wireless：ota() 头后 60 字符内同时有 echo download_fail 与 exit 3
+#     （与 patch_disable_ota 的校验同款；原厂的 download_fail 在 curl
+#     失败分支，离函数头 50 行开外）。
+#   - asound：两文件 mico_record/noop 块都走 Capture；Capture 块参数
+#     384/6144 且无 480/3840；.dts 文件全文无 480/3840（.dts 无播放链）。
+#     注意 OH2P 的 asound.conf 原厂即 Capture、Capture 块参数与补丁后
+#     逐字节相同：该文件“是否打过补丁”只能由 .bak 证明（.bak 存在且与
+#     原厂逐字节一致，见 patch.sh §6 的 cmp，本函数不管 .bak）。
+#   - inittab：三行控制台均走 /bin/login（F-2），全表无免密 ash。
+# rc.local 包装器行、init 包装器内容与 .bak 比对不在本函数里：它们在
+# patch.sh §6（硬门）与 flash-check.sh §4b（旧镜像只警告）里各自处理，
+# 两处容忍度不同，不宜共用同一断言。
+# ---------------------------------------------------------------------------
+
+def verify_markers(rootfs: Path, model: str) -> None:
+    """校验一份 rootfs（通常是刚解开的补丁镜像）里补丁都在。
+
+    任一标记未通过即抛 PatchError（消息说明哪一项未通过）。"""
+    if model not in MODELS:
+        raise PatchError(f"未知型号：{model}（只支持 lx06 / oh2p）")
+    if not rootfs.is_dir():
+        raise PatchError(f"rootfs 不存在：{rootfs}")
+
+    # dropbear：三门控已删；mkdir 行只作文件完整性检查（原厂也有该行）。
+    dropbear = _require(rootfs / "etc/init.d/dropbear", "SSH 启动脚本")
+    text = _read(dropbear)
+    _require_in(text, "mkdir -p /data/etc/dropbear", dropbear)
+    for needle in ('[ "${enable}" = "0" ] && return 1',
+                   "micocfg_work_mode", "/data/ssh_en", "/data/.ssh_en",
+                   "/tmp/ssh_en"):
+        _require_not_in(text, needle, dropbear)
+
+    # shadow：root 行是 $6$ 且权限 0600。
+    shadow = _require(rootfs / "etc/shadow", "密码文件")
+    if not re.search(r"^root:\$6\$[^:]+:", _read(shadow), re.MULTILINE):
+        raise PatchError(f"校验失败：{shadow} 里 root 行不是 $6$ hash")
+    if (shadow.stat().st_mode & 0o777) != 0o600:
+        raise PatchError(f"校验失败：{shadow} 权限不是 0600")
+
+    # inittab（F-2）：三行控制台均走 /bin/login，全表无免密 ash。
+    inittab = _require(rootfs / "etc/inittab", "init 表")
+    inittab_text = _read(inittab)
+    for dev in INITTAB_CONSOLES:
+        _require_in(inittab_text, f"{dev}::askfirst:/bin/login", inittab)
+    _require_not_in(inittab_text, "/bin/ash --login", inittab)
+
+    # PAM：libmico 已注释、pam_unix 已启用。
+    pam = _require(rootfs / "etc/pam.d/common-auth", "PAM 配置")
+    pam_text = _read(pam)
+    _require_in(pam_text, "# auth sufficient libmico-pam.so", pam)
+    _require_not_in(pam_text, "\nauth sufficient libmico-pam.so", pam)
+    if not re.search(r"^auth\s+\[success=1 default=ignore\]\s+pam_unix\.so",
+                     pam_text, re.MULTILINE):
+        raise PatchError(f"校验失败：{pam} 里 pam_unix.so 未启用")
+
+    # OTA 三处禁用：bin/ota 两个函数头后 return 1、flash.sh 参数检查后
+    # return 1、wireless ota() 头后 60 字符内 download_fail + exit 3。
+    ota = _require(rootfs / "bin/ota", "OTA 脚本")
+    ota_text = _read(ota)
+    for func_re in (r"^download_upgrade\(\) \{$", r"^upgrade\(\) \{$"):
+        m = re.search(func_re, ota_text, re.MULTILINE)
+        if m is None or "return 1" not in ota_text[m.end():m.end() + 80]:
+            raise PatchError(f"校验失败：{ota} 里 {func_re} 后没有 return 1")
+    flash = _require(rootfs / "bin/flash.sh", "刷机脚本")
+    flash_text = _read(flash)
+    m = re.search(r"^upgrade_param_check\(\) \{$", flash_text, re.MULTILINE)
+    if m is None or "return 1" not in flash_text[m.end():m.end() + 80]:
+        raise PatchError(
+            f"校验失败：{flash} 里 upgrade_param_check() 后没有 return 1")
+    wireless = _require(rootfs / "etc/init.d/wireless", "无线启动脚本")
+    wireless_text = _read(wireless)
+    header_re = (r"(^ota\(\)\n\{\n    ota_url=\$1\n    ssid=\$2\n    password=\$3\n"
+                 r"    identity=\$4\n)")
+    m = re.search(header_re, wireless_text, re.MULTILINE)
+    if m is None:
+        raise PatchError(f"校验失败：{wireless} 里找不到 ota() 函数头")
+    window = wireless_text[m.end():m.end() + 60]
+    if 'echo "download_fail"' not in window or "exit 3" not in window:
+        raise PatchError(
+            f"校验失败：{wireless} 里 ota() 头后 60 字符内没有"
+            ' echo "download_fail" + exit 3（原厂的 download_fail 在 curl'
+            " 失败分支，不算禁用）")
+
+    # asound：两文件 mico_record/noop 都走 Capture；Capture 块参数
+    # 384/6144 且无 480/3840；.dts 文件全文无 480/3840。
+    for rel in ASOUND_FILES:
+        p = _require(rootfs / rel, "ALSA 配置")
+        text = _read(p)
+        _require_in(text, "pcm.mico_record {\n    type plug\n    slave.pcm Capture\n}", p)
+        _require_in(text, "pcm.noop {\n    type plug\n    slave.pcm Capture\n}", p)
+        capture = _extract_pcm_block(text, "Capture", p)
+        for needle in ('pcm "hw:0,3"', "type dsnoop", "rate 48000",
+                       "format S32_LE", "period_size 384", "buffer_size 6144"):
+            _require_in(capture, needle, p)
+        _require_not_in(capture, "period_size 480", p)
+        _require_not_in(capture, "buffer_size 3840", p)
+        if rel.endswith(".dts"):
+            _require_not_in(text, "period_size 480", p)
+            _require_not_in(text, "buffer_size 3840", p)
+
+    # libxaudio（仅 LX06）：hw:0,3 必须已改掉。
+    if model == "lx06":
+        lib = _require(rootfs / "usr/lib/libxaudio_engine.so", "音频引擎库")
+        if LIBXAUDIO_TARGET in lib.read_bytes():
+            raise PatchError(f"校验失败：{lib} 里仍有 hw:0,3")
+
+
+# ---------------------------------------------------------------------------
 # 7. mTLS 客户端证书（P0-3）：把 CA + 客户端证书装进 rootfs（可选）
 #    证书由 scripts/gen-certs.sh 生成；装入位置 /etc/open-xiaoai/tls/
 #    （squashfs 内，刷机后一定存在；/data 是可写分区挂载点，烤进

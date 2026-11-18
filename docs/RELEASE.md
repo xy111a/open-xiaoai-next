@@ -41,7 +41,7 @@ OH2P 在 `firmware/oh2p_1.58.6.bin`（36,042,824 字节，SHA256
 1. 刷机电脑上核对 §1 的 SHA256（两份镜像 + Hub 二进制）。
 2. `cd firmware-patch && ./scripts/flash-check.sh lx06 1.94.13`（或 `oh2p 1.58.6`），
    再用 `--strict` 跑一遍：SHA 不一致即 FAIL。§4b 内容验证缺标记即 FAIL
-   （`.bak` 与 init 包装器缺失只警告——针对旧版镜像；当前重编镜像里两者都有）。
+   （init 包装器本身缺失只警告——针对旧版镜像；.bak 缺失即 FAIL，当前重编镜像里两者都有）。
 3. 按 `FLASH_RUNBOOK.md` §2 读当前启动槽 → §3 决策表定目标槽（按实测 `boot_part` 定，
    不要默认 boot0）→ §4 备份（NAS 侧 + 设备侧）→ §5 刷机（只写非当前槽的 system 分区，
    绝不写 bootloader / tpl / dtb / kernel / 当前槽）→ §6 刷后校验 + 回滚演练。

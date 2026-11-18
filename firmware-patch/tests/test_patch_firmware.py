@@ -33,6 +33,7 @@ from patch_firmware import (
     patch_ssh,
     patch_start,
     sha512_crypt,
+    verify_markers,
     _write,
     _write_bytes,
 )
@@ -456,6 +457,66 @@ def test_patch_asound_adds_rate_converter_when_missing(tmp_path):
         assert text.count('defaults.pcm.rate_converter "speexrate_medium"') == 1
 
 
+# --- F-1：verify_markers 只认补丁特有标记 ---
+
+def test_verify_markers_passes_on_patched(patched_rootfs):
+    verify_markers(patched_rootfs, "lx06")  # 不抛即通过
+
+
+def test_verify_markers_fails_on_factory(tmp_path):
+    # F-1 回归：原厂 rootfs 跑 §6 断言必须 FAIL（旧的三处 grep 标记在原厂
+    # 就有，会空转放行；新断言第一项 dropbear 门控即拦住原厂）。
+    root = copy_rootfs(tmp_path / "rootfs")
+    with pytest.raises(PatchError):
+        verify_markers(root, "lx06")
+
+
+def test_verify_markers_fails_when_dropbear_gate_restored(patched_rootfs,
+                                                          tmp_path):
+    # 门控重现即 FAIL：把 enable=0 返回插回已打补丁的 dropbear（只改
+    # 副本，不动模块级 fixture）。
+    root = tmp_path / "rootfs"
+    shutil.copytree(patched_rootfs, root, symlinks=True)
+    p = root / "etc/init.d/dropbear"
+    p.write_text('\t[ "${enable}" = "0" ] && return 1\n' + p.read_text())
+    with pytest.raises(PatchError, match="enable"):
+        verify_markers(root, "lx06")
+
+
+def test_verify_markers_fails_when_wireless_ota_block_removed(patched_rootfs,
+                                                              tmp_path):
+    # wireless 的 ota() 禁用块被删即 FAIL：只删插入的那 4 空格缩进块，
+    # 原厂 curl 失败分支的 8 空格 download_fail 留着——新断言只认函数头后
+    # 60 字符内的 download_fail + exit 3，旧的全文 grep 会被那处空转放行。
+    root = tmp_path / "rootfs"
+    shutil.copytree(patched_rootfs, root, symlinks=True)
+    p = root / "etc/init.d/wireless"
+    text = p.read_text()
+    assert text.count('\n    echo "download_fail"\n    exit 3\n') == 1
+    p.write_text(text.replace('\n    echo "download_fail"\n    exit 3\n',
+                              "\n", 1))
+    assert 'echo "download_fail"' in p.read_text()  # 原厂分支那处还在
+    with pytest.raises(PatchError, match="wireless"):
+        verify_markers(root, "lx06")
+
+
+def test_verify_markers_fails_when_inittab_ash_restored(patched_rootfs,
+                                                        tmp_path):
+    # inittab 任一行回到免密 ash 即 FAIL（F-2：三行都要 login）。
+    root = tmp_path / "rootfs"
+    shutil.copytree(patched_rootfs, root, symlinks=True)
+    p = root / "etc/inittab"
+    p.write_text(p.read_text().replace("tty1::askfirst:/bin/login",
+                                       "tty1::askfirst:/bin/ash --login", 1))
+    with pytest.raises(PatchError, match="inittab"):
+        verify_markers(root, "lx06")
+
+
+def test_verify_markers_rejects_unknown_model(patched_rootfs):
+    with pytest.raises(PatchError):
+        verify_markers(patched_rootfs, "lx99")
+
+
 # --- libxaudio ---
 
 def test_patch_libxaudio(patched_rootfs):
@@ -498,6 +559,7 @@ def test_patch_all_real_oh2p_rootfs(tmp_path):
     result = patch_all(root, "oh2p")
     assert result["libxaudio_offset"] is None
     assert not (root / "usr/lib/libxaudio_engine.so").exists()  # OH2P 本无此文件
+    verify_markers(root, "oh2p")  # F-1：OH2P 打完补丁的断言通过
     conf = (root / "etc/asound.conf").read_text()
     assert "channels 4" in conf  # 原厂 Capture 块保留
     assert "period_size 480" in conf  # 播放链原厂参数未动
@@ -510,10 +572,25 @@ def test_patch_all_real_oh2p_rootfs(tmp_path):
     # P1-36：串口仍走 /bin/login（需 root 密码），不再是免密 ash。
     assert inittab.count("ttyS0::askfirst:/bin/login") == 1
     assert "ttyS0::askfirst:/bin/ash --login" not in inittab
+    # F-2：另两行同样走 /bin/login，全表无免密 ash。
+    assert "tts/0::askfirst:/bin/login" in inittab
+    assert "tty1::askfirst:/bin/login" in inittab
+    assert "/bin/ash --login" not in inittab
     shadow = (root / "etc/shadow").read_text()
     root_hash = shadow_root_hash(root)
     assert root_hash.startswith("$6$")
     assert hash_matches_password(TEST_SSH_PASSWORD, root_hash)
+
+
+@pytest.mark.skipif(not OH2P_ROOTFS.is_dir(),
+                    reason="需先跑 download-ota.py + unpack.sh oh2p 1.58.6")
+def test_verify_markers_fails_on_factory_oh2p(tmp_path):
+    # F-1 回归：OH2P 原厂 rootfs 同样必须 FAIL（它的 asound.conf 原厂即
+    # Capture，但 dropbear 门控、inittab、wireless 三项都拦得住原厂）。
+    root = tmp_path / "rootfs"
+    shutil.copytree(OH2P_ROOTFS, root, symlinks=True)
+    with pytest.raises(PatchError):
+        verify_markers(root, "oh2p")
 
 
 # --- 失败时不写输出 ---
