@@ -85,6 +85,9 @@ var table = []entry{
 // bai 2026-11-17 批复）：生产代码里目前确实没有这些调用，检查时跳过
 // FAIL、只打印 DEFERRED 提醒。条目保留在上面的检查表里（不要删），
 // 第一关口后接线完成再从本表摘掉，检查即恢复为 FAIL。
+// 摘掉条件：条目对应的接线在生产代码落地并有集成测试覆盖后即从本表删除
+// （P1-9 的 ota.ConfirmHello/MarkRebooted/Sweep 与 P1-15 的
+// intercom.Start/Sweep 就是按此条件摘掉的 5 个旧条目）。
 //
 // 2026-11-17 P1 全量修复后本表已空：P1-9（ota.ConfirmHello/MarkRebooted/Sweep）
 // 与 P1-15（intercom.Start/Sweep）的接线均已落地，5 个旧条目随之摘掉。

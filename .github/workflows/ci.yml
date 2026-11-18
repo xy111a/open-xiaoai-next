@@ -34,6 +34,12 @@ jobs:
       # 理论上可能因版本差在 CI 抖动。
       - name: 安装 libopus
         run: sudo apt-get update && sudo apt-get install -y libopus-dev libopusfile-dev pkg-config
+      # FW-P2-1：CI 与 lint.sh 互补——lint.sh 本地有 gofmt，CI 原来没有；
+      # 本地全绿 ≠ CI 全绿就是从这里漏的。gofmt 检查 hub + scripts（与 lint.sh 同范围）。
+      - name: gofmt
+        run: |
+          out="$(gofmt -l hub scripts)"
+          if [ -n "$out" ]; then echo "gofmt 失败，以下文件格式不对：$out"; exit 1; fi
       - name: go vet
         working-directory: hub
         run: go vet ./...
@@ -43,6 +49,8 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
+          # FW-P2-1：版本与本机一致（2026-11-18 实测本机
+          # ~/workspace/tools/bin/golangci-lint v1.64.8）；升级须两边同步。
           version: v1.64.8
           working-directory: hub
           # .golangci.yml 在仓库根，golangci-lint 会向上查找。
@@ -63,6 +71,14 @@ jobs:
       # client 链 ALSA（alsa-sys）与 Opus。
       - name: 安装系统依赖
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libopus-dev pkg-config
+      # FW-P2-8：semgrep 规则 3 覆盖不到 vec![x; 变量]（无界分配）——
+      # 见 scripts/check-vec-len.sh（变量长度即 FAIL，常量长度放行，
+      # #[cfg(test)] 模块不查）。lint.sh 里有同款调用（run_rust）。
+      # 2026-11-18 实测：生产代码无违规；aec.rs 测试里有一处
+      # vec![0i16; total_samples]（total_samples 由常量派生，有界），
+      # 属测试模块，不查（见 check-vec-len.sh 头注释）。
+      - name: 规则 3 Rust vec! 长度检查
+        run: bash scripts/check-vec-len.sh
       - name: cargo test
         working-directory: client
         run: cargo test --locked
@@ -133,3 +149,17 @@ jobs:
           semgrep --config .semgrep/rules.yml --error \
             --exclude '*_test.go' --exclude '*/tests/*' --exclude 'test_*.py' \
             hub client/src firmware-patch/scripts
+
+  # FW-P2-8：lint.sh 本地有 bash -n，CI 原来没有——shell 脚本语法错了
+  # 本地 lint 能拦、CI 拦不住。shellcheck 未装，只跑 bash -n 语法检查。
+  shell:
+    name: Shell（bash -n）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: |
+          for f in firmware-patch/scripts/*.sh deploy/*.sh scripts/*.sh; do
+            bash -n "$f" || exit 1
+          done
+          echo "bash -n 通过（shellcheck 未装，只做语法检查）"

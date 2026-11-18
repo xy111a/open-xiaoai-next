@@ -46,6 +46,8 @@ import (
 //     上限：这是暂缓审计项（AUDIT P1-1 同类问题在 Snapcast 客户端的残留，
 //     不在本轮 12 项修复内）。修时应加读 deadline + 限长读取；在此之前
 //     只在 lint 里标注，不静默放行、也不改代码。
+//   - 摘掉条件：N-P1-1（SnapClient.call 读 deadline + 限长读取）修复时
+//     同步删除本条目（N-P1-1 归 Hub 面）。
 var knownExceptions = map[string]string{
 	"internal/music/music.go:SnapClient.call": "已知例外：暂缓审计项（P1-1 同类：SnapClient.call() 的 ReadBytes 无长度上限），不在本轮 12 项内，只记录、不修",
 }
