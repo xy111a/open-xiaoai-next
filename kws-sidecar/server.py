@@ -19,12 +19,17 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
   同 device_id 重连：旧连接被关闭（1000 "replaced by new connection"），
   旧流状态丢弃，旧连接此后不再产生 wake。
   连接数上限：默认 16，超限即 error + 1013 关闭。
-  Hub -> 边车 二进制帧：PCM int16 LE 单声道 16kHz（20ms = 640 字节）
+  Hub -> 边车 二进制帧：PCM int16 LE 单声道 16kHz（20ms = 640 字节）；
+  非 640 字节的帧即 error + 丢弃（S-4，不再切分喂入）
   边车 -> Hub {"type":"ready"} / {"type":"wake","device_id","keyword",
-                 "rms","rms_peak","timestamp_ms"} / {"type":"error","message"}
+                 "rms","rms_peak","wake_no","frames_since_wake",
+                 "timestamp_ms"} / {"type":"error","message"}
                  （rms 是检出时最近 1s 的 RMS 均值；rms_peak 是同一窗口
                  内单帧 RMS 的峰值，不被 trailing 静音稀释，供仲裁选用，
-                 见 SC-P2-2）
+                 见 SC-P2-2；wake_no 是该设备流自连接以来的第 N 次检出，
+                 frames_since_wake 是上次检出后喂入的帧数（每帧 20ms，
+                 检出延迟的近似度量），见 S-13；Hub 侧 encoding/json
+                 容错解析，未知字段忽略）
   HTTP GET /health -> 200 {"status":"ok","model_loaded":true,
                  "keywords":1,"devices":0,"uptime_s":...,"total_wakes":0,
                  "device_wakes":{}}；
@@ -71,6 +76,15 @@ RMS_WINDOW_FRAMES = 50       # wake 事件的 rms 取最近 1s 的帧 RMS 合成
 TOKEN_MIN_LENGTH = 16        # 与 Hub 的 OPEN_XIAOAI_TOKEN 规则一致（>=16 位）
 DEFAULT_MAX_CONNECTIONS = 16  # WS 连接数上限（每设备一路流，2 台设备余量充足）
 MAX_CONSECUTIVE_STREAM_ERRORS = 5  # 连续推理失败达此数即标记服务不健康（/health 503）
+# S-5：_fatal_error 置起后，连续成功达此数即自动清除（带日志），
+# 不再粘住到重启；成功计数只在 fatal 置起期间累计。
+FATAL_CLEAR_SUCCESSES = 5
+# S-4：WS 单条消息上限。协议帧是 640 字节；64KB 仍留足余量（100 倍），
+# 同时堵住 1MB 超长帧切成 1562 块堵事件循环的路。
+MAX_WS_MESSAGE_SIZE = 64 << 10
+# S-12：keywords_score 的合理上界（实验验证值 1.0；过大抬高误触发倾向）。
+MAX_SCORE = 10.0
+MAX_NUM_THREADS = 8  # S-12：sherpa 解码线程数上限（NAS 上 8 线程已足）
 
 # SC-P2-1：单帧排空循环的 decode 硬上限。is_ready 恒真时无上限循环会
 # 堵住整个单事件循环（全部设备停摆）；超限即记 error 并 reset 该流。
@@ -209,6 +223,10 @@ class DeviceStream:
             return result
         return None
 
+    def reset_stream(self):
+        """复位该设备流（S-6：单帧喂入异常后自愈，不撕连接）。"""
+        self.spotter.reset_stream(self.stream)
+
     def flush_on_disconnect(self, silence_frames=FLUSH_SILENCE_FRAMES):
         """断开时补喂静音并做最后一次检出（SC-P2-4）：模型需要关键词
         后约 200ms trailing 音频才吐结果；设备恰在关键词尾音处断线
@@ -254,10 +272,23 @@ class Server:
         self.model_loaded = spotter is not None
         self.devices = {}  # device_id -> (DeviceStream, ws)
         self.connections = 0  # 当前 WS 连接数（含未完成 hello 的半开连接）
+        # S-11：已认证连接数（通过 hello + token 的连接）；与 connections
+        # 的差值即半开连接数，/health 里分开报告。
+        self.authenticated_connections = 0
+        self._handler_tasks = {}  # device_id -> 当前 handler 的 asyncio 任务
         self.started_at = time.monotonic()
         self.total_wakes = 0
-        self._consecutive_stream_errors = 0
-        self._fatal_error = None  # 置起后 /health 即 503（fail-closed，需重启恢复）
+        # S-10：断开时 flush 检出、事件无处可发的唤醒数（total_wakes 同
+        # 时 +1，不再漏计）；device_wakes_total 是每设备累计唤醒（含已
+        # 断开设备），断开后不随 devices 字典消失。
+        self.lost_wakes = 0
+        self._device_wakes_total = {}
+        # S-5：连续推理错误按 device_id 分桶（None/缺失用 "" 桶）。
+        # 一台设备的解码异常不再计入另一台设备的计数；_fatal_error 置
+        # 起后，连续成功达 FATAL_CLEAR_SUCCESSES 次即自动清除（带日志）。
+        self._stream_errors = {}
+        self._fatal_successes = 0
+        self._fatal_error = None  # 置起后 /health 即 503（fail-closed）
 
     def health_reason(self):
         """None 表示健康；否则返回 503 应报告的原因字符串。"""
@@ -269,17 +300,35 @@ class Server:
             return self._fatal_error
         return None
 
-    def note_feed_success(self):
-        self._consecutive_stream_errors = 0
+    def stream_error_count(self, device_id=None):
+        """该设备的当前连续推理错误数（S-5 分桶计数；供 S-6 联动）"""
+        return self._stream_errors.get(device_id or "", 0)
 
-    def note_feed_error(self):
-        self._consecutive_stream_errors += 1
-        if self._consecutive_stream_errors >= MAX_CONSECUTIVE_STREAM_ERRORS:
+    def note_feed_success(self, device_id=None):
+        self._stream_errors[device_id or ""] = 0
+        if self._fatal_error is not None:
+            self._fatal_successes += 1
+            if self._fatal_successes >= FATAL_CLEAR_SUCCESSES:
+                LOG.info("clearing sidecar unhealthy flag after %d "
+                         "consecutive successful feeds: %s",
+                         self._fatal_successes, self._fatal_error)
+                self._fatal_error = None
+                self._fatal_successes = 0
+
+    def note_feed_error(self, device_id=None):
+        """记一次推理错误，返回该设备分桶后的连续错误数。"""
+        key = device_id or ""
+        count = self._stream_errors.get(key, 0) + 1
+        self._stream_errors[key] = count
+        if (count >= MAX_CONSECUTIVE_STREAM_ERRORS
+                and self._fatal_error is None):
             self._fatal_error = (
                 "repeated stream errors "
-                f"({self._consecutive_stream_errors} consecutive "
-                "decode failures)")
+                f"({count} consecutive decode failures"
+                + (f" on device {device_id}" if device_id else "") + ")")
+            self._fatal_successes = 0
             LOG.error("marking sidecar unhealthy: %s", self._fatal_error)
+        return count
 
     # ---- HTTP（经 websockets 的 process_request 拦截）----
     async def process_request(self, connection, request: Request):
@@ -289,14 +338,18 @@ class Server:
                 "model_loaded": bool(self.model_loaded),
                 "keywords": self.keywords_count,
                 "devices": len(self.devices),
+                "connections": self.connections,
+                "authenticated_connections":
+                    self.authenticated_connections,
                 "uptime_s": round(time.monotonic() - self.started_at, 1),
                 "total_wakes": self.total_wakes,
-                # SC-P2-7：每设备累计唤醒次数（此前 wake_count 自增后
-                # 无任何读取方，是死指标）；排障时可直接看出哪台设备
-                # 流异常（某设备 wakes 远高于同屋另一台即疑似误触发）。
-                "device_wakes": {did: stream.wake_count
-                                 for did, (stream, _ws)
-                                 in self.devices.items()},
+                # S-10：flush 检出的唤醒也计入 total_wakes，另单记
+                # lost_wakes（断开时无处可发的检出数）。
+                "lost_wakes": self.lost_wakes,
+                # S-10：device_wakes 是每设备累计唤醒次数——已断开设备
+                # 的累计值保留在 _device_wakes_total 里，不随 devices
+                # 字典消失；当前连接设备的本次连接计数另行累加。
+                "device_wakes": self._merged_device_wakes(),
             }
             if reason is None:
                 body_dict["status"] = "ok"
@@ -314,10 +367,19 @@ class Server:
             return None  # 继续 WebSocket 握手
         return Response(404, "Not Found", Headers(), b"not found")
 
+    def _merged_device_wakes(self):
+        """已断开设备的累计值（_device_wakes_total）+ 当前连接设备
+        本次连接的 wake_count（S-10）。"""
+        merged = dict(self._device_wakes_total)
+        for did, (stream, _ws) in self.devices.items():
+            merged[did] = merged.get(did, 0) + stream.wake_count
+        return merged
+
     # ---- WebSocket ----
     async def handler(self, ws):
         device_id = None
         stream = None
+        authenticated = False
         # 连接数上限：在事件循环内同步检查 + 计数，无竞态；半开连接也计入。
         self.connections += 1
         if self.connections > self.max_connections:
@@ -392,6 +454,7 @@ class Server:
                 return
             if device_id in self.devices:
                 old_stream, old_ws = self.devices[device_id]
+                old_task = self._handler_tasks.get(device_id)
                 # 先标记取代（旧 handler 见标志即停喂、不再发 wake），
                 # 再尽力关闭旧连接；关闭超时也不阻塞新连接——
                 # replaced 标志本身已保证旧流不再出 wake。
@@ -403,12 +466,23 @@ class Server:
                         old_ws.close(code=1000,
                                      reason="replaced by new connection"),
                         timeout=5)
-                except (asyncio.TimeoutError, websockets.ConnectionClosed):
-                    LOG.warning("device %s: old connection close timed out "
-                                "or already closed; old stream already "
-                                "invalidated", device_id)
+                except asyncio.TimeoutError:
+                    # S-11：close 握手 5 秒未完成时，旧 handler 仍挂在
+                    # async for 里、连接数名额不释放——显式取消旧 handler
+                    # 任务（其 finally 会释放连接计数），不再只记日志。
+                    LOG.warning("device %s: old connection close timed "
+                                "out; cancelling old handler task",
+                                device_id)
+                    if old_task is not None and not old_task.done():
+                        old_task.cancel()
+                except websockets.ConnectionClosed:
+                    LOG.warning("device %s: old connection already closed; "
+                                "old stream already invalidated", device_id)
+            authenticated = True
+            self.authenticated_connections += 1
             stream = DeviceStream(self.spotter, device_id)
             self.devices[device_id] = (stream, ws)
+            self._handler_tasks[device_id] = asyncio.current_task()
             LOG.info("device connected: %s", device_id)
             await ws.send(json.dumps({"type": "ready"}))
 
@@ -420,19 +494,38 @@ class Server:
                         ws, "unexpected text frame after hello; "
                             "audio must be binary PCM frames")
                     continue
-                if len(message) % 2 != 0:
+                # S-4：二进制帧必须恰好 640 字节（20ms）。非 640 即记
+                # error + 丢弃——超长帧不再切块喂入（1MB 帧切 1562 块会
+                # 堵住单事件循环）；奇数长度、超长、过短同属此类。
+                if len(message) != FRAME_BYTES:
                     await self._send_error(
-                        ws, f"odd-length PCM frame: {len(message)} bytes")
+                        ws, f"PCM frame must be {FRAME_BYTES} bytes, got "
+                            f"{len(message)}")
                     continue
                 pcm = np.frombuffer(message, dtype=np.int16)
-                # 按 20ms 切块喂入（Hub 约定 640 字节/帧；超长帧也照此切分）
                 for i in range(0, len(pcm), FRAME_SAMPLES):
                     try:
                         keyword = stream.feed(pcm[i:i + FRAME_SAMPLES])
                     except Exception:
-                        self.note_feed_error()
-                        raise
-                    self.note_feed_success()
+                        # S-6：单帧喂入异常不再直接 raise 撕连接——记
+                        # error、复位该设备流并继续喂下一块；仅当该设备
+                        # 分桶连续失败达上限（与 S-5 联动）才断连接。
+                        err_count = self.note_feed_error(device_id)
+                        LOG.error("device %s: feed failed (%d consecutive "
+                                  "stream errors); resetting stream",
+                                  device_id, err_count)
+                        try:
+                            stream.reset_stream()
+                        except Exception:
+                            LOG.warning("device %s: stream reset failed",
+                                        device_id, exc_info=True)
+                        if err_count >= MAX_CONSECUTIVE_STREAM_ERRORS:
+                            LOG.error("device %s: too many consecutive "
+                                      "feed failures; dropping connection",
+                                      device_id)
+                            raise
+                        continue
+                    self.note_feed_success(device_id)
                     if keyword:
                         # 取代后旧流即使算出结果也不发 wake（双保险）。
                         if stream.replaced or self.devices.get(
@@ -447,6 +540,12 @@ class Server:
                             # trailing 静音稀释；仲裁比较响度时应优先用
                             # rms_peak。
                             "rms_peak": stream.rms_peak,
+                            # S-13：wake_no 与 frames_since_wake 进事件
+                            # （此前只有日志有）；Hub 侧容错解析，未知字
+                            # 段忽略，无需 Hub 改动。
+                            "wake_no": stream.wake_count,
+                            "frames_since_wake":
+                                stream.frames_at_last_wake,
                             "timestamp_ms": int(time.time() * 1000),
                         }
                         await ws.send(json.dumps(event, ensure_ascii=False))
@@ -473,6 +572,8 @@ class Server:
                 pass
         finally:
             self.connections -= 1
+            if authenticated:
+                self.authenticated_connections -= 1
             if device_id is not None:
                 entry = self.devices.get(device_id)
                 if entry is not None and entry[0] is stream:
@@ -483,6 +584,10 @@ class Server:
                     if stream is not None and not stream.replaced:
                         lost = stream.flush_on_disconnect()
                         if lost:
+                            # S-10：flush 检出的唤醒也计入 total_wakes，
+                            # 另单记 lost_wakes（事件无处可发）。
+                            self.total_wakes += 1
+                            self.lost_wakes += 1
                             LOG.warning(
                                 "wake lost on disconnect: device=%s "
                                 "keyword=%s (keyword ended right before "
@@ -491,6 +596,19 @@ class Server:
                     del self.devices[device_id]
                     LOG.info("device disconnected, stream state dropped: %s",
                              device_id)
+                # S-10：该设备流的累计唤醒并入 _device_wakes_total——
+                # 断开后 device_wakes 仍保留累计值，不随 devices 字典
+                # 消失；重连后新流的计数另行累加。被取代的旧流也走这里
+                # （其 finally 的 entry 检查已不命中，但累计值不能丢）。
+                # S-5：断开即清该设备的分桶错误计数（重连从零开始）。
+                if stream is not None:
+                    self._device_wakes_total[device_id] = \
+                        self._device_wakes_total.get(device_id, 0) \
+                        + stream.wake_count
+                    self._stream_errors.pop(device_id, None)
+                if self._handler_tasks.get(device_id) \
+                        is asyncio.current_task():
+                    del self._handler_tasks[device_id]
 
     @staticmethod
     async def _send_error(ws, message):
@@ -498,6 +616,34 @@ class Server:
             await ws.send(json.dumps({"type": "error", "message": message}))
         except websockets.ConnectionClosed:
             pass
+
+
+def _env_float(name, default):
+    """读 float 环境变量；非法值时干净 FATAL 退出（S-12），不抛
+    ValueError traceback。build_arg_parser 在 logging 配好之前调用，
+    故直接写 stderr。"""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"FATAL: {name} must be a number, got {raw!r}",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def _env_int(name, default):
+    """读 int 环境变量；非法值时干净 FATAL 退出（S-12）。"""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"FATAL: {name} must be an integer, got {raw!r}",
+              file=sys.stderr)
+        sys.exit(1)
 
 
 def build_arg_parser():
@@ -510,25 +656,24 @@ def build_arg_parser():
                         "the sidecar has no TLS, see README security "
                         "assumption)")
     p.add_argument("--port", type=int,
-                   default=int(os.environ.get("KWS_PORT", "10400")))
+                   default=_env_int("KWS_PORT", 10400))
     p.add_argument("--model-dir",
                    default=os.environ.get("KWS_MODEL_DIR", "/data/kws/models"))
     p.add_argument("--keywords-file",
                    default=os.environ.get("KWS_KEYWORDS_FILE", ""))
     p.add_argument("--threshold", type=float,
-                   default=float(os.environ.get(
-                       "KWS_THRESHOLD", str(DEFAULT_THRESHOLD))))
+                   default=_env_float("KWS_THRESHOLD",
+                                      str(DEFAULT_THRESHOLD)))
     p.add_argument("--score", type=float,
-                   default=float(os.environ.get(
-                       "KWS_SCORE", str(DEFAULT_SCORE))))
+                   default=_env_float("KWS_SCORE", str(DEFAULT_SCORE)))
     p.add_argument("--num-threads", type=int,
-                   default=int(os.environ.get("KWS_NUM_THREADS", "1")))
+                   default=_env_int("KWS_NUM_THREADS", 1))
     p.add_argument("--token",
                    default=os.environ.get("OPEN_XIAOAI_TOKEN", ""),
                    help="WS hello 鉴权 Token；与 Hub 的 OPEN_XIAOAI_TOKEN "
                         "同一机密（>=16 位）。未配时拒绝启动。")
     p.add_argument("--max-connections", type=int,
-                   default=int(os.environ.get("KWS_MAX_CONNECTIONS", "16")),
+                   default=_env_int("KWS_MAX_CONNECTIONS", 16),
                    help="WS 连接数上限；超限的新连接以 1013 拒绝。")
     p.add_argument("--log-level",
                    default=os.environ.get("LOG_LEVEL", "INFO"))
@@ -550,9 +695,20 @@ async def amain():
         LOG.error("FATAL: --threshold / KWS_THRESHOLD must be in (0, 1]; "
                   "got %s", args.threshold)
         sys.exit(1)
-    if args.score < 0:
-        LOG.error("FATAL: --score / KWS_SCORE must be >= 0; got %s",
-                  args.score)
+    # S-12：score 加上界（0~10；实验验证值 1.0）。此前只拦下界，
+    # 过大 score 会抬高误触发倾向。
+    if not 0 <= args.score <= MAX_SCORE:
+        LOG.error("FATAL: --score / KWS_SCORE must be in [0, %s]; got %s",
+                  MAX_SCORE, args.score)
+        sys.exit(1)
+    # S-12：线程数与端口加范围校验（极端值此前依赖 sherpa/serve 自身报错）。
+    if not 1 <= args.num_threads <= MAX_NUM_THREADS:
+        LOG.error("FATAL: --num-threads / KWS_NUM_THREADS must be in "
+                  "[1, %d]; got %s", MAX_NUM_THREADS, args.num_threads)
+        sys.exit(1)
+    if not 1 <= args.port <= 65535:
+        LOG.error("FATAL: --port / KWS_PORT must be in [1, 65535]; got %s",
+                  args.port)
         sys.exit(1)
     if (args.threshold, args.score) != (DEFAULT_THRESHOLD, DEFAULT_SCORE):
         LOG.warning("KWS threshold/score differ from the experimentally "
@@ -582,7 +738,7 @@ async def amain():
                     max_connections=args.max_connections)
     async with serve(server.handler, args.host, args.port,
                      process_request=server.process_request,
-                     max_size=1 << 20):
+                     max_size=MAX_WS_MESSAGE_SIZE):  # S-4：64KB（协议帧 640B）
         LOG.info("kws-sidecar listening on ws://%s:%d/v1/kws "
                  "(health: http://%s:%d/health, keywords=%d, "
                  "max_connections=%d)",
