@@ -17,6 +17,8 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
 - Hub → 边车，首条消息（JSON 文本）：
   `{"type":"hello","device_id":"lx06-192-168-1-20","sample_rate":16000,"token":"..."}`
   `sample_rate` 必须为 16000，否则返回 `error` 并关闭连接。
+  `device_id` 限 1–64 字符 `[A-Za-z0-9_.-]`，非法返回 `error` 后以
+  1002 关闭（超长/含换行符的 id 原样进日志可伪造日志行）。
   `token` 必须与边车启动时传入的 Token 一致（与 Hub 的
   `OPEN_XIAOAI_TOKEN` 同一机密，≥16 位，常数时间比较）；缺失/错误
   返回 `error` 后以 1008 关闭。边车未配 Token 时拒绝启动。
@@ -25,16 +27,22 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
   20ms 一帧 = 640 字节（超长帧按 20ms 切分喂入）。
 - 边车 → Hub（JSON 文本）：
   - `{"type":"ready"}`：hello 确认；
-  - `{"type":"wake","device_id":"...","keyword":"你好小李","rms":0.42,"timestamp_ms":...}`：
-    检出唤醒词；`rms` 为检出时最近 1s 音频的 RMS（0~1），
+  - `{"type":"wake","device_id":"...","keyword":"你好小李","rms":0.42,"rms_peak":0.55,"timestamp_ms":...}`：
+    检出唤醒词；`rms` 为检出时最近 1s 音频的 RMS（0~1），`rms_peak`
+    为同一窗口内单帧 RMS 的峰值——`rms` 会被检出前的 trailing 静音
+    稀释（检出越晚稀释越多），仲裁比较响度时应优先用 `rms_peak`；
     `timestamp_ms` 为服务端 Unix 毫秒时间戳；检出后该设备流自动
     复位（re-arm），可继续检下一次唤醒；
   - `{"type":"error","message":"..."}`：协议错误或模型故障。
+    10s 内未发 hello 返回 `{"type":"error","message":"hello timeout"}`
+    后以 1008 关闭（预期内的协议行为，不打 traceback）。
 - 健康检查：`GET /health` → 200
   `{"status":"ok","model_loaded":true,"keywords":1,"devices":0,
-    "uptime_s":...,"total_wakes":0}`；模型未加载、关键词表为空或推理
-  连续失败（≥5 次）时 503 `{"status":"error",...,"reason":"..."}`。
-  模型加载失败时进程直接非零退出（不静默跑）。
+    "uptime_s":...,"total_wakes":0,"device_wakes":{}}`；模型未加载、
+  关键词表为空或推理连续失败（≥5 次）时 503
+  `{"status":"error",...,"reason":"..."}`。`device_wakes` 为每设备
+  自连接以来的累计唤醒次数（排障：某设备远高于同屋另一台即疑似
+  误触发）。模型加载失败时进程直接非零退出（不静默跑）。
 
 ## 并发与状态
 
@@ -43,7 +51,10 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
   少量设备并发无压力；大规模并发未测，不要超量挂设备）。
 - 连接断开即丢弃该设备流状态；同一 `device_id` 重连从零开始，
   旧的半句唤醒词不会残留（见 `tests/test_kws_sidecar.py::
-  test_reconnect_drops_old_state`）。
+  test_reconnect_drops_old_state`）。断开时先补喂 25 帧（500ms）
+  静音做最后一次检出（模型需要关键词后约 200ms trailing 音频才
+  吐结果；关键词尾音处恰好断线时不 flush 就会丢这句唤醒）——连接
+  已断，检出只记一条 `wake lost on disconnect` 日志，不发事件。
 - 同一 `device_id` 在旧连接未断时又连上来（且新连接已通过鉴权），
   旧连接被主动关闭（1000 "replaced by new connection"），旧流状态
   丢弃、旧连接此后不再产生 wake（见 `test_duplicate_device_id_
@@ -59,8 +70,8 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
 | `KWS_PORT` | `10400` | 监听端口（已确认与现有服务无冲突） |
 | `KWS_MODEL_DIR` | `/data/kws/models` | 模型目录 |
 | `KWS_KEYWORDS_FILE` | `<模型目录>/keywords.txt` | 关键词表（默认含“你好小李”） |
-| `KWS_THRESHOLD` | `0.25` | keywords_threshold（实验验证值） |
-| `KWS_SCORE` | `1.0` | keywords_score（实验验证值） |
+| `KWS_THRESHOLD` | `0.25` | keywords_threshold（实验验证值）；合法范围 (0, 1]，越界时边车拒绝启动。改阈值须同步改 `tests/bootstrap.py` 的样本校验（它读同一环境变量，见下） |
+| `KWS_SCORE` | `1.0` | keywords_score（实验验证值）；合法范围 ≥0，越界时边车拒绝启动 |
 | `KWS_NUM_THREADS` | `1` | sherpa 解码线程数 |
 | `OPEN_XIAOAI_TOKEN`（或 `--token`） | （必填，无默认） | WS hello 鉴权 Token，与 Hub 的 `OPEN_XIAOAI_TOKEN` 同一机密（≥16 位）；未配或太短时边车拒绝启动。Token 只经环境变量/命令行传入，绝不写进仓库、日志或代码 |
 | `KWS_MAX_CONNECTIONS`（或 `--max-connections`） | `16` | WS 连接数上限；超限的新连接以 1013 拒绝 |
@@ -126,7 +137,7 @@ zh_CN-huayan-medium）现生成、ffmpeg 重采样到 16kHz，噪声样本用
 numpy 固定种子生成。任何一步失败都明确报错，不静默跳过。
 
 生成后逐个离线校验（正样本必须检出、负样本必须静默），不合格的
-重抽最多 10 次：Piper 合成是非确定性的，同一文本两次生成是不同
+重抽最多 10 次（即最多 11 次检测）：Piper 合成是非确定性的，同一文本两次生成是不同
 音频，实测 pos3（“你好小李，今天天气怎么样”）约 1/7 的抽样检不
 出——干净状态验证时确实命中一次坏抽样，重抽后通过。校验不过
 10 次就报错，不要改样本文本绕过去。

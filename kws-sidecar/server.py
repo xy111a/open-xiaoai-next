@@ -21,9 +21,13 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
   连接数上限：默认 16，超限即 error + 1013 关闭。
   Hub -> 边车 二进制帧：PCM int16 LE 单声道 16kHz（20ms = 640 字节）
   边车 -> Hub {"type":"ready"} / {"type":"wake","device_id","keyword",
-                 "rms","timestamp_ms"} / {"type":"error","message"}
+                 "rms","rms_peak","timestamp_ms"} / {"type":"error","message"}
+                 （rms 是检出时最近 1s 的 RMS 均值；rms_peak 是同一窗口
+                 内单帧 RMS 的峰值，不被 trailing 静音稀释，供仲裁选用，
+                 见 SC-P2-2）
   HTTP GET /health -> 200 {"status":"ok","model_loaded":true,
-                 "keywords":1,"devices":0,"uptime_s":...,"total_wakes":0}；
+                 "keywords":1,"devices":0,"uptime_s":...,"total_wakes":0,
+                 "device_wakes":{}}；
                  模型未加载、关键词表为空或推理连续失败时 503 + reason。
                  模型加载失败则进程直接非零退出。
 
@@ -38,6 +42,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import time
 from collections import deque
@@ -58,6 +63,20 @@ RMS_WINDOW_FRAMES = 50       # wake 事件的 rms 取最近 1s 的帧 RMS 合成
 TOKEN_MIN_LENGTH = 16        # 与 Hub 的 OPEN_XIAOAI_TOKEN 规则一致（>=16 位）
 DEFAULT_MAX_CONNECTIONS = 16  # WS 连接数上限（每设备一路流，2 台设备余量充足）
 MAX_CONSECUTIVE_STREAM_ERRORS = 5  # 连续推理失败达此数即标记服务不健康（/health 503）
+
+# SC-P2-1：单帧排空循环的 decode 硬上限。is_ready 恒真时无上限循环会
+# 堵住整个单事件循环（全部设备停摆）；超限即记 error 并 reset 该流。
+MAX_DECODE_PER_FRAME = 32
+# SC-P2-4：连接断开时补喂的 trailing 静音帧数（25 帧 = 500ms；实测
+# 关键词后约 10 帧静音即出结果，25 帧留足余量）。
+FLUSH_SILENCE_FRAMES = 25
+# SC-P2-5：device_id 字符集与长度上限（原样进日志会伪造日志行）。
+# 字符集含 "."——现有测试与 Hub 的设备 id 形如 pos-pos1.wav（含点），
+# 拒绝点会破坏既有协议；点本身不影响日志单行性。
+DEVICE_ID_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+# SC-P2-6：阈值/分数的合法范围（与 tests/bootstrap.py 的校验同源）。
+DEFAULT_THRESHOLD = 0.25     # 实验验证值（2026-11-17）
+DEFAULT_SCORE = 1.0          # 实验验证值（2026-11-17）
 
 # 模型文件（int8 encoder；与 client/scripts/download-kws-model.sh 一致）
 ENCODER_INT8 = "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"
@@ -125,6 +144,14 @@ def load_spotter(model_dir, keywords_file, threshold, score, num_threads):
     return spotter, keywords_count
 
 
+def _safe_device_id(value):
+    """日志用的 device_id 单行化（SC-P2-5）：去 \r/\n、截断 64 字符。
+    合法 id 原样通过；hello 校验前的原始输入只在报错路径进日志，
+    绝不原样输出（防日志行伪造）。"""
+    text = value if isinstance(value, str) else repr(value)
+    return text.replace("\r", "?").replace("\n", "?")[:64]
+
+
 class DeviceStream:
     """一台设备的独立 KWS 流状态。"""
 
@@ -134,6 +161,12 @@ class DeviceStream:
         self.stream = spotter.create_stream()
         self.rms_frames = deque(maxlen=RMS_WINDOW_FRAMES)
         self.wake_count = 0
+        # SC-P2-7：延迟统计（每帧 20ms）。frames_since_wake 是上次
+        # 检出后喂入的帧数——关键词结束到检出的帧数的近似（检出越晚
+        # 数越大）；frames_at_last_wake 在检出瞬间冻结，供日志用。
+        self.frames_fed = 0
+        self.frames_since_wake = 0
+        self.frames_at_last_wake = 0
         # 被同 device_id 的新连接取代时置 True：旧 handler 见此标志即停喂，
         # 且即使算出结果也不再发 wake（SC-P1-1 的双保险）。
         self.replaced = False
@@ -142,15 +175,48 @@ class DeviceStream:
         """喂一帧 PCM；返回检出的关键词（无检出返回 None）。"""
         samples = pcm_int16.astype(np.float32) / 32768.0
         self.rms_frames.append(float(np.sqrt(np.mean(samples ** 2))))
+        self.frames_fed += 1
+        self.frames_since_wake += 1
         self.stream.accept_waveform(SAMPLE_RATE, samples)
-        # 复用实验的排空逻辑：is_ready -> decode -> get_result
+        # 复用实验的排空逻辑：is_ready -> decode -> get_result。
+        # SC-P2-1：排空循环加硬上限——某路流的 is_ready 若因模型/
+        # 音频异常恒为真，无上限循环会堵住整个单事件循环；超限即
+        # 记 error 并 reset 该设备流（自愈），不让整车停摆。
+        decodes = 0
         while self.spotter.is_ready(self.stream):
+            if decodes >= MAX_DECODE_PER_FRAME:
+                LOG.error("device %s: is_ready still true after %d "
+                          "decodes; resetting stream", self.device_id,
+                          MAX_DECODE_PER_FRAME)
+                self.spotter.reset_stream(self.stream)
+                break
             self.spotter.decode_stream(self.stream)
+            decodes += 1
         result = self.spotter.get_result(self.stream)
         if result:
             self.spotter.reset_stream(self.stream)
             self.wake_count += 1
+            self.frames_at_last_wake = self.frames_since_wake
+            self.frames_since_wake = 0
             return result
+        return None
+
+    def flush_on_disconnect(self, silence_frames=FLUSH_SILENCE_FRAMES):
+        """断开时补喂静音并做最后一次检出（SC-P2-4）：模型需要关键词
+        后约 200ms trailing 音频才吐结果；设备恰在关键词尾音处断线
+        时，不 flush 就会丢这句唤醒。连接已断，wake 事件无处可发，
+        检出时调用方只记一条日志供排障。返回检出的关键词或 None；
+        推理失败返回 None，不抛异常（finally 里调用必须安全）。"""
+        silence = np.zeros(FRAME_SAMPLES, dtype=np.int16)
+        for _ in range(silence_frames):
+            try:
+                keyword = self.feed(silence)
+            except Exception:
+                LOG.warning("device %s: flush on disconnect failed",
+                            self.device_id, exc_info=True)
+                return None
+            if keyword:
+                return keyword
         return None
 
     @property
@@ -159,6 +225,15 @@ class DeviceStream:
             return 0.0
         return round(math.sqrt(
             sum(r * r for r in self.rms_frames) / len(self.rms_frames)), 3)
+
+    @property
+    def rms_peak(self):
+        """窗口内单帧 RMS 的峰值（SC-P2-2）：rms 是 1s 均值，会被
+        trailing 静音稀释（检出越晚稀释越多）；峰值不受检出延迟
+        影响，仲裁比较响度时应优先用它。"""
+        if not self.rms_frames:
+            return 0.0
+        return round(max(self.rms_frames), 3)
 
 
 class Server:
@@ -208,6 +283,12 @@ class Server:
                 "devices": len(self.devices),
                 "uptime_s": round(time.monotonic() - self.started_at, 1),
                 "total_wakes": self.total_wakes,
+                # SC-P2-7：每设备累计唤醒次数（此前 wake_count 自增后
+                # 无任何读取方，是死指标）；排障时可直接看出哪台设备
+                # 流异常（某设备 wakes 远高于同屋另一台即疑似误触发）。
+                "device_wakes": {did: stream.wake_count
+                                 for did, (stream, _ws)
+                                 in self.devices.items()},
             }
             if reason is None:
                 body_dict["status"] = "ok"
@@ -243,7 +324,20 @@ class Server:
                 self.connections -= 1
             return
         try:
-            hello_raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            # SC-P2-3：hello 超时是预期内的协议行为（半开连接/端口扫描），
+            # 不是内部异常——单独捕获：记一条 warning，发 "hello timeout"
+            # 后以 1008 关闭，不打 traceback、不误导客户端。
+            try:
+                hello_raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            except asyncio.TimeoutError:
+                LOG.warning("hello timeout: no hello within 10s; closing "
+                            "connection")
+                try:
+                    await self._send_error(ws, "hello timeout")
+                    await ws.close(code=1008, reason="hello timeout")
+                except websockets.ConnectionClosed:
+                    pass
+                return
             if not isinstance(hello_raw, str):
                 await self._send_error(
                     ws, "first message must be a JSON hello text frame")
@@ -262,9 +356,14 @@ class Server:
                 return
             device_id = hello.get("device_id")
             sample_rate = hello.get("sample_rate")
-            if not isinstance(device_id, str) or not device_id:
+            # SC-P2-5：device_id 只判“非空字符串”不够——超长 id 可进字典
+            # 与日志，含 \n 的 id 可伪造日志行。限长 64、字符集限
+            # [A-Za-z0-9_.-]，非法即 error + 1002 关闭。
+            if (not isinstance(device_id, str)
+                    or not DEVICE_ID_RE.fullmatch(device_id)):
                 await self._send_error(
-                    ws, "hello.device_id must be a non-empty string")
+                    ws, "hello.device_id must be 1-64 chars of "
+                        "[A-Za-z0-9_.-]")
                 await ws.close(code=1002, reason="bad device_id")
                 return
             if sample_rate != SAMPLE_RATE:
@@ -336,16 +435,30 @@ class Server:
                             "device_id": device_id,
                             "keyword": keyword,
                             "rms": stream.rms,
+                            # SC-P2-2：同时报峰值——rms 是 1s 均值，会被
+                            # trailing 静音稀释；仲裁比较响度时应优先用
+                            # rms_peak。
+                            "rms_peak": stream.rms_peak,
                             "timestamp_ms": int(time.time() * 1000),
                         }
                         await ws.send(json.dumps(event, ensure_ascii=False))
                         self.total_wakes += 1
-                        LOG.info("wake: device=%s keyword=%s rms=%s",
-                                 device_id, keyword, event["rms"])
+                        # SC-P2-7：wake_count 此前是死指标——日志行写明
+                        # “自该设备连接以来的第 N 次”与“上次检出后喂入
+                        # 的帧数”（每帧 20ms，检出延迟的近似度量）。
+                        LOG.info("wake: device=%s keyword=%s rms=%s "
+                                 "rms_peak=%s wake_no=%d "
+                                 "frames_since_wake=%d",
+                                 device_id, keyword, event["rms"],
+                                 event["rms_peak"], stream.wake_count,
+                                 stream.frames_at_last_wake)
         except websockets.ConnectionClosed:
             pass
         except Exception:  # noqa: BLE001 - 任何异常都不能让服务静默死连接
-            LOG.exception("error handling device %s", device_id)
+            # SC-P2-5：此处 device_id 可能是 hello 校验前的原始输入，
+            # 单行化后再进日志。
+            LOG.exception("error handling device %s",
+                          _safe_device_id(device_id))
             try:
                 await self._send_error(ws, "internal error")
             except websockets.ConnectionClosed:
@@ -355,6 +468,18 @@ class Server:
             if device_id is not None:
                 entry = self.devices.get(device_id)
                 if entry is not None and entry[0] is stream:
+                    # SC-P2-4：断开时补喂静音做最后一次检出（模型需要
+                    # 关键词后约 200ms trailing 音频才吐结果）；检出只
+                    # 记日志——连接已断，wake 事件无处可发。被取代的旧
+                    # 流不 flush（其音频已过期、状态已作废）。
+                    if stream is not None and not stream.replaced:
+                        lost = stream.flush_on_disconnect()
+                        if lost:
+                            LOG.warning(
+                                "wake lost on disconnect: device=%s "
+                                "keyword=%s (keyword ended right before "
+                                "disconnect; no connection left to deliver "
+                                "the wake event)", device_id, lost)
                     del self.devices[device_id]
                     LOG.info("device disconnected, stream state dropped: %s",
                              device_id)
@@ -377,9 +502,11 @@ def build_arg_parser():
     p.add_argument("--keywords-file",
                    default=os.environ.get("KWS_KEYWORDS_FILE", ""))
     p.add_argument("--threshold", type=float,
-                   default=float(os.environ.get("KWS_THRESHOLD", "0.25")))
+                   default=float(os.environ.get(
+                       "KWS_THRESHOLD", str(DEFAULT_THRESHOLD))))
     p.add_argument("--score", type=float,
-                   default=float(os.environ.get("KWS_SCORE", "1.0")))
+                   default=float(os.environ.get(
+                       "KWS_SCORE", str(DEFAULT_SCORE))))
     p.add_argument("--num-threads", type=int,
                    default=int(os.environ.get("KWS_NUM_THREADS", "1")))
     p.add_argument("--token",
@@ -401,6 +528,25 @@ async def amain():
         format="%(asctime)s %(levelname)s %(name)s %(message)s")
     keywords_file = args.keywords_file or os.path.join(args.model_dir,
                                                        KEYWORDS)
+    # SC-P2-6：阈值/分数启动期校验——配错时边车要么永不唤醒、要么狂
+    # 误触发，且 sherpa 未必 clamp；越界即 FATAL 退出，不静默跑。
+    # 与 tests/bootstrap.py 的 _verify_thresholds() 同源（同一环境
+    # 变量、同一合法范围），两边改阈值不会悄悄分叉。
+    if not 0 < args.threshold <= 1:
+        LOG.error("FATAL: --threshold / KWS_THRESHOLD must be in (0, 1]; "
+                  "got %s", args.threshold)
+        sys.exit(1)
+    if args.score < 0:
+        LOG.error("FATAL: --score / KWS_SCORE must be >= 0; got %s",
+                  args.score)
+        sys.exit(1)
+    if (args.threshold, args.score) != (DEFAULT_THRESHOLD, DEFAULT_SCORE):
+        LOG.warning("KWS threshold/score differ from the experimentally "
+                    "verified values (threshold=%s, score=%s): "
+                    "threshold=%s score=%s; tests/bootstrap.py reads the "
+                    "same env vars for sample verification, keep them in "
+                    "sync", DEFAULT_THRESHOLD, DEFAULT_SCORE,
+                    args.threshold, args.score)
     # 鉴权 Token 是启动前置条件：未配或太短即拒绝启动（SC-P1-3 fail-closed，
     # 与 Hub 的 OPEN_XIAOAI_TOKEN 规则一致；Token 值绝不记日志）。
     token = args.token
