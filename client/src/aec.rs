@@ -363,7 +363,9 @@ mod tests {
     /// C-1 的失配；白噪声只有对齐进抽头窗才能抵消。
     fn noise_signal(total_samples: usize, amp: i16) -> Vec<i16> {
         let mut state: u32 = 0x1234_5678;
-        let mut out = Vec::with_capacity(total_samples);
+        // 不用 with_capacity：semgrep 规则 3 要求 Vec 容量须为字面量/常量/.len()；
+        // 测试 helper 的长度来自调用方，Vec::new + push 即可，无性能要求。
+        let mut out = Vec::new();
         for _ in 0..total_samples {
             // LCG（glibc 常数），取高 15 位再缩放到 ±amp。
             state = state.wrapping_mul(1103515245).wrapping_add(12345);
