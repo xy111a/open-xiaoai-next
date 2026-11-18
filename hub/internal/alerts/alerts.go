@@ -13,6 +13,7 @@ package alerts
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -45,15 +46,35 @@ func (k Kind) Chinese() string {
 	return ""
 }
 
-// KindFor 按 entity_id 判断是不是安全类实体（与旧 main.go 接线同一规则：
-// entity_id 含 leak/smoke/water 任一子串）。
+// KindFor 按 entity_id 判断是不是安全类实体（P2-26）：
+// 必须同时满足两点才算：
+//  1. domain 是 binary_sensor（sensor.water_heater_status 这类
+//     热水器状态实体不再误判为水浸）；
+//  2. 对象名按 "_" 分词后含 leak/smoke/water 词元（子串匹配会把
+//     water_heater 当水浸；词元匹配 + 下面的排除表兜底）。
+//
+// 含 heater/battery/temperature/humidity 等非报警词元的一律不算。
 func KindFor(entityID string) (Kind, bool) {
+	parts := strings.SplitN(entityID, ".", 2)
+	if len(parts) != 2 || parts[0] != "binary_sensor" {
+		return "", false
+	}
+	tokens := strings.Split(parts[1], "_")
+	tokenSet := map[string]bool{}
+	for _, tok := range tokens {
+		tokenSet[tok] = true
+	}
+	for _, excl := range []string{"heater", "battery", "temperature", "humidity", "tamper"} {
+		if tokenSet[excl] {
+			return "", false
+		}
+	}
 	switch {
-	case strings.Contains(entityID, "leak"):
+	case tokenSet["leak"]:
 		return KindLeak, true
-	case strings.Contains(entityID, "smoke"):
+	case tokenSet["smoke"]:
 		return KindSmoke, true
-	case strings.Contains(entityID, "water"):
+	case tokenSet["water"]:
 		return KindWater, true
 	}
 	return "", false
@@ -128,16 +149,25 @@ func AnnouncementText(entityID string) (string, bool) {
 	return "注意，" + LocationOf(entityID) + kind.Chinese() + "报警了，请检查一下。", true
 }
 
-// InDoNotDisturb 判断是否在勿扰时段（格式 "23:00-07:00"，可跨午夜；格式不对按不在算）。
+// InDoNotDisturb 判断是否在勿扰时段（格式 "23:00-07:00"，可跨午夜）。
+// P2-25：空串表示未配勿扰，返回 false；非空但格式非法时返回 true
+// （fail-closed：按“在勿扰”保守处理并记 warn，深夜不再误播报）。
+// config.Validate 已在启动时校验格式，这里的保守分支只兜底
+// 未经 Validate 的直接调用。
 func InDoNotDisturb(spec string, now time.Time) bool {
+	if strings.TrimSpace(spec) == "" {
+		return false
+	}
 	parts := strings.Split(spec, "-")
 	if len(parts) != 2 {
-		return false
+		log.Printf("alerts: 勿扰时段格式非法 %q，按在勿扰处理", spec)
+		return true
 	}
 	start, err1 := time.Parse("15:04", strings.TrimSpace(parts[0]))
 	end, err2 := time.Parse("15:04", strings.TrimSpace(parts[1]))
 	if err1 != nil || err2 != nil {
-		return false
+		log.Printf("alerts: 勿扰时段格式非法 %q，按在勿扰处理", spec)
+		return true
 	}
 	minutes := now.Hour()*60 + now.Minute()
 	s := start.Hour()*60 + start.Minute()

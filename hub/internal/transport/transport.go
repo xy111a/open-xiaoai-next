@@ -475,12 +475,16 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		_ = ws.Close()
 		return
 	}
-	// hello 失败统一记限流（P1-3），拒绝原因仍按 P2-2 的区分枚举
-	// 原样返回（本轮不改拒绝文案，避免客户端解析依赖断裂）。
+	// hello 失败统一记限流（P1-3）。P2-2：拒绝原因统一回一个
+	// 通用 reason，不区分“首条非 hello / 解析失败 / Token 错 /
+	// 型号不支持”——否则攻击者可枚举“Token 对了但型号不对”。
+	// 具体原因只记服务端日志（客户端只看 hello_reject 类型，
+	// 不解析 reason 文本，见 client/src/transport.rs）。
 	reject := func(reason string) {
 		s.recordHelloFailure(host)
+		log.Printf("transport: 设备 hello 被拒（%s，原因：%s）", host, reason)
 		_ = ws.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		_ = ws.WriteJSON(map[string]string{"type": "hello_reject", "reason": reason})
+		_ = ws.WriteJSON(map[string]string{"type": "hello_reject", "reason": "rejected"})
 		_ = ws.Close()
 	}
 	var env Envelope
@@ -501,6 +505,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		reject("unsupported model")
 		return
 	}
+	// P2-3：hello 的自由文本字段限长——超长 Version/Model 直接丢弃
+	// 该字段；房间名非法时当未上报处理（不进注册表与日志）。
+	hello.Version = registry.SanitizeField(hello.Version)
+	if err := registry.ValidateRoomName(hello.Room); hello.Room != "" && err != nil {
+		log.Printf("transport: 设备 %s hello 的房间名不合法，已忽略: %v", host, err)
+		hello.Room = ""
+	}
 	s.clearHelloFailures(host)
 	deviceID := hello.Model + "-" + strings.ReplaceAll(host, ".", "-")
 	c := &Conn{DeviceID: deviceID, conn: ws}
@@ -515,8 +526,11 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	s.reg.Upsert(registry.Device{
 		ID: deviceID, Model: hello.Model, IP: host,
-		Room: hello.Room, Version: hello.Version,
+		Version: hello.Version,
 	})
+	// P2-51：hello 的 room 只在注册表当前无房间时填充——语音认领的
+	// 房间优先，设备重连不得用 client.toml 里的静态 room 覆盖认领。
+	s.reg.FillRoomIfEmpty(deviceID, hello.Room)
 	s.reg.SetOnline(deviceID, true)
 	// N-P2-9（顺带）：hello_ok 写前设写 deadline，对端只建连不读时
 	// 不再永久阻塞在写上。必须走 c.SendJSON 而不是 ws.WriteJSON：
@@ -638,6 +652,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		case "status":
 			var m Status
 			if json.Unmarshal(data, &m) == nil {
+				// P2-3：status 的 Version 超长即丢弃，不进注册表。
+				m.Version = registry.SanitizeField(m.Version)
 				s.handler.OnStatus(deviceID, m)
 			}
 		case "rpc_result":
@@ -683,7 +699,10 @@ func (s *Server) handleRegister(c *Conn, deviceID, helloModel string, data []byt
 	s.regMu.Lock()
 	s.registered[deviceID] = time.Now()
 	s.regMu.Unlock()
-	s.reg.Upsert(registry.Device{ID: deviceID, Model: m.Model, Room: m.Room})
+	s.reg.Upsert(registry.Device{ID: deviceID, Model: m.Model})
+	// P2-51：register 的 room 同 hello——只在当前无房间时填充，
+	// 不得覆盖语音认领；非法房间名直接忽略。
+	s.reg.FillRoomIfEmpty(deviceID, m.Room)
 	s.reg.SetOnline(deviceID, true)
 	_ = c.SendJSON(map[string]string{"type": "register_ok", "device_id": deviceID})
 }

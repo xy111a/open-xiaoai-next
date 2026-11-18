@@ -49,6 +49,16 @@ type streamChunk struct {
 // 旧代码把上游响应全文拼进错误（日志里可能含密钥/长文本），现只留摘要。
 const maxUpstreamErrorBody = 512
 
+// maxUpstreamBody 是上游成功响应体的读取上限（P2-7，1MB；
+// 正常 chat 响应远小于此值，超限即报错，不读无界数据）。
+const maxUpstreamBody = 1 << 20
+
+// maxSSELineBytes 是 ChatStream 里单条 SSE 行的上限（P2-46）：
+// 旧代码用 bufio.Scanner 1MB 上限，超长行直接丢弃整段已生成的回答。
+// 现用 ReadLine 分段读，上限放宽到 4MB；超限时返回已拼接的部分内容 + 错误，
+// 不再把已生成的回答整个丢掉。
+const maxSSELineBytes = 4 << 20
+
 // truncateErrorBody 截断上游错误摘要。
 func truncateErrorBody(s string, n int) string {
 	s = strings.TrimSpace(s)
@@ -99,7 +109,8 @@ func (c *Client) Chat(ctx context.Context, messages []Message) (string, error) {
 		return "", fmt.Errorf("agent %s 返回 %d: %s", c.BaseURL, resp.StatusCode, truncateErrorBody(string(b), maxUpstreamErrorBody))
 	}
 	var out chatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	// P2-7：成功响应体同样限长解码（上游异常返回超大 body 不再打满内存）。
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxUpstreamBody)).Decode(&out); err != nil {
 		return "", err
 	}
 	if out.Error != nil {
@@ -137,10 +148,20 @@ func (c *Client) ChatStream(ctx context.Context, messages []Message, onDelta fun
 		return "", fmt.Errorf("agent %s 返回 %d: %s", c.BaseURL, resp.StatusCode, truncateErrorBody(string(b), maxUpstreamErrorBody))
 	}
 	var full strings.Builder
-	sc := bufio.NewScanner(resp.Body)
-	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
+	// P2-46：不用 bufio.Scanner（行缓冲上限 1MB，超长行会丢整段回答），
+	// 改用 ReadLine 分段读：行可跨多次 ReadLine 拼接，上限 4MB；
+	// 读错或行超限时返回已拼接的部分内容 + 错误（调用方可播已生成部分，
+	// 而不是拿到空串）。
+	rd := bufio.NewReader(resp.Body)
+	for {
+		line, err := readSSELine(rd)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return full.String(), err
+		}
+		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
@@ -163,8 +184,24 @@ func (c *Client) ChatStream(ctx context.Context, messages []Message, onDelta fun
 			}
 		}
 	}
-	if err := sc.Err(); err != nil {
-		return "", err
-	}
 	return full.String(), nil
+}
+
+// readSSELine 用 ReadLine 分段读一整行（SSE 行可能很长）：
+// 行长超过 maxSSELineBytes 即报错（已读片段丢弃，调用方按部分内容处理）。
+func readSSELine(rd *bufio.Reader) (string, error) {
+	var line []byte
+	for {
+		frag, isPrefix, err := rd.ReadLine()
+		if err != nil {
+			return "", err
+		}
+		if len(line)+len(frag) > maxSSELineBytes {
+			return "", fmt.Errorf("agent SSE 行超过 %d 字节上限", maxSSELineBytes)
+		}
+		line = append(line, frag...)
+		if !isPrefix {
+			return string(line), nil
+		}
+	}
 }

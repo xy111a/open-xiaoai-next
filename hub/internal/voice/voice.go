@@ -272,6 +272,14 @@ func (p *Pipeline) answer(ctx context.Context, deviceID string, pcm []int16) (er
 		samples = append(samples, int16(audio[i])|int16(audio[i+1])<<8)
 	}
 	var frames [][]byte
+	// P2-48：尾部不足一帧（320 点）的采样补零到整帧再编码——
+	// 旧代码直接丢弃，TTS 尾音（常 <20ms，短回复可能整句 <320 点
+	// 即零帧）会丢失；短于一帧的回复也不再发空帧列表。
+	if rem := len(samples) % opus.FrameSize; rem != 0 {
+		for i := 0; i < opus.FrameSize-rem; i++ {
+			samples = append(samples, 0)
+		}
+	}
 	for i := 0; i+opus.FrameSize <= len(samples); i += opus.FrameSize {
 		f, err := enc.Encode(samples[i : i+opus.FrameSize])
 		if err != nil {

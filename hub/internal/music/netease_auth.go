@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -95,7 +96,8 @@ func (a *NeteaseAuth) save(cookie string) error {
 		return err
 	}
 	dir := filepath.Dir(a.cookiePath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	// P2-4：cookie 目录 0700（旧代码 0755；cookie 文件本身已是 0600）。
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
 	tmp, err := os.CreateTemp(dir, ".netease-cookie-*.tmp")
@@ -160,7 +162,8 @@ func (a *NeteaseAuth) getJSON(ctx context.Context, u string, cookie string, out 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("netease-api 返回 %d", resp.StatusCode)
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	// P2-7：上游响应体限长 1MB 解码（与 NeteaseClient 的 cappedBodyDecoder 同限）。
+	return json.NewDecoder(io.LimitReader(resp.Body, maxUpstreamBody)).Decode(out)
 }
 
 // CreateQR 建一个登录二维码：返回 key（轮询用）、qrurl（扫码地址）、

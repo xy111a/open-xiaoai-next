@@ -6,9 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// memSeq 是 Set 生成 key 的进程内自增序号（与纳秒时间戳组合，
+// P2-15：纳秒时间戳 + 序号，同一纳秒内两次“记住”也不会撞 key）。
+var memSeq atomic.Uint64
 
 // Memory 是一台设备（或全屋）的记忆。
 type Memory struct {
@@ -39,15 +45,16 @@ func (m *Memory) Load() error {
 	return json.Unmarshal(b, &m.data)
 }
 
-// Set 记一条（key 用纳秒时间戳，value 存原文；查的时候按原文匹配）。
-// key 必须用纳秒级：秒级 RFC3339 会让同一秒内的两条“记住”互相覆盖。
+// Set 记一条（key 用纳秒时间戳 + 自增序号，value 存原文；查的时候按原文匹配）。
+// key 必须用纳秒级 + 序号：秒级 RFC3339 会让同一秒内的两条“记住”互相覆盖
+// （P2-15；P1-41 顺带改的纳秒 key 已闭合秒级碰撞，序号再兜底同一纳秒）。
 func (m *Memory) Set(deviceID, text string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.data[deviceID] == nil {
 		m.data[deviceID] = map[string]string{}
 	}
-	m.data[deviceID][fmt.Sprintf("%d", time.Now().UnixNano())] = text
+	m.data[deviceID][fmt.Sprintf("%d-%d", time.Now().UnixNano(), memSeq.Add(1))] = text
 	return m.saveLocked()
 }
 
@@ -70,9 +77,29 @@ func (m *Memory) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	tmp := m.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0644); err != nil {
+	// P2-4：记忆文件含用户语音原文，落盘 0600；唯一临时文件。
+	dir := filepath.Dir(m.path)
+	f, err := os.CreateTemp(dir, ".memory-*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, m.path)
+	tmp := f.Name()
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, 0600); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, m.path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }

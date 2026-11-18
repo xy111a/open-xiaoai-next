@@ -10,11 +10,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net"
 	"sync"
 	"time"
 )
+
+// maxUnknownEvents 是 Transcribe/Synthesize 读循环里连续未知事件的上限
+// （P2-17）：旧代码遇未知类型只静默循环，全靠 120s 整体超时兜底；
+// 现连续 10 个未知事件即报错（服务端行为异常时早失败、不空转）。
+const maxUnknownEvents = 10
+
+// expectedSampleRate 是语音管线假定的采样率（P2-48）：
+// Piper 应返回 16kHz 单声道 PCM；audio-start 带的 rate 不是 16000
+// 即报错，不让变调/变速的语音悄悄播出去。
+const expectedSampleRate = 16000
 
 // P1-1 防护上限：单条 Wyoming 负载（音频 chunk）最大 1MB；
 // 头行（JSON）最大 64KB；读写各设 10s deadline。
@@ -222,6 +233,7 @@ func (c *Client) Transcribe(pcm []byte, language string) (text string, err error
 	if err := c.writeEvent(map[string]any{"type": "audio-stop"}, nil); err != nil {
 		return "", err
 	}
+	unknown := 0
 	for {
 		if time.Now().After(deadline) {
 			return "", fmt.Errorf("wyoming: transcribe 超过 %v 未返回 transcript", transcribeTimeout)
@@ -236,6 +248,15 @@ func (c *Client) Transcribe(pcm []byte, language string) (text string, err error
 			return text, nil
 		case "error":
 			return "", fmt.Errorf("wyoming stt error: %v", header["text"])
+		default:
+			// P2-17：未知事件类型计数，连续超限即报错，不静默空转。
+			unknown++
+			if unknown == 1 || unknown%maxUnknownEvents == 0 {
+				log.Printf("wyoming: transcribe 收到未知事件类型 %v（连续 %d 个）", header["type"], unknown)
+			}
+			if unknown >= maxUnknownEvents {
+				return "", fmt.Errorf("wyoming: transcribe 连续收到 %d 个未知事件类型，服务端行为异常", maxUnknownEvents)
+			}
 		}
 	}
 }
@@ -258,6 +279,7 @@ func (c *Client) Synthesize(text, voice string) (pcm []byte, err error) {
 	}, nil); err != nil {
 		return nil, err
 	}
+	unknown := 0
 	for {
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("wyoming: synthesize 超过 %v 未返回 audio-stop", synthesizeTimeout)
@@ -268,7 +290,12 @@ func (c *Client) Synthesize(text, voice string) (pcm []byte, err error) {
 		}
 		switch header["type"] {
 		case "audio-start":
-			// 忽略，继续收 chunk。
+			// P2-48：校验合成采样率——audio-start 带 rate 且不是 16kHz
+			// 即报错（变调/变速的语音不播）；不带 rate 字段时放行
+			// （旧版 Piper 不发 rate，按默认 16kHz 处理）。
+			if rate, ok := header["rate"].(float64); ok && int(rate) != expectedSampleRate {
+				return nil, fmt.Errorf("wyoming: tts 采样率 %d 不是 %d，拒绝播放", int(rate), expectedSampleRate)
+			}
 		case "audio-chunk":
 			if len(pcm)+len(payload) > MaxSynthesizeTotal {
 				return nil, fmt.Errorf("wyoming: tts 音频累积超过 %d 字节上限", MaxSynthesizeTotal)
@@ -278,6 +305,15 @@ func (c *Client) Synthesize(text, voice string) (pcm []byte, err error) {
 			return pcm, nil
 		case "error":
 			return nil, fmt.Errorf("wyoming tts error: %v", header["text"])
+		default:
+			// P2-17：未知事件类型计数，连续超限即报错，不静默空转。
+			unknown++
+			if unknown == 1 || unknown%maxUnknownEvents == 0 {
+				log.Printf("wyoming: synthesize 收到未知事件类型 %v（连续 %d 个）", header["type"], unknown)
+			}
+			if unknown >= maxUnknownEvents {
+				return nil, fmt.Errorf("wyoming: synthesize 连续收到 %d 个未知事件类型，服务端行为异常", maxUnknownEvents)
+			}
 		}
 	}
 }

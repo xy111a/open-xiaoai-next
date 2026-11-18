@@ -24,18 +24,11 @@ wake_word_routes:
   "你好小李": hermes
   "你好龙虾": openclaw
 
-# 已发现的设备（Hub 启动时自动发现写入；手工改也行）
-# IP 由 mDNS/ARP 扫描得到；room 由语音认领写入，未认领为空。
-devices:
-  # 示例占位：第一次启动后由自动发现替换
-  livingroom-speaker:
-    model: lx06
-    ip: ""
-    room: ""
-  bedroom-speaker:
-    model: oh2p
-    ip: ""
-    room: ""
+# 已注册的设备（P2-27/P2-51：空 IP 占位已删——占位键与设备真实 ID
+# 对不上，注册表里会留幽灵行；设备由 register 主动注册写入，
+# 种子只保留带真实 IP 的条目，手工改也行）。
+# IP 由设备注册时上报；room 由语音认领写入，未认领为空。
+devices: {}
 
 # 音乐文件夹，默认 /volume1/music；不存在时只警告，本地曲库兜底不可用
 #（点歌仍走网易云直连，不阻塞启动）。

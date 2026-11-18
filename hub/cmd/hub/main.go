@@ -11,6 +11,7 @@ import (
 	"log"
 	"math"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -299,6 +300,16 @@ func (h *hubHandler) OnRoomClaim(deviceID string, room string) {
 	if room == "" {
 		return
 	}
+	// P2-3：房间名先校验——超长/含控制字符直接拒绝，不进注册表、
+	// 配置文件与日志（SetRoom 内部也会再拦一道，这里先拦是为
+	// 了给设备回一个明确的失败，而不是静默无事发生）。
+	if err := registry.ValidateRoomName(room); err != nil {
+		log.Printf("房间认领被拒（%s）：%v", deviceID, err)
+		if c, ok := h.server.Conn(deviceID); ok {
+			_ = c.SendJSON(map[string]string{"type": "room_reject", "reason": err.Error()})
+		}
+		return
+	}
 	if !h.reg.SetRoom(deviceID, room) {
 		return
 	}
@@ -384,16 +395,40 @@ func (h *hubHandler) openSession(deviceID string) {
 }
 
 // sweepSessions 清理过期会话（每秒一次）。
-func (h *hubHandler) sweepSessions() {
-	for range time.Tick(time.Second) {
-		now := time.Now()
-		h.sessMu.Lock()
-		for id, until := range h.sessions {
-			if now.After(until) {
-				delete(h.sessions, id)
+// P2-53：time.Tick 改 NewTicker + done 退出（旧代码 ticker 永不 Stop，
+// 且 goroutine 在进程退出前永不返回）。
+func (h *hubHandler) sweepSessions(done <-chan struct{}) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			now := time.Now()
+			h.sessMu.Lock()
+			for id, until := range h.sessions {
+				if now.After(until) {
+					delete(h.sessions, id)
+				}
 			}
+			h.sessMu.Unlock()
 		}
-		h.sessMu.Unlock()
+	}
+}
+
+// tightenFilePerm 把已存在文件的权限收紧到 perm（P2-4）：
+// 文件不存在时什么都不做；收紧失败只记日志，不阻塞启动。
+func tightenFilePerm(path string, perm os.FileMode) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	if fi.Mode().Perm() == perm {
+		return
+	}
+	if err := os.Chmod(path, perm); err != nil {
+		log.Printf("收紧 %s 权限到 %o 失败: %v", path, perm, err)
 	}
 }
 
@@ -425,9 +460,15 @@ func main() {
 	if err := transport.ValidateToken(token); err != nil {
 		log.Fatalf("OPEN_XIAOAI_TOKEN 无效: %v", err)
 	}
-	if err := os.MkdirAll(cfg.Hub.DataDir, 0755); err != nil {
+	// P2-4：数据目录 0700（旧代码 0755，同 NAS 多用户可列目录）；
+	// 已有的数据文件（提醒/记忆含用户语音原文）在启动时收紧到 0600。
+	if err := os.MkdirAll(cfg.Hub.DataDir, 0700); err != nil {
 		log.Fatalf("建数据目录失败: %v", err)
 	}
+	tightenFilePerm(filepath.Join(cfg.Hub.DataDir, "reminders.json"), 0600)
+	tightenFilePerm(filepath.Join(cfg.Hub.DataDir, "memory.json"), 0600)
+	tightenFilePerm(filepath.Join(cfg.Hub.DataDir, "netease-cookie.json"), 0600)
+	tightenFilePerm(*cfgPath, 0600)
 
 	reg := registry.New()
 	for id, d := range cfg.Devices {
@@ -436,6 +477,15 @@ func main() {
 		if strings.TrimSpace(d.IP) == "" {
 			log.Printf("种子设备 %s（%s）IP 为空，跳过注册，等设备主动注册", id, d.Model)
 			continue
+		}
+		// P2-51：种子键归一化为真实 ID（model-IP，IP 里的 "." 换 "-"）——
+		// 旧代码按 config.yaml 里的键原样注册，种子键
+		// livingroom-speaker 与真实 ID lx06-<ip> 永远对不上，
+		// 注册表里新旧条目并存、越积越多。
+		realID := transport.DeviceIDFor(d.Model, d.IP)
+		if id != realID {
+			log.Printf("种子设备键 %q 已归一化为真实 ID %q", id, realID)
+			id = realID
 		}
 		reg.Upsert(registry.Device{ID: id, Model: d.Model, IP: d.IP, Room: d.Room})
 	}
@@ -484,9 +534,15 @@ func main() {
 
 	// 提醒与记忆。
 	remStore := reminders.New(cfg.Hub.DataDir+"/reminders.json", nil)
-	_ = remStore.Load()
+	// P2-44：Load 失败不再静默吞掉（损坏文件已由 Store 备份，
+	// 这里记日志让运维知道今天的提醒可能丢了）。
+	if err := remStore.Load(); err != nil {
+		log.Printf("提醒存储加载失败: %v", err)
+	}
 	memory := router.NewMemory(cfg.Hub.DataDir + "/memory.json")
-	_ = memory.Load()
+	if err := memory.Load(); err != nil {
+		log.Printf("场景记忆加载失败: %v", err)
+	}
 
 	// 语音管线（STT/TTS 走 Wyoming Dialer，P1-27：懒拨号，断线后
 	// 下次调用自动重拨重试一次；失败时错误带“STT/TTS 不可用”前缀，
@@ -597,9 +653,22 @@ func main() {
 	// 不再需要重启 Hub；接管原有的 MPD/Snap 启动重试 goroutine。
 	// （Wyoming 走 Dialer 懒重拨，不用看门狗管；HA 重连后要给
 	// alerts Watcher 重订，见下面的 watcher 变量。）
+	// P2-53：关停通道——后台 goroutine（看门狗、会话清扫、
+	// OTA/对讲/紧急扫荡）收到 done 后退出，不再靠 time.Tick
+	// 泄漏到进程结束。
+	done := make(chan struct{})
+
 	var watcher *alerts.Watcher
 	go func() {
-		for range time.Tick(30 * time.Second) {
+		// P2-53：time.Tick 改 NewTicker + done 退出。
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+			}
 			// MPD：Ping 失败即断开、Router 清空，下轮重拨。
 			if cfg.Hub.MPD != "" {
 				if mpdClient == nil {
@@ -670,36 +739,43 @@ func main() {
 	remStore.SetOnFire(func(r reminders.Reminder) {
 		if r.Kind == reminders.KindAction {
 			// P1-41：定时动作——把 Text 当命令走一遍 Route 执行，
-			// 回复播报到对应房间（无房间时播到第一台在线设备）。
-			devID := ""
+			// 回复播报到对应房间的全部设备（P2-27：旧代码只取
+			// ByRoom 随机一台，同房间的另一台收不到）。
+			// 无房间时播到第一台在线设备。
+			targets := []string{}
 			if r.Room != "" {
-				if d := reg.ByRoom(r.Room); d != nil {
-					devID = d.ID
+				for _, d := range reg.ByRoomAll(r.Room) {
+					targets = append(targets, d.ID)
 				}
 			}
-			if devID == "" {
+			if len(targets) == 0 {
 				if online := reg.Online(); len(online) > 0 {
-					devID = online[0].ID
+					targets = append(targets, online[0].ID)
 				}
 			}
-			if devID == "" {
+			if len(targets) == 0 {
 				log.Printf("定时动作无在线设备，跳过：%s", r.Text)
 				return
 			}
-			reply, err := rt.Route(context.Background(), devID, r.Text)
+			reply, err := rt.Route(context.Background(), targets[0], r.Text)
 			if err != nil {
 				log.Printf("定时动作执行失败（%s）: %v", r.Text, err)
 				return
 			}
 			if reply != "" && h.speakText != nil {
-				h.speakText(devID, reply)
+				for _, devID := range targets {
+					h.speakText(devID, reply)
+				}
 			}
 			return
 		}
 		text := "提醒你" + r.Text
 		if r.Room != "" {
-			if d := reg.ByRoom(r.Room); d != nil && h.speakText != nil {
-				h.speakText(d.ID, text)
+			// P2-27：房间播报给该房间全部在线设备，不再随机一台。
+			if devs := reg.ByRoomAll(r.Room); len(devs) > 0 && h.speakText != nil {
+				for _, d := range devs {
+					h.speakText(d.ID, text)
+				}
 				return
 			}
 		}
@@ -748,6 +824,18 @@ func main() {
 			}
 			frames = append(frames, f)
 		}
+		// P2-48：尾部不足一帧的采样补零到整帧再编码（与 voice.answer
+		// 同款）——旧代码直接丢掉，TTS 尾音（常是句尾词）被吞。
+		if rest := len(samples) % opus.FrameSize; rest != 0 {
+			tail := make([]int16, opus.FrameSize)
+			copy(tail, samples[len(samples)-rest:])
+			f, err := enc.Encode(tail)
+			if err != nil {
+				log.Printf("speakText 尾帧编码失败（给 %s）: %v", deviceID, err)
+				return
+			}
+			frames = append(frames, f)
+		}
 		h.playFrames(deviceID, frames)
 	}
 
@@ -786,12 +874,20 @@ func main() {
 			}
 		}
 	})
-	go h.sweepSessions()
+	go h.sweepSessions(done)
 
 	// P1-9/P1-15：每 10s 扫一次——OTA 超时任务标失败（pushing 超 10 分钟
 	// 或 verifying 超 30s）、对讲超时会话挂断、紧急呼叫过期清理。
+	// P2-53：time.Tick 改 NewTicker + done 退出。
 	go func() {
-		for range time.Tick(10 * time.Second) {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+			}
 			if failed := otaMgr.Sweep(time.Now()); len(failed) > 0 {
 				log.Printf("OTA 扫荡：任务失败（超时未验证）: %v", failed)
 			}
@@ -808,7 +904,9 @@ func main() {
 	// 降级为日志 + /api/status 报告 kws_down，音频流重连后自动恢复。
 	var kwsClient *kws.Client
 	if cfg.KWS.Enabled {
-		c, err := kws.New(cfg.KWS.URL, kws.Options{Keywords: cfg.KWS.Keywords, Token: config.Token()})
+		// N-P2-10：边车走 wss + 自签证书时，把 config.yaml 配的
+		// 指纹交给 Client（拨号与健康检查共用 pin 配置）。
+		c, err := kws.New(cfg.KWS.URL, kws.Options{Keywords: cfg.KWS.Keywords, Token: config.Token(), TLSFingerprint: cfg.KWS.Fingerprint})
 		if err != nil {
 			log.Fatalf("kws 配置无效: %v", err)
 		}
@@ -858,15 +956,19 @@ func main() {
 		log.Printf("wss 已启用（mTLS：要求客户端证书），Hub 证书指纹：%s（刷机前写进 client.toml 的 hub_ca_fingerprint；也可经 Web 面板 /api/fingerprint 取回）", fp)
 	}
 	// 传输层：wss :4399（或 tls=false 时纯 ws）。
+	// P2-53：服务 goroutine 里不再 log.Fatalf（旧代码服务一崩
+	// 整个 Hub 直接 exit，且提醒/记忆来不及落盘）——错误走
+	// serveErr 通道，由主流程统一关停。
+	serveErr := make(chan error, 1)
 	go func() {
 		if cfg.TLSEnabled() {
 			if err := server.Serve(ln, serverCert); err != nil {
-				log.Fatalf("wss 服务退出: %v", err)
+				serveErr <- fmt.Errorf("wss 服务退出: %w", err)
 			}
 		} else {
 			log.Printf("警告：TLS 已关闭，走纯 ws（仅本地测试）")
 			if err := server.Serve(ln, nil); err != nil {
-				log.Fatalf("ws 服务退出: %v", err)
+				serveErr <- fmt.Errorf("ws 服务退出: %w", err)
 			}
 		}
 	}()
@@ -900,10 +1002,12 @@ func main() {
 			"type": "ota", "version": version, "url": url, "sha256": sha256,
 		})
 	}
+	// P2-53：Web 服务句柄留给关停流程做 Shutdown（旧代码只记
+	// 日志、进程退出时不优雅关闭）。
+	webSrv := webServer.NewHTTPServer()
 	go func() {
-		srv := webServer.NewHTTPServer()
-		log.Printf("Web 面板：http://%s", srv.Addr)
-		if err := srv.ListenAndServe(); err != nil {
+		log.Printf("Web 面板：http://%s", webSrv.Addr)
+		if err := webSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("Web 面板退出: %v", err)
 		}
 	}()
@@ -925,15 +1029,45 @@ func main() {
 
 	log.Printf("open-xiaoai-hub 已启动：唤醒词 %q，监听 %s", cfg.WakeWord, cfg.Hub.Listen)
 
-	// 等退出信号。
+	// 等退出信号或 wss 服务崩溃（二者任一都走同一关停路径）。
+	// P2-53：旧代码只等信号、不调 remStore.Stop()、不关 Wyoming
+	// Dialer/MPD/Snap/Web——提醒可能丢、连接悬着。
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-	log.Printf("收到退出信号，关闭中…")
+	select {
+	case <-sig:
+		log.Printf("收到退出信号，关闭中…")
+	case err := <-serveErr:
+		log.Printf("收到服务退出信号，关闭中…: %v", err)
+	}
+	// 先停后台 goroutine（看门狗/清扫/扫荡），再停各客户端；
+	// 提醒存储最后 Stop（落盘正在进行的提醒）。
+	close(done)
+	if remStore != nil {
+		remStore.Stop()
+	}
 	if kwsClient != nil {
 		kwsClient.Close()
+	}
+	if stt != nil {
+		_ = stt.Close()
+	}
+	if tts != nil {
+		_ = tts.Close()
+	}
+	if mpdClient != nil {
+		mpdClient.Close()
+	}
+	if snapClient != nil {
+		snapClient.Close()
 	}
 	if haClient != nil {
 		_ = haClient.Close()
 	}
+	// Web 面板优雅关闭（5s 内未处理完的请求直接断开）。
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = webSrv.Shutdown(ctx)
+	// alerts.Watcher 没有 Stop：订阅挂在 HA 客户端连接上，
+	// 上面 haClient.Close() 已断开 SSE，监视随之结束。
 }

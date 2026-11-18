@@ -23,20 +23,25 @@ func TestAddRejectsUnknownKind(t *testing.T) {
 
 func TestTickDeletesUnknownKindOnce(t *testing.T) {
 	s := New("", nil)
-	fired := 0
-	s.SetOnFire(func(r Reminder) { fired++ })
+	fired := make(chan struct{}, 10)
+	s.SetOnFire(func(r Reminder) { fired <- struct{}{} })
 	// Add 拦不住手写/旧数据：直接进表模拟磁盘里的未知 Kind。
 	s.mu.Lock()
 	s.items["u1"] = &Reminder{ID: "u1", Kind: "bogus", Text: "x", Enabled: true, Next: time.Now().Add(-time.Second)}
 	s.mu.Unlock()
 	s.tick(time.Now())
-	if fired != 1 {
-		t.Fatalf("未知 Kind 当轮应触发一次后删除，实际触发 %d 次", fired)
+	// P2-44：onFire 已改为异步，等回调。
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("未知 Kind 当轮应触发一次，未收到回调")
 	}
 	// 再扫一次：不应再触发（P1-24 的核心 bug：每秒触发永不停）。
 	s.tick(time.Now())
-	if fired != 1 {
-		t.Fatalf("未知 Kind 删除后不应再触发，实际 %d 次", fired)
+	select {
+	case <-fired:
+		t.Fatal("未知 Kind 删除后不应再触发")
+	case <-time.After(300 * time.Millisecond):
 	}
 	if len(s.List()) != 0 {
 		t.Fatalf("未知 Kind 应从表里删除，实际 %+v", s.List())
@@ -66,19 +71,26 @@ func TestLoadDropsUnknownKind(t *testing.T) {
 
 func TestKindActionFiresOnceThenDeleted(t *testing.T) {
 	s := New("", nil)
-	fired := 0
-	var got Reminder
-	s.SetOnFire(func(r Reminder) { fired++; got = r })
+	fired := make(chan Reminder, 10)
+	s.SetOnFire(func(r Reminder) { fired <- r })
 	if _, err := s.Add(Reminder{Kind: KindAction, Text: "关客厅灯", Room: "客厅", Next: time.Now().Add(-time.Second)}); err != nil {
 		t.Fatal(err)
 	}
 	s.tick(time.Now())
-	if fired != 1 || got.Kind != KindAction || got.Text != "关客厅灯" {
-		t.Fatalf("KindAction 应触发一次，实际 fired=%d got=%+v", fired, got)
+	// P2-44：onFire 已改为异步，等回调。
+	select {
+	case got := <-fired:
+		if got.Kind != KindAction || got.Text != "关客厅灯" {
+			t.Fatalf("KindAction 应触发一次，实际 got=%+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("KindAction 应触发一次，未收到回调")
 	}
 	s.tick(time.Now())
-	if fired != 1 {
-		t.Fatalf("KindAction 触发后应删除、不再触发，实际 %d 次", fired)
+	select {
+	case got := <-fired:
+		t.Fatalf("KindAction 触发后应删除、不再触发，实际 %+v", got)
+	case <-time.After(300 * time.Millisecond):
 	}
 	if len(s.List()) != 0 {
 		t.Fatalf("KindAction 触发后应删除，实际 %+v", s.List())

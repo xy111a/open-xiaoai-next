@@ -238,6 +238,9 @@ func (c *Client) call(msgType string, extra map[string]any) (json.RawMessage, er
 type State struct {
 	EntityID string `json:"entity_id"`
 	State    string `json:"state"`
+	// Attributes 是实体属性（P2-49：场景实体的 attributes.entity_id
+	// 列出场景内含的实体，供执行前做 domain allowlist 校验）。
+	Attributes map[string]any `json:"attributes,omitempty"`
 }
 
 // GetStates 取全部实体状态。
@@ -251,6 +254,39 @@ func (c *Client) GetStates() ([]State, error) {
 		return nil, err
 	}
 	return states, nil
+}
+
+// GetSceneEntityIDs 取一个场景实体内含的实体 ID 列表（P2-49）：
+// 读 scene.<name> 的 attributes.entity_id。场景不存在或属性缺失
+// 时返回错误——调用方应 fail-closed（拒绝执行），不要猜场景内容。
+func (c *Client) GetSceneEntityIDs(sceneEntityID string) ([]string, error) {
+	states, err := c.GetStates()
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range states {
+		if s.EntityID != sceneEntityID {
+			continue
+		}
+		raw, ok := s.Attributes["entity_id"]
+		if !ok {
+			return nil, fmt.Errorf("ha: 场景 %s 没有 entity_id 属性", sceneEntityID)
+		}
+		list, ok := raw.([]any)
+		if !ok {
+			return nil, fmt.Errorf("ha: 场景 %s 的 entity_id 属性格式异常", sceneEntityID)
+		}
+		out := make([]string, 0, len(list))
+		for _, v := range list {
+			id, ok := v.(string)
+			if !ok {
+				return nil, fmt.Errorf("ha: 场景 %s 的 entity_id 里有非字符串项", sceneEntityID)
+			}
+			out = append(out, id)
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("ha: 实体 %s 不存在", sceneEntityID)
 }
 
 // GetEntityState 查一个实体的 state，例如 light.living_room → "on"。

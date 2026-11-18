@@ -65,6 +65,10 @@ type KWS struct {
 	URL string `yaml:"url" json:"url"`
 	// Keywords 是接受的唤醒词表，默认应含 WakeWord（如“你好小李”）。
 	Keywords []string `yaml:"keywords" json:"keywords"`
+	// Fingerprint 是边车 wss 自签证书的 SHA-256 指纹（小写 hex，N-P2-10）：
+	// 配了才允许 wss + 自签证书的边车；不配时 wss 只认系统根证书。
+	// ws 地址下忽略。
+	Fingerprint string `yaml:"fingerprint" json:"fingerprint"`
 }
 
 // Device 是一台音箱。
@@ -176,6 +180,17 @@ func (c *Config) Validate() error {
 		if d.Model != "lx06" && d.Model != "oh2p" {
 			return fmt.Errorf("devices[%s].model 必须是 lx06 或 oh2p，实际是 %q", id, d.Model)
 		}
+		// P2-3：种子设备的房间名同样要合法（非法名字不进注册表与日志）。
+		if d.Room != "" {
+			if len([]rune(d.Room)) > 16 {
+				return fmt.Errorf("devices[%s].room 超过 16 个字符", id)
+			}
+			for _, r := range d.Room {
+				if r == '\n' || r == '\r' || r == '\t' {
+					return fmt.Errorf("devices[%s].room 含控制字符", id)
+				}
+			}
+		}
 		if d.IP != "" {
 			if ip := net.ParseIP(d.IP); ip == nil || !(ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast()) {
 				return fmt.Errorf("devices[%s].ip 必须是内网 IP，实际是 %q", id, d.IP)
@@ -255,6 +270,18 @@ func (c *Config) Validate() error {
 		for _, kw := range c.KWS.Keywords {
 			if strings.TrimSpace(kw) == "" {
 				return fmt.Errorf("kws.keywords 里有空唤醒词")
+			}
+		}
+		// N-P2-10：边车指纹须是 64 位小写 hex（SHA-256），否则配了也认不出。
+		if c.KWS.Fingerprint != "" {
+			fp := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(c.KWS.Fingerprint, ":", ""), " ", ""))
+			if len(fp) != 64 {
+				return fmt.Errorf("kws.fingerprint 必须是 64 位 hex（证书 SHA-256 指纹），实际 %d 位", len(fp))
+			}
+			for _, r := range fp {
+				if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+					return fmt.Errorf("kws.fingerprint 含非 hex 字符")
+				}
 			}
 		}
 	}
@@ -530,7 +557,7 @@ func (c *Config) Save(path string) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	if err := os.Chmod(tmp, 0644); err != nil {
+	if err := os.Chmod(tmp, 0600); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}

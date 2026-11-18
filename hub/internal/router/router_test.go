@@ -99,7 +99,10 @@ func (f *fakeMPD) commands() []string {
 type fakeHA struct {
 	mu     sync.Mutex
 	states map[string]string
-	calls  []string // "domain/service/entity_id"
+	// attrs 是实体的 attributes（P2-49 测试用：场景实体的
+	// attributes.entity_id 列出场景内含的实体）。
+	attrs map[string]map[string]any
+	calls []string // "domain/service/entity_id"
 }
 
 func startFakeHA(t *testing.T) (*fakeHA, *ha.Client) {
@@ -128,7 +131,11 @@ func startFakeHA(t *testing.T) (*fakeHA, *ha.Client) {
 				f.mu.Lock()
 				var out []map[string]any
 				for eid, st := range f.states {
-					out = append(out, map[string]any{"entity_id": eid, "state": st})
+					item := map[string]any{"entity_id": eid, "state": st}
+					if attrs, ok := f.attrs[eid]; ok {
+						item["attributes"] = attrs
+					}
+					out = append(out, item)
 				}
 				f.mu.Unlock()
 				_ = c.WriteJSON(map[string]any{"id": int(id), "type": "result", "success": true, "result": out})
