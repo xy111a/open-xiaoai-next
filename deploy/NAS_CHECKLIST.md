@@ -22,7 +22,7 @@
 
 | # | 做什么 | 预期结果 |
 |---|---|---|
-| 1.1 | `NAS_SSH=root@NAS_IP ./deploy/nas-install.sh`（不带 `up`，只传文件+检查） | 末尾汇总 `FAIL=0`；文件在 `$NAS_DIR/deploy/`（docker-compose.yml / Dockerfile.hub / hub-linux-amd64 / snapserver.conf / .env）和 `$NAS_DIR/hub/config.yaml` |
+| 1.1 | `NAS_SSH=root@NAS_IP ./deploy/nas-install.sh`（不带 `up`，只传文件+检查） | 末尾汇总 `FAIL=0`；文件在 `$NAS_DIR/deploy/`（docker-compose.yml / Dockerfile.hub / hub-linux-amd64 / snapserver.conf / .env）、`$NAS_DIR/hub/config.yaml`，以及 `$NAS_DIR/kws-sidecar/`（构建源文件：Dockerfile / server.py / entrypoint.sh / requirements.txt / scripts/——compose 里边车是 `build: ../kws-sidecar`，只传 deploy/ 的话 `up` 会因构建上下文缺失而失败，2026-11-18 P2 轮已补传） |
 | 1.2 | 脚本第 3 步会自动改 NAS 上的 `config.yaml`：netease 的 `api` 地址改成 `127.0.0.1:3000`，kws.url 若是旧容器名 `ws://kws-sidecar:10400` 也改成 `ws://127.0.0.1:10400`，HA 地址里的 `192.168.1.10` 改成 `NAS_IP`（保持原有 ws/wss 协议，不降级成明文）（NAS 上已有 config 时不覆盖，先备份为带时间戳的 `config.yaml.bak.YYYYMMDDHHMMSS`；首次部署才传种子配置）。2026-11-18 融合 B：`music_assistant` 地址不再改写——该行已废弃，脚本会直接删掉 NAS 副本里的这一行（新 Hub 读到它会拒绝启动）；种子配置里的该行由 Hub 面删除 | 屏幕打印出的 `api:` / `url:` 行是 `127.0.0.1` / `NAS_IP`，`kws:` 下的 `url:` 是 `ws://127.0.0.1:10400/v1/kws`；打印结果里不应再有 `music_assistant:` |
 | 1.3 | 原因（不用改回来）：Hub 跑在 host 网络下，Docker 容器名 `netease-api` / `kws-sidecar` 解析不到，必须用 `127.0.0.1`；kws-sidecar 与 Hub 一样走 host 网络（见 `deploy/docker-compose.yml`）；本机 `hub/config.yaml` 没动 | — |
 
@@ -52,8 +52,8 @@
 |---|---|---|
 | 4.1 | `docker compose logs --tail=50 hub` | 出现 `open-xiaoai-hub 已启动：唤醒词 "你好小李"，监听 :4399` 和 `Web 面板：http://localhost:8080`；STT/TTS 连不上时会记 `Wyoming STT/TTS 连接失败`——刚启动时出现一次是正常的，等 whisper/piper 起好后 Hub 会重连（若一直失败，看 3 的端口） |
 | 4.1a | 同上，看 KWS 一行 + `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' $NAS_DIR/deploy/.env \| cut -d= -f2-); curl -s -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8080/api/status` | Hub 日志出现 `KWS 边车健康检查通过: ws://127.0.0.1:10400/v1/kws`；`/api/status` 里 `"kws_status":"ok"`（若是 `"down"`，看 10400 的 `/health` 与 `docker compose logs kws-sidecar`；刚重启边车后 `kws_status` 最多滞后一个 30s 健康检查周期才回 `ok`，唤醒本身恢复是即时的） |
-| 4.1b | `docker compose logs kws-sidecar \| tail -20` | 出现 `KWS model ready` / 监听 `ws://0.0.0.0:10400/v1/kws`（模型首次下载失败会明确报错退出，`kws-data` 卷里文件不全时重起会重新下载；不要手动往卷里拷模型） |
-| 4.2 | `docker compose logs --tail=30 hub \| grep -i 发现` | 应有自动发现扫描相关行（本机冒烟时无真设备，只验证到日志格式；NAS 上有音箱刷好后才会扫到设备） |
+| 4.1b | `docker compose logs kws-sidecar \| tail -20` | 出现 `KWS model ready` / 监听 `ws://127.0.0.1:10400/v1/kws`（compose 传 `KWS_HOST=127.0.0.1`；旧写法 `0.0.0.0` 是镜像默认，已被 compose 覆盖）（模型首次下载失败会明确报错退出，`kws-data` 卷里文件不全时重起会重新下载；不要手动往卷里拷模型） |
+| 4.2 | `docker compose logs --tail=30 hub \| grep '设备注册制'` | 应有 `设备注册制：…` 行（P1-44 注册制：白名单为空时 `register` 一律拒绝；配好指纹后音箱发 `register` 才注册。自动发现扫描已删，不要再查“发现/扫描”——旧写法已废弃）（本机冒烟时无真设备，只验证到日志格式；NAS 上有音箱刷好后才会注册） |
 | 4.3 | `docker compose logs --tail=100 \| grep -iE 'fatal|panic'` | 无输出（有则把对应容器日志贴回来） |
 | 4.4 | `docker compose logs snapserver \| tail -20`、`docker compose logs mpd \| tail -20` | 无 ERROR/FATAL；snapserver 应加载到 `snapserver.conf` 里 `NAS音乐` 这个流 |
 

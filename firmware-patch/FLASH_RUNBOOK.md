@@ -44,6 +44,17 @@
 > 补丁镜像若被重编（例如另一位修复工人在改 `patch_firmware.py`），SHA256
 > 会变：以重编后 `flash-check.sh` 打印的值为准，并把新值与重编原因记进
 > §8 检查清单，不要硬套上表。
+>
+> 【2026-11-18 P2 轮注：上表镜像是 2026-11-17 打的，内容比现版
+> `patch_firmware.py` 旧三处——(1) inittab 串口仍是免密 `/bin/ash --login`
+> （P1-36 的 `/bin/login` 不在镜像里）；(2) 无 asound `.bak` 备份（P2-33）；
+> (3) rc.local 仍是旧直行 `/data/init.sh`，无 init 包装器校验（P2-34）。
+> `flash-check.sh` §4b 现在会报出来（inittab FAIL + 三处 WARN），按 §0.2
+> 与 §1.4 的规则，该镜像目前过不了干跑检查。处理二选一，不要把 FAIL 当
+> WARN 忽略：(a) 下次重编镜像（SHA 会变，同步更新本表、`flash-check.sh`
+> 的 `KNOWN_PATCHED_SHA256`、`TEST_REPORT.md`、`docs/RELEASE.md`）；或
+> (b) 明确接受该缺口、把豁免理由与责任人记进 §8 检查清单再刷——串口免密
+> 是物理接触即可进 root shell 的缺口，不是小事。】
 
 ### 1.2 恢复用原厂材料（回滚的第二道保险，第一道是未动过的槽，见 §6）
 
@@ -75,9 +86,23 @@ Micro USB 调试口（拆机参考：52audio 38303）。OH2P：底部 Type-C，�
 ```bash
 cd firmware-patch
 ./scripts/flash-check.sh lx06 1.94.13   # 或 oh2p 1.58.6
+# 刷机当天用 --strict 再跑一遍：SHA 与 §1.1 记录值不一致即 FAIL（默认只警告）。
+./scripts/flash-check.sh --strict lx06 1.94.13
 ```
 
 全部 PASS（WARN 只提示、不拦截）才继续。把输出保存下来附在 §8 清单后。
+注意：`--strict` 下 SHA 不一致即 FAIL；§4b 内容验证缺标记即 FAIL
+（.bak 与 init 包装器缺失只警告——旧版补丁产物，下次重编会带上）。
+
+### 1.5 Hub OTA 更新（首刷之后的事，不在首刷流程里）
+
+- 首刷之后再推补丁镜像走 Hub 自有 OTA（`hub/internal/ota`）。**绝不复用
+  原厂 `bin/flash.sh` 推补丁镜像**——它会重写 u-boot；补丁镜像没有小米
+  签名，走不通原厂 OTA，复用它等于把设备变砖。
+- Hub OTA 的 `VerifyTimeout` 是 **30 秒**（`hub/internal/ota/ota.go` 的
+  `VerifyTimeout: 30s`，`PushTimeout` 10 分钟是另一项）：设备须在 30 秒内
+  回 hello，否则任务标失败。设备回 hello 慢（首次启动、网络抖动）时任务
+  会误判失败——先看设备日志再决定是否重推，不要连续重推。
 `flash-check.sh` 只做本地校验：官方 `.bin` / 原始 root.squashfs 白名单
 SHA256、补丁镜像大小 / 魔数 / `unsquashfs -s` 解析、mico_version 一致性。
 设备侧步骤它验不了，见 §2–§6。
