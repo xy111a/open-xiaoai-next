@@ -65,9 +65,9 @@ NAS 上实际运行未验证）。
 
 ## 2026-11-17 部署包更新（G）
 
-- **Hub 二进制已编好**（2026-11-18 P2 轮重编，分支 `fix-p2-loose-ends` 尖 996329c，
-  干净 HEAD worktree 编译）：`deploy/hub-linux-amd64`，12,093,552 字节，
-  SHA256 `95535eee9f1152547b3fe585aef731f33293f1040d09afe73a95b75444ead7de`，
+- **Hub 二进制已编好**（2026-11-18 P2 轮收尾重编，分支 `fix-p2-loose-ends` 尖 afcdcf0，
+  干净 HEAD worktree 编译）：`deploy/hub-linux-amd64`，12,093,544 字节，
+  SHA256 `973a3b1fa2d34acab7a1feaa5c6fb146bc01167735b4c50ba408d1acd0213091`，
   `go build -o deploy/hub-linux-amd64 ./cmd/hub`（hub/ 下，Go 1.23.12）。
   清单 `deploy/hub-linux-amd64.sha256` 已生成（`nas-install.sh` §0 会比对，
   不一致即 FAIL；重编后须重新生成清单）。本机冒烟验证：`--help` 打印用法退出 0；

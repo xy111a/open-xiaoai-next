@@ -21,7 +21,7 @@ hash，bai 手里已有的密码继续有效，未生成新密码。
 |---|---|---|---|---|---|
 | 1 | LX06 补丁镜像 | `images/lx06_1.94.13-root-patched.squashfs` | 38,457,344 | `7dafb9507bdc4894715f2978ffaf5fd6a11af18ad61ed268f48c6309f0a05e21` | `sha256sum images/lx06_1.94.13-root-patched.squashfs` |
 | 2 | OH2P 补丁镜像 | `images/oh2p_1.58.6-root-patched.squashfs` | 30,179,328 | `fe2bab99eb15e423b689c24bace6fec1b665b1073dc12ec1c9fa2e4433b5c926` | `sha256sum images/oh2p_1.58.6-root-patched.squashfs` |
-| 3 | Hub 二进制 | `deploy/hub-linux-amd64` | 12,093,552 | `95535eee9f1152547b3fe585aef731f33293f1040d09afe73a95b75444ead7de` | `sha256sum deploy/hub-linux-amd64`；清单 `deploy/hub-linux-amd64.sha256`（`nas-install.sh` §0 会比对，不一致即 FAIL） |
+| 3 | Hub 二进制 | `deploy/hub-linux-amd64` | 12,093,544 | `973a3b1fa2d34acab7a1feaa5c6fb146bc01167735b4c50ba408d1acd0213091` | `sha256sum deploy/hub-linux-amd64`；清单 `deploy/hub-linux-amd64.sha256`（`nas-install.sh` §0 会比对，不一致即 FAIL） |
 | 4 | 部署包 | `deploy/`（docker-compose.yml / Dockerfile.hub / .dockerignore / snapserver.conf / .env.example / nas-install.sh / NAS_CHECKLIST.md / README.md） | — | — | `python3 -c "import yaml; yaml.safe_load(open('deploy/docker-compose.yml'))"`；`bash -n deploy/nas-install.sh` |
 | 5 | kws-sidecar 构建源 | `kws-sidecar/`（Dockerfile / server.py / entrypoint.sh / requirements.txt / scripts/） | — | — | `ls kws-sidecar/` 四项都在；`nas-install.sh` §2 会打 tar 传到 NAS `$NAS_DIR/kws-sidecar` |
 | 6 | 刷机 runbook | `FLASH_RUNBOOK.md` | — | — | 按 §8 检查清单逐条打勾 |
@@ -66,3 +66,4 @@ OH2P 在 `firmware/oh2p_1.58.6.bin`（36,042,824 字节，SHA256
 |---|---|
 | 2026-11-17 | 补丁镜像重编（P0-2 修复后）：LX06 `7266aba9…d97b3`、OH2P `139de363…6415` |
 | 2026-11-18 | Hub 从分支尖 996329c 重编：12,093,552 字节、`95535eee…ead7de`（融合 B + P1 + P2 Hub 改动后）；digest 钉死（compose 5 个 + Dockerfile.hub 基础镜像）；nas-install.sh 补 kws-sidecar 发货与 Hub 清单校验 |
+| 2026-11-18 | Hub 从分支尖 afcdcf0 再重编：12,093,544 字节、`973a3b1f…3091`（协调员收尾：删 streamFor 死代码 + kws 排空移到 hello 前）；清单已同步更新 |

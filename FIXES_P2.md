@@ -208,7 +208,7 @@ set -e 下不要用 `grep … && fail`，用 if。
 |---|---|---|---|
 | 1 | LX06 补丁镜像（2026-11-18 重编） | `images/lx06_1.94.13-root-patched.squashfs` | 38,457,344 字节，`7dafb9507bdc4894715f2978ffaf5fd6a11af18ad61ed268f48c6309f0a05e21` |
 | 2 | OH2P 补丁镜像（2026-11-18 重编） | `images/oh2p_1.58.6-root-patched.squashfs` | 30,179,328 字节，`fe2bab99eb15e423b689c24bace6fec1b665b1073dc12ec1c9fa2e4433b5c926` |
-| 3 | Hub 二进制 | `deploy/hub-linux-amd64` | 12,093,552 字节，`95535eee9f1152547b3fe585aef731f33293f1040d09afe73a95b75444ead7de`（2026-11-18 从分支尖的干净 HEAD worktree 重编；清单 `deploy/hub-linux-amd64.sha256`） |
+| 3 | Hub 二进制 | `deploy/hub-linux-amd64` | 12,093,544 字节，`973a3b1fa2d34acab7a1feaa5c6fb146bc01167735b4c50ba408d1acd0213091`（2026-11-18 从分支尖 afcdcf0 的干净 HEAD worktree 重编；清单 `deploy/hub-linux-amd64.sha256`） |
 | 4 | 部署包 | `deploy/`（docker-compose.yml / Dockerfile.hub / .dockerignore / snapserver.conf / .env.example / nas-install.sh / NAS_CHECKLIST.md / README.md） | — |
 | 5 | kws-sidecar 构建源 | `kws-sidecar/`（Dockerfile / server.py / entrypoint.sh / requirements.txt / scripts/） | — |
 | 6 | 刷机 runbook | `FLASH_RUNBOOK.md` | — |
