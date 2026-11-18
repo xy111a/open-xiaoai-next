@@ -30,7 +30,7 @@
 
 use anyhow::Result;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use tokio::sync::mpsc;
@@ -45,7 +45,7 @@ mod kws;
 mod sherpa;
 mod transport;
 
-use aec::Aec;
+use aec::{Aec, AEC_REF_DELAY_FRAMES};
 use audio::{Audio, FailureThrottle};
 use kws::Kws;
 use transport::{HubMsg, RawFrame, Transport};
@@ -513,9 +513,14 @@ async fn main() -> Result<()> {
     // 只读。server 模式会话一建立即推流，初始值 true；local 模式 false。
     let pushing = Arc::new(AtomicBool::new(cfg.is_server_kws_mode()));
     let pushing_capture = pushing.clone();
+    // C-1：AEC 参考延迟帧数（共享原子值）。初值是标称 4 帧；会话每次
+    // 打开播放设备后按实际 ALSA 缓冲重新推导并写回，录音任务每帧取
+    // 最新值——播放缓冲若被硬件取整为 3/5 周期，延迟不再静默错位。
+    let aec_delay_frames = Arc::new(AtomicUsize::new(AEC_REF_DELAY_FRAMES));
+    let aec_delay_frames_capture = aec_delay_frames.clone();
     let capture_handle = tokio::spawn(async move {
         let mut kws = kws;
-        let mut aec = Aec::new();
+        let mut aec = Aec::with_delay_frames(aec_delay_frames_capture.load(Ordering::Relaxed));
         let mut ref_rx = ref_rx;
         let mut encode_throttle =
             FailureThrottle::new(std::time::Duration::from_secs(1), ENCODE_REBUILD_AFTER);
@@ -541,6 +546,17 @@ async fn main() -> Result<()> {
                 // 非阻塞地收播放参考帧（run_session 的 play_frame 产物）。
                 while let Ok(frame) = ref_rx.try_recv() {
                     aec.push_ref(frame);
+                }
+                // C-1：会话重开播放设备后可能推导出新的延迟帧数，变化时
+                // 热更新（只改对齐点，不动滤波器系数；队列下一帧自调整）。
+                let delay = aec_delay_frames_capture.load(Ordering::Relaxed);
+                if delay != aec.delay_frames() {
+                    info!(
+                        "AEC reference delay frames changed: {} -> {} (derived from actual playback buffer)",
+                        aec.delay_frames(),
+                        delay
+                    );
+                    aec.set_delay_frames(delay);
                 }
                 match audio.capture_pcm() {
                     Ok(pcm) => {
@@ -688,6 +704,19 @@ async fn main() -> Result<()> {
                 None
             }
         };
+
+        // C-1：按播放设备的实际 ALSA 缓冲推导 AEC 参考延迟（每次重连
+        // 都会重开播放设备、重新推导）。无播放设备时保持上次的值。
+        if let Some(a) = audio.as_ref() {
+            if let Some(frames) = a.playback_aec_delay_frames() {
+                let prev = aec_delay_frames.swap(frames, Ordering::Relaxed);
+                if prev != frames {
+                    info!(
+                        "AEC reference delay frames: {prev} -> {frames} (derived from actual playback buffer; nominal is {AEC_REF_DELAY_FRAMES})"
+                    );
+                }
+            }
+        }
 
         // 会话循环：Hub 消息 / KWS 唤醒 / 30s 状态上报 / Ctrl-C。
         let session_result = run_session(
