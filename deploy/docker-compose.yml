@@ -25,8 +25,11 @@
 #     127.0.0.1:10400，snapserver/mpd host 网络是播放链要求；改桥接要动寻址，
 #     收益小于回归风险。MA 8095 已随融合 B 砍 MA 而失效，不用做。
 #   - P1-4：hub 与 kws-sidecar 以 user: "1000:1000" 运行（hub 镜像内建
-#     uid 1000 的 appuser，见 Dockerfile.hub；边车镜像内无该用户，用数字 uid，
-#     卷属主由 nas-install.sh §4 的 chown one-shot 负责）；其余 5 个服务
+#     uid 1000 的 appuser，见 Dockerfile.hub；边车镜像内无该用户，用数字 uid。
+#     全新 kws-data 卷的属主由边车 Dockerfile 里的 mkdir + chown 经首次
+#     copy-up 带进卷（S-2，2026-11-18；该 RUN 必须在 VOLUME 声明之前）；
+#     nas-install.sh §4 的 chown one-shot 只负责已存在的 root 属主旧卷
+#     迁移，新卷上它是空操作）；其余 5 个服务
 #     不加 user——上游镜像的数据目录是 root-owned，改 user 需逐镜像验证，
 #     以 cap_drop: [ALL] 作补偿。
 #   - P1-4 / SC-P2-12：7 个服务都加 cap_drop: [ALL]（失败模式是响亮的
@@ -136,9 +139,15 @@ services:
     container_name: oxn-kws-sidecar
     restart: unless-stopped
     network_mode: host
-    # SC-P2-12 / P1-4：以 uid 1000 运行（镜像内无该用户，用数字 uid；
-    # 模型卷属主由 nas-install.sh §4 的 chown one-shot 负责，否则
-    # entrypoint 首次下载模型时写不进 /data/kws/models）。
+    # SC-P2-12 / S-2（2026-11-18 第三轮审计 P1）：以 uid 1000 运行（镜像内
+    # 无该用户，用数字 uid）。全新 kws-data 卷的属主由 Dockerfile 里的
+    # mkdir -p /data/kws/models && chown 1000:1000 经首次 copy-up 带进卷，
+    # 不走 nas-install.sh 也能直接 `docker compose up -d kws-sidecar`
+    #（冒烟项见 NAS_CHECKLIST.md §8）；已存在的 root 属主旧卷仍需
+    # nas-install.sh §4 的 chown one-shot 迁移；entrypoint 在下载前另有
+    # 目录可写预检，写不进时给可读 FATAL 而不是在 cp 上失败。
+    # S-3：边车不启用 TLS（正式安全假设见 kws-sidecar/README.md），只绑
+    # 127.0.0.1，流量不出回环；`wss://` 一配就连不上（fail-closed）。
     user: "1000:1000"
     cap_drop:
       - ALL

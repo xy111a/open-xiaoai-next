@@ -88,6 +88,13 @@ jobs:
       - name: cargo test
         working-directory: client
         run: cargo test --locked
+      # C-2（第三轮审计）：默认 feature 不编译 `sherpa-kws`——`sherpa.rs`
+      # 整个文件门控，`decode_ready_loop` 单测与 kws.rs 的 sherpa 分支
+      # （P2-20/P2-21）在 CI 里从未被检查。x86_64 宿主机即可编；需真实
+      # .so 的端到端测试无环境变量时自动 SKIP，只有纯逻辑单测实际跑。
+      - name: cargo test (sherpa-kws feature)
+        working-directory: client
+        run: cargo test --locked --features sherpa-kws
       - name: cargo fmt --check
         working-directory: client
         run: cargo fmt --check

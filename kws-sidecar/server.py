@@ -34,6 +34,14 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
 并发模型：单事件循环内串行解码；每 device_id 独立的 KeywordSpotter
 流状态（stream），互不干扰；连接断开即丢弃该设备流状态，重连从零开始；
 同一 device_id 重连时旧连接被主动关闭、旧流丢弃（不再出 wake）。
+
+安全假设（S-3，2026-11-18 第三轮审计 P1，未决 TLS 前的正式假设，
+详见 README.md“安全假设”）：本服务不启用 TLS，只监听明文 ws，
+默认只绑 127.0.0.1 回环（--host / KWS_HOST 默认值），流量不出回环；
+hello 的 token 以明文 JSON 传输，隔离只靠回环绑定 + token 本身。
+任何 NAS 本机进程都可直连 127.0.0.1:10400。bai 在“接受回环假设”
+与“给边车加 TLS”之间定夺后，本假设即失效（选 TLS 则 Hub 的指纹
+pin 才真正跑通；wss:// 一配就连不上，是 fail-closed，不是 bug）。
 """
 import argparse
 import asyncio
@@ -494,7 +502,13 @@ class Server:
 
 def build_arg_parser():
     p = argparse.ArgumentParser(description="KWS sidecar for open-xiaoai-next")
-    p.add_argument("--host", default=os.environ.get("KWS_HOST", "0.0.0.0"))
+    # S-3：默认只绑回环（127.0.0.1）。边车不启用 TLS（见 README
+    # “安全假设”），回环绑定是唯一的隔离；需局域网暴露时再显式改
+    # --host / KWS_HOST。serve() 只绑 args.host 一个地址，无其他监听。
+    p.add_argument("--host", default=os.environ.get("KWS_HOST", "127.0.0.1"),
+                   help="listen address (default 127.0.0.1, loopback only; "
+                        "the sidecar has no TLS, see README security "
+                        "assumption)")
     p.add_argument("--port", type=int,
                    default=int(os.environ.get("KWS_PORT", "10400")))
     p.add_argument("--model-dir",

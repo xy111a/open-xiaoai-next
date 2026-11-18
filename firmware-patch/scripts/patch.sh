@@ -221,34 +221,22 @@ done
 if [ "$MODEL" = "lx06" ]; then
     [ -f "$VERIFY_DIR/rootfs/usr/lib/libxaudio_engine.so" ] || fail "验证失败：解开后缺 usr/lib/libxaudio_engine.so"
 fi
-# 补丁标记抽查（P2-6：shadow / PAM / OTA 三处 / rc.local 包装器 / .bak / 包装器）
-grep -q 'mkdir -p /data/etc/dropbear' "$VERIFY_DIR/rootfs/etc/init.d/dropbear" \
-    || fail "验证失败：dropbear 未打补丁"
-grep -q '\$6\$' "$VERIFY_DIR/rootfs/etc/shadow" \
-    || fail "验证失败：shadow 的 root 密码不是 \$6\$ sha512crypt"
-[ "$(stat -c %a "$VERIFY_DIR/rootfs/etc/shadow")" = "600" ] \
-    || fail "验证失败：shadow 权限不是 0600"
-grep -q 'ttyS0::askfirst:/bin/login' "$VERIFY_DIR/rootfs/etc/inittab" \
-    || fail "验证失败：inittab 串口不是 /bin/login（P1-36：串口必须走密码登录）"
-grep -q '^# auth sufficient libmico-pam.so' "$VERIFY_DIR/rootfs/etc/pam.d/common-auth" \
-    || fail "验证失败：PAM 的 libmico 行未被注释"
-grep -q 'auth.*pam_unix.so nullok_secure' "$VERIFY_DIR/rootfs/etc/pam.d/common-auth" \
-    || fail "验证失败：PAM 未启用 pam_unix"
-# OTA 三处禁用：bin/ota 两个函数头后 return 1、flash.sh upgrade_param_check
-# 后 return 1、wireless ota() 里 download_fail + exit 3。
-# grep -A1 取“函数头 + 下一行”，第二行不是 return 1 即 FAIL；函数头本身
-# 缺失时第一段 grep 无输出，第二段也 FAIL（不静默通过）。
-for func in download_upgrade upgrade; do
-    grep -A1 "^$func() {$" "$VERIFY_DIR/rootfs/bin/ota" | grep -q 'return 1' \
-        || fail "验证失败：bin/ota 的 $func() 未禁用（函数头后不是 return 1）"
-done
-grep -A1 '^upgrade_param_check() {$' "$VERIFY_DIR/rootfs/bin/flash.sh" \
-    | grep -q 'return 1' \
-    || fail "验证失败：bin/flash.sh 的 upgrade_param_check() 未禁用"
-grep -q 'echo "download_fail"' "$VERIFY_DIR/rootfs/etc/init.d/wireless" \
-    || fail "验证失败：wireless ota() 未禁用"
-grep -q 'slave.pcm Capture' "$VERIFY_DIR/rootfs/etc/asound.conf" \
-    || fail "验证失败：asound.conf 未打补丁"
+# 补丁标记抽查（F-1：断言只认补丁特有标记，见
+# scripts/patch_firmware.py:verify_markers——原厂 rootfs 跑本检查必须
+# FAIL；与 flash-check.sh §4b 是同一套断言）。
+# dropbear 三门控已删 / inittab 三行 login / shadow $6$+0600 / PAM /
+# OTA 三处 / asound 两文件 / libxaudio（LX06），缺一即 FAIL。
+PYTHONPATH="$HERE/scripts" python3 -c \
+    'import sys
+from pathlib import Path
+from patch_firmware import PatchError, verify_markers
+try:
+    verify_markers(Path(sys.argv[1]), sys.argv[2])
+except PatchError as exc:
+    print(f"验证失败：{exc}", file=sys.stderr)
+    sys.exit(1)' \
+    "$VERIFY_DIR/rootfs" "$MODEL" \
+    || fail "验证失败：补丁标记核对未通过（见上）"
 # rc.local 走包装器行（P2-34；旧直行是旧版补丁产物，这里只接受包装器行）。
 grep -q '^\[ -x /etc/open-xiaoai/init.sh \]' "$VERIFY_DIR/rootfs/etc/rc.local" \
     || fail "验证失败：rc.local 里没有 init 包装器启动行"
@@ -256,6 +244,10 @@ grep -q 'sha256sum' "$VERIFY_DIR/rootfs/etc/open-xiaoai/init.sh" \
     || fail "验证失败：init 包装器里没有 sha256sum 校验"
 grep -q 'init.sh.sha256' "$VERIFY_DIR/rootfs/etc/open-xiaoai/init.sh" \
     || fail "验证失败：init 包装器里没有 SHA256 pin 检查"
+# F-3：pin 必填——包装器里必须有“缺 pin 文件即拒绝”的分支（不只是“有 pin
+# 时才校验”）；旧的可选 pin 写法没有 'sha256 pin missing' 这一行。
+grep -q 'sha256 pin missing' "$VERIFY_DIR/rootfs/etc/open-xiaoai/init.sh" \
+    || fail "验证失败：init 包装器里 pin 不是必填（缺 pin 文件时必须拒绝执行）"
 [ "$(stat -c %a "$VERIFY_DIR/rootfs/etc/open-xiaoai/init.sh")" = "755" ] \
     || fail "验证失败：init 包装器权限不是 0755"
 # .bak 必须是原厂原文——与原始 root.squashfs 里的同名文件逐字节比对。
@@ -268,11 +260,6 @@ for rel in etc/asound.conf etc/asound.conf.dts; do
     cmp -s "$VERIFY_DIR/rootfs/$rel.bak" "$VERIFY_DIR/orig/$rel" \
         || fail "验证失败：$rel.bak 与原厂内容不一致（备份应是原厂原文）"
 done
-if [ "$MODEL" = "lx06" ]; then
-    if grep -q 'hw:0,3' "$VERIFY_DIR/rootfs/usr/lib/libxaudio_engine.so" 2>/dev/null; then
-        fail "验证失败：libxaudio_engine.so 里仍有 hw:0,3"
-    fi
-fi
 rm -rf "$VERIFY_DIR"
 VERIFY_DIR=""
 

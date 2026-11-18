@@ -217,10 +217,11 @@ def test_patch_sh_end_to_end(unpacked_work, tmp_path):
     dropbear = (verify / "etc/init.d/dropbear").read_text()
     assert "mkdir -p /data/etc/dropbear" in dropbear
     assert "micocfg_work_mode" not in dropbear
-    assert (verify / "etc/inittab").read_text().count(
-        "ttyS0::askfirst:/bin/login") == 1
-    assert "ttyS0::askfirst:/bin/ash --login" not in \
-        (verify / "etc/inittab").read_text()
+    inittab = (verify / "etc/inittab").read_text()
+    # F-2：三行控制台统一走 /bin/login，全表无免密 ash。
+    for dev in ("tts/0", "ttyS0", "tty1"):
+        assert inittab.count(f"{dev}::askfirst:/bin/login") == 1
+    assert "/bin/ash --login" not in inittab
     ota = (verify / "bin/ota").read_text()
     for func_re in (r"^download_upgrade\(\) \{$", r"^upgrade\(\) \{$"):
         m = re.search(func_re, ota, re.MULTILINE)
@@ -242,6 +243,7 @@ def test_patch_sh_end_to_end(unpacked_work, tmp_path):
     wrapper = (verify / "etc/open-xiaoai/init.sh").read_text()
     assert "sha256sum" in wrapper and "ls -ln" in wrapper
     assert "init.sh.sha256" in wrapper
+    assert "sha256 pin missing" in wrapper  # F-3：pin 必填，缺 pin 即拒绝
     # P2-33：asound 原厂备份在镜像里（.bak 是原厂内容，不含补丁）。
     for rel in ("etc/asound.conf", "etc/asound.conf.dts"):
         bak = verify / (rel + ".bak")
@@ -500,8 +502,8 @@ def test_patch_rejects_multiple_orig_sqfs(unpacked_work, tmp_path):
 # --- P0-6：flash-check.sh 干跑检查 ---
 
 def test_flash_check_passes_on_shipped_image():
-    """FW-P2-5：仓库 work/ 里的已交付补丁镜像（2026-11-18 重编，
-    SHA 7dafb950…/fe2bab99…）含全部现版补丁——§4b 内容验证必须通过，
+    """FW-P2-5：仓库 work/ 里的已交付补丁镜像（2026-11-18 P1 修复轮重编，
+    SHA 1a5c2760…/8db02670…）含全部现版补丁——§4b 内容验证必须通过，
     默认与 --strict 两路都 exit 0，无过期 FAIL/WARN。
     （前身是 test_flash_check_reports_stale_shipped_image：2026-11-17 的
     旧镜像（7266aba9…/139de363…）缺 P1-36/P2-33/P2-34，§4b 报 FAIL；
@@ -596,16 +598,18 @@ def _repack_patched_image(tmp_path, edit=None):
 def test_flash_check_strict_fails_on_repacked_image(tmp_path):
     """FW-P2-5：--strict 下 SHA 与记录值不同即 FAIL；默认模式只警告、不失败
     （内容标记都在，只是重编过）。
-    注意：重打包的底子是已交付镜像（inittab 还是旧的 /bin/ash），所以
-    _harmless_edit 顺带把 inittab 改成 /bin/login，否则 §4b 会先 FAIL，
-    就测不到 SHA 这一项。"""
+    注意：重打包的底子是已交付镜像；_harmless_edit 顺带把 inittab 三行
+    都改成 /bin/login（F-2：旧镜像的 tts/0 与 tty1 还是 /bin/ash，新镜像
+    已是三行 login、replace 即 no-op），否则 §4b 会先 FAIL，就测不到
+    SHA 这一项。"""
     def _harmless_edit(rootfs):
         p = rootfs / "etc/rc.local"
         p.write_text(p.read_text() + "\n# repack test\n")
+        # F-2：inittab 三行都改成 /bin/login（旧镜像只有 ttyS0 是 login，
+        # tts/0 与 tty1 是 ash；新镜像三行已是 login，replace 即 no-op）。
         inittab = rootfs / "etc/inittab"
         inittab.write_text(inittab.read_text().replace(
-            "ttyS0::askfirst:/bin/ash --login",
-            "ttyS0::askfirst:/bin/login"))
+            "::askfirst:/bin/ash --login", "::askfirst:/bin/login"))
 
     work = _repack_patched_image(tmp_path, edit=_harmless_edit)
     r = run(["bash", str(SCRIPTS / "flash-check.sh"), "--strict",
@@ -619,17 +623,53 @@ def test_flash_check_strict_fails_on_repacked_image(tmp_path):
 
 
 def test_flash_check_rejects_missing_patch_marker(tmp_path):
-    """FW-P2-5：镜像内补丁标记被抹掉时干跑检查失败（不只验 SHA/魔数）。"""
-    def _remove_dropbear_marker(rootfs):
+    """FW-P2-5：镜像内补丁标记被抹掉时干跑检查失败（不只验 SHA/魔数）。
+    F-1：变异是把 dropbear 的 enable=0 门控插回去——新断言（verify_markers）
+    只认门控已删，插回即 FAIL；旧断言只查 `mkdir -p /data/etc/dropbear`
+    这一行（原厂就有），该变异测不到它。"""
+    def _restore_dropbear_gate(rootfs):
         p = rootfs / "etc/init.d/dropbear"
-        p.write_text(p.read_text().replace(
-            "mkdir -p /data/etc/dropbear", "# marker removed"))
+        p.write_text('\t[ "${enable}" = "0" ] && return 1\n' + p.read_text())
 
-    work = _repack_patched_image(tmp_path, edit=_remove_dropbear_marker)
+    work = _repack_patched_image(tmp_path, edit=_restore_dropbear_gate)
     r = run(["bash", str(SCRIPTS / "flash-check.sh"), "lx06", "1.94.13"],
             env_extra={"PATCH_WORK_DIR": str(work)})
     assert r.returncode != 0
-    assert "dropbear 未打补丁" in r.stdout
+    assert "补丁标记核对失败" in r.stdout
+    assert "enable" in r.stdout
+
+
+def test_flash_check_rejects_factory_image(tmp_path):
+    """F-1 回归：原厂 rootfs 打包成的镜像跑 flash-check 必须 FAIL。
+    旧断言会空转放行：原厂 dropbear 里就有 `mkdir -p /data/etc/dropbear`、
+    wireless 里就有 `echo "download_fail"`、OH2P asound.conf 里就有
+    `slave.pcm Capture`——三处旧标记在原厂都存在。新断言（verify_markers）
+    第一项 dropbear 门控即拦住原厂。
+    缺本地 work/ 原厂 rootfs 或无 mksquashfs 时跳过（CI 干净 checkout
+    无此材料、无工具）。"""
+    factory = FIRMWARE_PATCH / "work" / "lx06_1.94.13" / "rootfs"
+    if not factory.is_dir():
+        pytest.skip("缺原厂 rootfs（work/ 是本地构建产物）："
+                    f"{factory}")
+    if shutil.which("mksquashfs") is None:
+        pytest.skip("无 mksquashfs（squashfs-tools 未装）")
+    work = tmp_path / "work"
+    src = FIRMWARE_PATCH / "work" / "lx06_1.94.13"
+    (work / "lx06_1.94.13").mkdir(parents=True)
+    for name in ("root.squashfs", "mico_version"):
+        shutil.copyfile(src / name, work / "lx06_1.94.13" / name)
+    out = work / "lx06_1.94.13" / "root-patched.squashfs"
+    r = run(["mksquashfs", str(factory), str(out), "-comp", "xz",
+             "-b", "131072", "-noappend", "-all-root",
+             "-always-use-fragments", "-no-xattrs", "-no-exports"],
+            timeout=600)
+    assert r.returncode == 0, r.stderr
+    r2 = run(["bash", str(SCRIPTS / "flash-check.sh"), "lx06", "1.94.13"],
+             env_extra={"PATCH_WORK_DIR": str(work)})
+    assert r2.returncode != 0
+    assert "干跑检查失败" in r2.stdout
+    assert "补丁标记核对失败" in r2.stdout
+    assert "dropbear" in r2.stdout
 
 
 def test_flash_check_rejects_slash_version(tmp_path):

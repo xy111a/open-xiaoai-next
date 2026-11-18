@@ -14,9 +14,10 @@
 #   3. mico_version 若在，须含型号与版本
 #   4. 补丁镜像 root-patched.squashfs 必须存在、< 40MB、squashfs 魔数
 #      hsq s、unsquashfs -s 可解析（无 unsquashfs 时只警告）
-#   4b. 解开补丁镜像核对补丁标记（FW-P2-5）：dropbear / inittab / shadow /
-#       PAM / asound / OTA 三处 / rc.local / libxaudio；缺失即 FAIL
-#       （.bak 与 init 包装器是 P2-33/P2-34 新加的，旧版镜像里没有，缺失只警告）
+#   4b. 解开补丁镜像核对补丁标记（FW-P2-5）：走
+#       patch_firmware.py:verify_markers（dropbear / inittab / shadow /
+#       PAM / asound / OTA 三处 / libxaudio）+ .bak + init 包装器；
+#       缺失即 FAIL（init 包装器本身缺失只警告，旧版镜像里没有）
 #   5. 打印补丁镜像 SHA256：与 FLASH_RUNBOOK.md 记录的实测值
 #      一致则提示一致；不一致默认只警告（镜像可能已重编），--strict 则失败
 # 设备侧检查（读 boot_part、/proc/mtd、刷后校验）无法在 VM 上跑，
@@ -50,11 +51,11 @@ ok()   { echo "  PASS $*"; }
 bad()  { echo "  FAIL $*"; FAIL=1; }
 warn() { echo "  WARN $*"; }
 
-# 2026-11-18 重编的补丁镜像 SHA256（见 FLASH_RUNBOOK.md §1）。
+# 2026-11-18 第三轮审计 P1 修复轮重编的补丁镜像 SHA256（见 FLASH_RUNBOOK.md §1）。
 # 仅作“与记录值一致”的提示；不一致时警告、不失败（镜像重编后值会变）。
 case "$MODEL:$VERSION" in
-    lx06:1.94.13) KNOWN_PATCHED_SHA256="7dafb9507bdc4894715f2978ffaf5fd6a11af18ad61ed268f48c6309f0a05e21" ;;
-    oh2p:1.58.6)  KNOWN_PATCHED_SHA256="fe2bab99eb15e423b689c24bace6fec1b665b1073dc12ec1c9fa2e4433b5c926" ;;
+    lx06:1.94.13) KNOWN_PATCHED_SHA256="1a5c27603d7ab8064841f3e970258ef39ae754c2847a46fc0529168c250d0281" ;;
+    oh2p:1.58.6)  KNOWN_PATCHED_SHA256="8db02670f0c81bda5059e5a0fe2cad5b6045f4afe252a310353c7ac3acf9d197" ;;
     *) KNOWN_PATCHED_SHA256="" ;;
 esac
 
@@ -153,20 +154,27 @@ else
     fi
 
     # --- 4b. 镜像内补丁内容验证（FW-P2-5）：解开核对补丁标记 ---
-    # .bak 与 init 包装器是 P2-33/P2-34 新加的：旧版 patch_firmware.py
-    # 打出的镜像里没有，缺失只警告（下次重编会带上）；其余标记缺失即 FAIL。
+    # 标记核对走 patch_firmware.py:verify_markers（与 patch.sh §6 同一套
+    # 断言，F-1），缺失即 FAIL；.bak 缺失也 FAIL（OH2P 的 asound.conf
+    # 只能由 .bak 证明打过补丁）；init 包装器缺失只警告（旧版镜像里没有），
+    # 但包装器在而 pin 不是必填即 FAIL（F-3）。
     VDIR="$(mktemp -d)"
     FAIL_BEFORE_4B="$FAIL"
     if unsquashfs -d "$VDIR/rootfs" -f -no-exit-code "$PATCHED" >/dev/null 2>&1; then
         RF="$VDIR/rootfs"
-        grep -q 'mkdir -p /data/etc/dropbear' "$RF/etc/init.d/dropbear" \
-            || bad "镜像内补丁缺失：dropbear 未打补丁"
-        grep -q 'ttyS0::askfirst:/bin/login' "$RF/etc/inittab" \
-            || bad "镜像内补丁缺失：inittab 串口不是 /bin/login"
-        grep -q '\$6\$' "$RF/etc/shadow" \
-            || bad "镜像内补丁缺失：shadow 的 root 密码不是 \$6\$"
-        grep -q '^# auth sufficient libmico-pam.so' "$RF/etc/pam.d/common-auth" \
-            || bad "镜像内补丁缺失：PAM 的 libmico 行未被注释"
+        # F-1：补丁标记核对走 patch_firmware.py:verify_markers（与 patch.sh §6
+        # 同一套断言，原厂镜像必须 FAIL）；失败原因由 Python 打印到 stderr。
+        MARKER_ERR="$(PYTHONPATH="$HERE/scripts" python3 -c \
+            'import sys
+from pathlib import Path
+from patch_firmware import PatchError, verify_markers
+try:
+    verify_markers(Path(sys.argv[1]), sys.argv[2])
+except PatchError as exc:
+    print(f"{exc}", file=sys.stderr)
+    sys.exit(1)' \
+            "$RF" "$MODEL" 2>&1)" \
+            || bad "镜像内补丁标记核对失败：$MARKER_ERR"
         # mTLS 客户端证书必须在镜像里（patch.sh 无证书目录会直接失败）。
         for f in etc/open-xiaoai/tls/ca.crt etc/open-xiaoai/tls/client.crt; do
             [ -f "$RF/$f" ] || bad "镜像内补丁缺失：缺 $f（mTLS 客户端证书）"
@@ -175,16 +183,6 @@ else
             || bad "镜像内补丁缺失：缺 etc/open-xiaoai/tls/client.key（mTLS 客户端私钥）"
         [ "$(stat -c %a "$RF/etc/open-xiaoai/tls/client.key")" = "600" ] \
             || bad "镜像内补丁缺失：client.key 权限不是 0600"
-        grep -q 'slave.pcm Capture' "$RF/etc/asound.conf" \
-            || bad "镜像内补丁缺失：asound.conf 未打补丁"
-        for func in download_upgrade upgrade; do
-            grep -A1 "^$func() {$" "$RF/bin/ota" | grep -q 'return 1' \
-                || bad "镜像内补丁缺失：bin/ota 的 $func() 未禁用"
-        done
-        grep -A1 '^upgrade_param_check() {$' "$RF/bin/flash.sh" | grep -q 'return 1' \
-            || bad "镜像内补丁缺失：bin/flash.sh 的 upgrade_param_check() 未禁用"
-        grep -q 'echo "download_fail"' "$RF/etc/init.d/wireless" \
-            || bad "镜像内补丁缺失：wireless ota() 未禁用"
         # rc.local：包装器行或旧直行均接受（旧版补丁产物）。
         if grep -q '^\[ -x /etc/open-xiaoai/init.sh \]' "$RF/etc/rc.local"; then
             ok "rc.local 走 init 包装器（P2-34）"
@@ -193,19 +191,33 @@ else
         else
             bad "镜像内补丁缺失：rc.local 里既无包装器行也无旧直行"
         fi
+        # .bak 是 OH2P asound.conf 唯一的“打过补丁”证据（原厂即 Capture，
+        # Capture 块参数与补丁后逐字节相同，见 F-1）：缺失即 FAIL；原始
+        # root.squashfs 在时再逐字节比对原厂（与 patch.sh §6 同款）。
         for rel in etc/asound.conf.bak etc/asound.conf.dts.bak; do
-            [ -f "$RF/$rel" ] || warn "镜像里缺 $rel（旧版补丁产物；下次重编会带上）"
+            [ -f "$RF/$rel" ] || bad "镜像内补丁缺失：缺 $rel（asound 原厂备份）"
         done
+        if [ -f "$SQFS" ]; then
+            if unsquashfs -d "$VDIR/orig" -f -no-exit-code "$SQFS" \
+                    etc/asound.conf etc/asound.conf.dts >/dev/null 2>&1; then
+                for rel in etc/asound.conf etc/asound.conf.dts; do
+                    cmp -s "$RF/$rel.bak" "$VDIR/orig/$rel" \
+                        || bad "镜像内补丁缺失：$rel.bak 与原厂内容不一致（备份应是原厂原文）"
+                done
+            else
+                warn "解不出原始 root.squashfs 里的 asound 文件，跳过 .bak 逐字节比对"
+            fi
+        else
+            warn "未找到原始 root.squashfs，跳过 .bak 逐字节比对（只验 .bak 存在）"
+        fi
         if [ -f "$RF/etc/open-xiaoai/init.sh" ]; then
             grep -q 'sha256sum' "$RF/etc/open-xiaoai/init.sh" \
-                || warn "init 包装器里没有 sha256sum 校验"
+                || bad "镜像内补丁缺失：init 包装器里没有 sha256sum 校验"
+            # F-3：pin 必填——包装器里必须有“缺 pin 文件即拒绝”的分支。
+            grep -q 'sha256 pin missing' "$RF/etc/open-xiaoai/init.sh" \
+                || bad "镜像内补丁缺失：init 包装器里 pin 不是必填（缺 pin 文件时必须拒绝执行）"
         else
             warn "镜像里缺 etc/open-xiaoai/init.sh（旧版补丁产物；下次重编会带上）"
-        fi
-        if [ "$MODEL" = "lx06" ]; then
-            if grep -q 'hw:0,3' "$RF/usr/lib/libxaudio_engine.so" 2>/dev/null; then
-                bad "镜像内补丁缺失：libxaudio_engine.so 里仍有 hw:0,3"
-            fi
         fi
         [ "$FAIL" -eq "$FAIL_BEFORE_4B" ] && ok "镜像内补丁标记核对通过"
     else

@@ -62,8 +62,9 @@ INIT_WRAPPER_SCRIPT = """#!/bin/sh
 #   1. /data/init.sh 存在；
 #   2. 属主 uid 为 0（root），且组/全局均不可写（ls -ln 的权限串里
 #      第 6 位与第 9 位都不是 w；设备上没有 stat 命令，见下）；
-#   3. 若 /data/init.sh.sha256 存在，文件 SHA256 必须与其中第一字段一致
-#      （客户端安装流程写该文件来钉死钩子内容；没有该文件时只做 1+2）。
+#   3. /data/init.sh.sha256 必须存在，且其中第一字段与 /data/init.sh 的
+#      SHA256 一致（F-3：pin 必填——缺 pin 文件即拒绝执行；安装流程写
+#      pin，见 firmware-patch/README.md“/data/init.sh 安装流程”）。
 # 任一条件不满足都拒绝执行，并把原因记到 /data/open-xiaoai-init.log。
 # 本文件烤进 squashfs（只读），改它要重打补丁重刷机。
 # 只用 busybox 自带命令（ls/sha256sum/cut/date 均在原厂 rootfs 里实测存在；
@@ -84,13 +85,15 @@ case "$1" in
         exit 0
         ;;
 esac
-if [ -f "$PIN" ]; then
-    want="$(cut -d' ' -f1 "$PIN" 2>/dev/null)"
-    got="$(sha256sum "$INIT" 2>/dev/null | cut -d' ' -f1)"
-    if [ -z "$want" ] || [ "$want" != "$got" ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') refuse: $INIT sha256 mismatch" >> "$LOG" 2>/dev/null
-        exit 0
-    fi
+if [ ! -f "$PIN" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') refuse: $INIT sha256 pin missing ($PIN not found)" >> "$LOG" 2>/dev/null
+    exit 0
+fi
+want="$(cut -d' ' -f1 "$PIN" 2>/dev/null)"
+got="$(sha256sum "$INIT" 2>/dev/null | cut -d' ' -f1)"
+if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') refuse: $INIT sha256 mismatch" >> "$LOG" 2>/dev/null
+    exit 0
 fi
 exec sh "$INIT"
 """
@@ -371,6 +374,35 @@ def _password() -> str:
     return pw
 
 
+_REUSE_HASH_RE = re.compile(
+    r"^\$6\$(rounds=\d+\$)?[A-Za-z0-9./]{1,16}\$[A-Za-z0-9./]{86}$")
+
+# 三行控制台（F-2）：原厂 inittab 全文就是这三行；补丁后三行统一走 /bin/login。
+INITTAB_CONSOLES = ("tts/0", "ttyS0", "tty1")
+
+
+def _reuse_root_hash() -> str | None:
+    """重编时沿用旧镜像的 root hash（F-2 重编、F-4 移植步骤脚本化）。
+
+    环境变量 PATCH_REUSE_ROOT_HASH_FILE 指向一个文件，内容为一行完整的
+    $6$ hash（由重编前的旧镜像 shadow 里取，见 FLASH_RUNBOOK.md §1 的
+    重编流程；hash 只记在本地 gitignore 的 work/ 文件里，永不进仓库、
+    永不打印）。未设置该变量时返回 None，走正常流程（读密码、随机盐
+    生成新 hash）。文件不存在或内容不是合法 $6$ hash 时抛 PatchError。
+    """
+    path = os.environ.get("PATCH_REUSE_ROOT_HASH_FILE", "")
+    if not path:
+        return None
+    try:
+        text = Path(path).read_text().strip()
+    except OSError as exc:
+        raise PatchError(f"读 PATCH_REUSE_ROOT_HASH_FILE 失败：{path}：{exc}")
+    if not _REUSE_HASH_RE.match(text):
+        raise PatchError(
+            f"PATCH_REUSE_ROOT_HASH_FILE 内容不是合法的 $6$ hash：{path}")
+    return text
+
+
 # ---------------------------------------------------------------------------
 # 1. SSH：/etc/init.d/dropbear 改为始终启动
 #    （来源：01-ssh.patch 的效果；只做任务指定的三处门控拆除 + mkdir）
@@ -454,7 +486,16 @@ def check_login(rootfs: Path) -> None:
     if not re.search(r"^root:\$[156]\$[^:]+:", text, re.MULTILINE):
         raise PatchError(f"前置条件不满足：{shadow} 里 root 行不是 $1$/$5$/$6$ hash")
     inittab = _require(rootfs / "etc/inittab", "init 表")
-    _require_in(_read(inittab), "ttyS0::askfirst:/bin/login", inittab)
+    inittab_text = _read(inittab)
+    # F-2：三行控制台都必须存在，且是 /bin/login（已打补丁）或
+    # /bin/ash --login（原厂 / 旧版补丁态）；其他形态一律拒绝。
+    # ttyS0 原厂即 login；tts/0 与 tty1 原厂是免密 ash，patch_login 会改掉。
+    for dev in INITTAB_CONSOLES:
+        if not re.search(rf"^{re.escape(dev)}::askfirst:/bin/(login|ash --login)$",
+                         inittab_text, re.MULTILINE):
+            raise PatchError(
+                f"前置条件不满足：{inittab} 里找不到 {dev} 控制台行"
+                "（应为 /bin/login 或 /bin/ash --login）")
     pam = _require(rootfs / "etc/pam.d/common-auth", "PAM 配置")
     pam_text = _read(pam)
     # 接受两种状态：原厂（libmico 未注释、pam_unix 被注释）与已打过本补丁
@@ -472,16 +513,22 @@ def check_login(rootfs: Path) -> None:
 
 
 def patch_login(rootfs: Path) -> str:
-    """换 root 密码 hash；串口仍走 /bin/login（需 root 密码，P1-36：
-    原先改成 /bin/ash --login 是拆机串口即免密 root）；PAM 去 libmico、启用 pam_unix。
+    """换 root 密码 hash；三行控制台统一走 /bin/login（F-2：原先只有 ttyS0
+    是 login，tts/0 与 tty1 是免密 ash）；PAM 去 libmico、启用 pam_unix。
 
     密码只从 SSH_PASSWORD_FILE / 环境变量 SSH_PASSWORD 或交互式 getpass
-    读（见 _password），hash 为 sha512crypt（$6$）+ 每次随机盐。返回实际写入的 hash，
-    供测试校验；调用方（main）不得打印它。
+    读（见 _password），hash 为 sha512crypt（$6$）+ 每次随机盐。重编时若
+    设了 PATCH_REUSE_ROOT_HASH_FILE，则沿用文件里的旧 hash（不读密码、
+    不生成新盐，root 密码不变）。返回实际写入的 hash，供测试校验；
+    调用方（main）不得打印它。
     """
     check_login(rootfs)
-    password = _password()
-    new_hash = sha512_crypt(password)
+    reused = _reuse_root_hash()
+    if reused is not None:
+        new_hash = reused
+    else:
+        password = _password()
+        new_hash = sha512_crypt(password)
 
     shadow = rootfs / "etc/shadow"
     text = _read(shadow)
@@ -491,10 +538,17 @@ def patch_login(rootfs: Path) -> str:
         raise PatchError(f"root 密码行替换失败：{shadow}")
     _write(shadow, text)
 
-    # P1-36：inittab 不动——串口仍走 ttyS0::askfirst:/bin/login，登录要输
-    # root 密码（打补丁时设的强密码）。串口恢复仍可用（有密码就能进），
-    # 只是不再是拆机即免密 root。
+    # F-2：三行控制台统一走 /bin/login（需 root 密码）。tts/0 与 tty1 原厂
+    # 是 /bin/ash --login（拆机串口 / 虚拟终端即免密 root）。tts/0 在
+    # 4.9 内核 + devtmpfs 下是死项（meson-uart 只注册 ttyS 设备名，内核
+    # 里无 tts 设备名，/dev/tts/0 不会生成），tty1 是无键盘/显示的音箱
+    # 不可达的虚拟终端，但纵深防御：三行都改成密码登录，不留任何免密
+    # root shell。已是 /bin/login 的行不动（幂等）。
     inittab = rootfs / "etc/inittab"
+    text = _read(inittab)
+    text, _ = re.subn(r"^(tts/0|tty1)::askfirst:/bin/ash --login$",
+                      r"\1::askfirst:/bin/login", text, flags=re.MULTILINE)
+    _write(inittab, text)
 
     pam = rootfs / "etc/pam.d/common-auth"
     text = _read(pam)
@@ -517,8 +571,9 @@ def patch_login(rootfs: Path) -> str:
     after = _read(shadow)
     _require_in(after, f"root:{new_hash}:", shadow)
     after = _read(inittab)
-    _require_in(after, "ttyS0::askfirst:/bin/login", inittab)
-    _require_not_in(after, "ttyS0::askfirst:/bin/ash --login", inittab)
+    for dev in INITTAB_CONSOLES:
+        _require_in(after, f"{dev}::askfirst:/bin/login", inittab)
+    _require_not_in(after, "/bin/ash --login", inittab)
     after = _read(pam)
     _require_not_in(after, "\nauth sufficient libmico-pam.so", pam)
     _require_not_in(after, "\naccount sufficient libmico-pam.so", pam)
@@ -789,6 +844,121 @@ def patch_libxaudio(rootfs: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# 打包后验证（F-1）：补丁标记断言——只认补丁特有的标记
+#
+# patch.sh §6 与 flash-check.sh §4b 共用本函数（两处不再各写一套 grep，
+# 改一处即同步）。原厂 rootfs 跑本函数必须失败：
+#   - dropbear：三门控已删（enable=0 返回、蓝牙门控、ssh_en 门控）。
+#     `mkdir -p /data/etc/dropbear` 单独不能作标记——原厂 keygen() 里
+#     已有该行（第 104 行），只查它会空转；这里只把它当文件完整性检查。
+#   - wireless：ota() 头后 60 字符内同时有 echo download_fail 与 exit 3
+#     （与 patch_disable_ota 的校验同款；原厂的 download_fail 在 curl
+#     失败分支，离函数头 50 行开外）。
+#   - asound：两文件 mico_record/noop 块都走 Capture；Capture 块参数
+#     384/6144 且无 480/3840；.dts 文件全文无 480/3840（.dts 无播放链）。
+#     注意 OH2P 的 asound.conf 原厂即 Capture、Capture 块参数与补丁后
+#     逐字节相同：该文件“是否打过补丁”只能由 .bak 证明（.bak 存在且与
+#     原厂逐字节一致，见 patch.sh §6 的 cmp，本函数不管 .bak）。
+#   - inittab：三行控制台均走 /bin/login（F-2），全表无免密 ash。
+# rc.local 包装器行、init 包装器内容与 .bak 比对不在本函数里：它们在
+# patch.sh §6（硬门）与 flash-check.sh §4b（旧镜像只警告）里各自处理，
+# 两处容忍度不同，不宜共用同一断言。
+# ---------------------------------------------------------------------------
+
+def verify_markers(rootfs: Path, model: str) -> None:
+    """校验一份 rootfs（通常是刚解开的补丁镜像）里补丁都在。
+
+    任一标记未通过即抛 PatchError（消息说明哪一项未通过）。"""
+    if model not in MODELS:
+        raise PatchError(f"未知型号：{model}（只支持 lx06 / oh2p）")
+    if not rootfs.is_dir():
+        raise PatchError(f"rootfs 不存在：{rootfs}")
+
+    # dropbear：三门控已删；mkdir 行只作文件完整性检查（原厂也有该行）。
+    dropbear = _require(rootfs / "etc/init.d/dropbear", "SSH 启动脚本")
+    text = _read(dropbear)
+    _require_in(text, "mkdir -p /data/etc/dropbear", dropbear)
+    for needle in ('[ "${enable}" = "0" ] && return 1',
+                   "micocfg_work_mode", "/data/ssh_en", "/data/.ssh_en",
+                   "/tmp/ssh_en"):
+        _require_not_in(text, needle, dropbear)
+
+    # shadow：root 行是 $6$ 且权限 0600。
+    shadow = _require(rootfs / "etc/shadow", "密码文件")
+    if not re.search(r"^root:\$6\$[^:]+:", _read(shadow), re.MULTILINE):
+        raise PatchError(f"校验失败：{shadow} 里 root 行不是 $6$ hash")
+    if (shadow.stat().st_mode & 0o777) != 0o600:
+        raise PatchError(f"校验失败：{shadow} 权限不是 0600")
+
+    # inittab（F-2）：三行控制台均走 /bin/login，全表无免密 ash。
+    inittab = _require(rootfs / "etc/inittab", "init 表")
+    inittab_text = _read(inittab)
+    for dev in INITTAB_CONSOLES:
+        _require_in(inittab_text, f"{dev}::askfirst:/bin/login", inittab)
+    _require_not_in(inittab_text, "/bin/ash --login", inittab)
+
+    # PAM：libmico 已注释、pam_unix 已启用。
+    pam = _require(rootfs / "etc/pam.d/common-auth", "PAM 配置")
+    pam_text = _read(pam)
+    _require_in(pam_text, "# auth sufficient libmico-pam.so", pam)
+    _require_not_in(pam_text, "\nauth sufficient libmico-pam.so", pam)
+    if not re.search(r"^auth\s+\[success=1 default=ignore\]\s+pam_unix\.so",
+                     pam_text, re.MULTILINE):
+        raise PatchError(f"校验失败：{pam} 里 pam_unix.so 未启用")
+
+    # OTA 三处禁用：bin/ota 两个函数头后 return 1、flash.sh 参数检查后
+    # return 1、wireless ota() 头后 60 字符内 download_fail + exit 3。
+    ota = _require(rootfs / "bin/ota", "OTA 脚本")
+    ota_text = _read(ota)
+    for func_re in (r"^download_upgrade\(\) \{$", r"^upgrade\(\) \{$"):
+        m = re.search(func_re, ota_text, re.MULTILINE)
+        if m is None or "return 1" not in ota_text[m.end():m.end() + 80]:
+            raise PatchError(f"校验失败：{ota} 里 {func_re} 后没有 return 1")
+    flash = _require(rootfs / "bin/flash.sh", "刷机脚本")
+    flash_text = _read(flash)
+    m = re.search(r"^upgrade_param_check\(\) \{$", flash_text, re.MULTILINE)
+    if m is None or "return 1" not in flash_text[m.end():m.end() + 80]:
+        raise PatchError(
+            f"校验失败：{flash} 里 upgrade_param_check() 后没有 return 1")
+    wireless = _require(rootfs / "etc/init.d/wireless", "无线启动脚本")
+    wireless_text = _read(wireless)
+    header_re = (r"(^ota\(\)\n\{\n    ota_url=\$1\n    ssid=\$2\n    password=\$3\n"
+                 r"    identity=\$4\n)")
+    m = re.search(header_re, wireless_text, re.MULTILINE)
+    if m is None:
+        raise PatchError(f"校验失败：{wireless} 里找不到 ota() 函数头")
+    window = wireless_text[m.end():m.end() + 60]
+    if 'echo "download_fail"' not in window or "exit 3" not in window:
+        raise PatchError(
+            f"校验失败：{wireless} 里 ota() 头后 60 字符内没有"
+            ' echo "download_fail" + exit 3（原厂的 download_fail 在 curl'
+            " 失败分支，不算禁用）")
+
+    # asound：两文件 mico_record/noop 都走 Capture；Capture 块参数
+    # 384/6144 且无 480/3840；.dts 文件全文无 480/3840。
+    for rel in ASOUND_FILES:
+        p = _require(rootfs / rel, "ALSA 配置")
+        text = _read(p)
+        _require_in(text, "pcm.mico_record {\n    type plug\n    slave.pcm Capture\n}", p)
+        _require_in(text, "pcm.noop {\n    type plug\n    slave.pcm Capture\n}", p)
+        capture = _extract_pcm_block(text, "Capture", p)
+        for needle in ('pcm "hw:0,3"', "type dsnoop", "rate 48000",
+                       "format S32_LE", "period_size 384", "buffer_size 6144"):
+            _require_in(capture, needle, p)
+        _require_not_in(capture, "period_size 480", p)
+        _require_not_in(capture, "buffer_size 3840", p)
+        if rel.endswith(".dts"):
+            _require_not_in(text, "period_size 480", p)
+            _require_not_in(text, "buffer_size 3840", p)
+
+    # libxaudio（仅 LX06）：hw:0,3 必须已改掉。
+    if model == "lx06":
+        lib = _require(rootfs / "usr/lib/libxaudio_engine.so", "音频引擎库")
+        if LIBXAUDIO_TARGET in lib.read_bytes():
+            raise PatchError(f"校验失败：{lib} 里仍有 hw:0,3")
+
+
+# ---------------------------------------------------------------------------
 # 7. mTLS 客户端证书（P0-3）：把 CA + 客户端证书装进 rootfs（可选）
 #    证书由 scripts/gen-certs.sh 生成；装入位置 /etc/open-xiaoai/tls/
 #    （squashfs 内，刷机后一定存在；/data 是可写分区挂载点，烤进
@@ -961,11 +1131,12 @@ def _patch_all_apply(rootfs: Path, model: str,
     patch_ssh(rootfs)
     result["ssh"] = "dropbear 始终启动"
     patch_login(rootfs)
-    result["login"] = "root 密码已换 sha512crypt（$6$，随机盐）+ 串口仍走密码登录 + PAM pam_unix"
+    result["login"] = ("root 密码 sha512crypt（$6$）+ 三行控制台均走 /bin/login"
+                       "（F-2：tts/0、ttyS0、tty1 无免密 shell）+ PAM pam_unix")
     patch_disable_ota(rootfs)
     result["disable_ota"] = "bin/ota + flash.sh + wireless ota() 已禁"
     patch_start(rootfs)
-    result["start"] = "rc.local 已加包装器启动行 + etc/open-xiaoai/init.sh（P2-34：校验属主/权限/可选 SHA256 pin 后才执行 /data/init.sh）"
+    result["start"] = "rc.local 已加包装器启动行 + etc/open-xiaoai/init.sh（P2-34/F-3：校验属主/权限/必填 SHA256 pin 后才执行 /data/init.sh，缺 pin 即拒绝）"
     result["asound"] = patch_asound(rootfs)
     if model == "lx06":
         result["libxaudio_offset"] = patch_libxaudio(rootfs)

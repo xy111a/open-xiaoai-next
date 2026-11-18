@@ -1,26 +1,29 @@
 # 上机包（Release）— open-xiaoai-next 首刷 + NAS 部署
 
-> 2026-11-18，P2 全修轮（分支 `fix-p2-loose-ends`，Hub 重编自尖 996329c）。
+> 2026-11-18，第三轮审计 P1 修复轮（分支 `fix-p1-round3`，F-1/F-2/F-3 修完重编）。
 > 本文件只写路径、SHA256、核对命令与顺序；**不含任何密码、Token、证书、密钥**——
 > Token 在 `deploy/.env` 里（gitignore，不进仓库、不进包，刷机电脑上现场填）。
 > 实际文件在仓库外：`~/workspace/speaker-open-xiaoai-rebuild/release/`（见下文“包清单”）。
 
-## 0. 镜像已是现版（2026-11-18 重编）
+## 0. 镜像已是现版（2026-11-18 P1 修复轮重编）
 
-包内两份补丁镜像是 2026-11-18 用现版 `patch.sh` 重编的（SHA 见 §1，
+包内两份补丁镜像是 2026-11-18 第三轮审计 P1 修复轮重编的（SHA 见 §1，
 `flash-check.sh` §4b 四路默认/`--strict` 均 exit 0）。含全部现版补丁：
-inittab 串口走密码登录 `/bin/login`（P1-36）、asound `.bak` 原厂备份
-（P2-33）、rc.local init 包装器校验（P2-34）、mTLS 客户端证书。
+inittab 三行控制台均走密码登录 `/bin/login`（F-2）、asound `.bak` 原厂备份
+（P2-33）、rc.local init 包装器校验 + SHA256 pin 必填（F-3，缺 pin 即拒绝
+执行，安装流程见 `firmware-patch/README.md`“/data/init.sh 安装流程”）、mTLS
+客户端证书。
 **root 密码未换**：重编时新镜像的 shadow root 行沿用了旧镜像的 `$6$`
 hash，bai 手里已有的密码继续有效，未生成新密码。
-旧 SHA（LX06 `7266aba9…d97b3`、OH2P `139de363…6415`，2026-11-17 打的）已作废。
+旧 SHA（LX06 `7dafb950…05e21`、OH2P `fe2bab99…5c926`，2026-11-18 P2 轮打的）已作废；
+更旧的（LX06 `7266aba9…d97b3`、OH2P `139de363…6415`，2026-11-17 打的）同样作废。
 
 ## 1. 包清单（每件东西的路径、大小、SHA256、核对命令）
 
 | # | 东西 | 包内路径 | 大小（字节） | SHA256 | 核对命令 |
 |---|---|---|---|---|---|
-| 1 | LX06 补丁镜像 | `images/lx06_1.94.13-root-patched.squashfs` | 38,457,344 | `7dafb9507bdc4894715f2978ffaf5fd6a11af18ad61ed268f48c6309f0a05e21` | `sha256sum images/lx06_1.94.13-root-patched.squashfs` |
-| 2 | OH2P 补丁镜像 | `images/oh2p_1.58.6-root-patched.squashfs` | 30,179,328 | `fe2bab99eb15e423b689c24bace6fec1b665b1073dc12ec1c9fa2e4433b5c926` | `sha256sum images/oh2p_1.58.6-root-patched.squashfs` |
+| 1 | LX06 补丁镜像 | `images/lx06_1.94.13-root-patched.squashfs` | 38,457,344 | `1a5c27603d7ab8064841f3e970258ef39ae754c2847a46fc0529168c250d0281` | `sha256sum images/lx06_1.94.13-root-patched.squashfs` |
+| 2 | OH2P 补丁镜像 | `images/oh2p_1.58.6-root-patched.squashfs` | 30,179,328 | `8db02670f0c81bda5059e5a0fe2cad5b6045f4afe252a310353c7ac3acf9d197` | `sha256sum images/oh2p_1.58.6-root-patched.squashfs` |
 | 3 | Hub 二进制 | `deploy/hub-linux-amd64` | 12,093,544 | `973a3b1fa2d34acab7a1feaa5c6fb146bc01167735b4c50ba408d1acd0213091` | `sha256sum deploy/hub-linux-amd64`；清单 `deploy/hub-linux-amd64.sha256`（`nas-install.sh` §0 会比对，不一致即 FAIL） |
 | 4 | 部署包 | `deploy/`（docker-compose.yml / Dockerfile.hub / .dockerignore / snapserver.conf / .env.example / nas-install.sh / NAS_CHECKLIST.md / README.md） | — | — | `python3 -c "import yaml; yaml.safe_load(open('deploy/docker-compose.yml'))"`；`bash -n deploy/nas-install.sh` |
 | 5 | kws-sidecar 构建源 | `kws-sidecar/`（Dockerfile / server.py / entrypoint.sh / requirements.txt / scripts/） | — | — | `ls kws-sidecar/` 四项都在；`nas-install.sh` §2 会打 tar 传到 NAS `$NAS_DIR/kws-sidecar` |
@@ -41,7 +44,7 @@ OH2P 在 `firmware/oh2p_1.58.6.bin`（36,042,824 字节，SHA256
 1. 刷机电脑上核对 §1 的 SHA256（两份镜像 + Hub 二进制）。
 2. `cd firmware-patch && ./scripts/flash-check.sh lx06 1.94.13`（或 `oh2p 1.58.6`），
    再用 `--strict` 跑一遍：SHA 不一致即 FAIL。§4b 内容验证缺标记即 FAIL
-   （`.bak` 与 init 包装器缺失只警告——针对旧版镜像；当前重编镜像里两者都有）。
+   （init 包装器本身缺失只警告——针对旧版镜像；.bak 缺失即 FAIL，当前重编镜像里两者都有）。
 3. 按 `FLASH_RUNBOOK.md` §2 读当前启动槽 → §3 决策表定目标槽（按实测 `boot_part` 定，
    不要默认 boot0）→ §4 备份（NAS 侧 + 设备侧）→ §5 刷机（只写非当前槽的 system 分区，
    绝不写 bootloader / tpl / dtb / kernel / 当前槽）→ §6 刷后校验 + 回滚演练。

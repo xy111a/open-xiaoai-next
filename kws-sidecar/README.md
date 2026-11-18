@@ -66,7 +66,7 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `KWS_HOST` | `0.0.0.0` | 监听地址 |
+| `KWS_HOST` | `127.0.0.1` | 监听地址（默认只绑回环，见下“安全假设”；需局域网暴露时再显式改，不要悄悄改回 `0.0.0.0`） |
 | `KWS_PORT` | `10400` | 监听端口（已确认与现有服务无冲突） |
 | `KWS_MODEL_DIR` | `/data/kws/models` | 模型目录 |
 | `KWS_KEYWORDS_FILE` | `<模型目录>/keywords.txt` | 关键词表（默认含“你好小李”） |
@@ -94,6 +94,43 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
 （网络/SHA 校验失败）则容器明确报错退出。模型持久化在 `kws-data`
 卷，容器重建不重复下载。SHA256 与上游地址见脚本头注释
 （与 `client/scripts/download-kws-model.sh` 同源同 SHA）。
+
+卷属主（S-2，2026-11-18 第三轮审计 P1）：`docker-compose.yml` 让
+边车以 uid 1000 运行，但全新 `kws-data` 卷默认是 root 属主——光靠
+`user: "1000:1000"` 写不进卷。修复分两层：① `Dockerfile` 里
+`RUN mkdir -p /data/kws/models && chown 1000:1000 /data/kws/models`
+（必须在 `VOLUME` 声明之前），全新卷首次挂载时 Docker 把镜像里该
+目录的属主 copy-up 进卷，不走 `nas-install.sh` 也能直接
+`docker compose up -d kws-sidecar`（冒烟项见
+`deploy/NAS_CHECKLIST.md` §8）；② `entrypoint.sh` 在下载前预检
+卷目录可写，写不进时给可读 FATAL（含修复命令）再退出，而不是在
+`download-model.sh` 的 `cp` 上失败。已存在的 root 属主旧卷不受
+copy-up 影响，仍需 `nas-install.sh` §4 的 chown one-shot 迁移。
+
+## 安全假设（S-3：边车不启用 TLS，待 bai 定夺）
+
+> **状态：部分修，未决。** 下面是正式安全假设，不是 TLS 实现。
+> bai 在“接受回环假设”与“给边车加 TLS”之间二选一之前，边车保持
+> 明文 `ws`；定夺后本节即失效（选 TLS 则补自签证书 + 启动期生成/
+> 挂载，Hub 的指纹 pin 才真正跑通，另起一项做）。
+
+- **假设内容**：边车不启用 TLS，只监听明文 `ws://127.0.0.1:10400/v1/kws`；
+  隔离只靠回环绑定 + hello 的 token 鉴权。`KWS_HOST` 默认值与
+  `server.py` 的 `--host` 默认值都是 `127.0.0.1`（S-8 同款改动）；
+  `compose` 里也显式传 `KWS_HOST=127.0.0.1`，三层一致。`server.py`
+  用 `serve(handler, args.host, args.port, …)` 只绑这一个地址，
+  无其他监听；`server.py` 全文无 `ssl`/`SSL`，无任何证书逻辑。
+- **风险边界**：流量不出回环，局域网抓包风险不存在；但**任何 NAS
+  本机进程都可直连 `127.0.0.1:10400`**，token 以明文 JSON 在 hello
+  里传输——本机上跑了不可信进程即假设失效。`wss://` 一配就连不上
+  （fail-closed，算优点，不是 bug）。
+- **Hub 侧现状**：Hub 的指纹 pin 实现正确（`hub/internal/kws/kws.go:
+  tlsConfig()`），但 `hub/config.yaml` 实际配的是明文
+  `ws://127.0.0.1:10400/v1/kws`，pin 目前配了也用不上；不要把
+  `fingerprint` 当成已生效的安全措施。
+- **待定决定**：(a) 接受本假设继续用回环 + token，或 (b) 给边车加
+  TLS。决定前不要改 `KWS_HOST` 为 `0.0.0.0`、不要把 10400 发布到
+  局域网。
 
 ## 运行
 

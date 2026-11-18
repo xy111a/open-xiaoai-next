@@ -20,6 +20,22 @@ model_complete() {
 }
 
 if ! model_complete; then
+    # S-2：下载前先预检卷目录可写——全新具名卷若属主仍是 root，uid 1000
+    # 的下载会在 download-model.sh 里的 cp 上失败，报错藏在脚本深处；
+    # 这里先给一句可读的 FATAL 再退出（Dockerfile 的 mkdir + chown
+    # 负责新卷，nas-install.sh §4 的 chown one-shot 负责旧卷迁移）。
+    if [ ! -d "$MODEL_DIR" ]; then
+        if ! mkdir -p "$MODEL_DIR" 2>/dev/null; then
+            echo "FATAL: KWS model dir $MODEL_DIR does not exist and cannot be created (running as uid $(id -u)); check the kws-data volume ownership" >&2
+            exit 1
+        fi
+    fi
+    if [ ! -w "$MODEL_DIR" ]; then
+        echo "FATAL: KWS model dir $MODEL_DIR is not writable by uid $(id -u); refusing to download (it would fail inside download-model.sh)" >&2
+        ls -ld "$MODEL_DIR" >&2 || true
+        echo "Fix: on the NAS run the chown one-shot from deploy/nas-install.sh §4 (docker compose run --rm --user root --no-deps --entrypoint /bin/chown kws-sidecar -R 1000:1000 /data/kws/models), or delete the stale volume so a fresh one is created from the image (Dockerfile mkdir + chown, copy-up)" >&2
+        exit 1
+    fi
     echo "==> KWS model incomplete in $MODEL_DIR; downloading..." >&2
     if ! /app/scripts/download-model.sh "$MODEL_DIR"; then
         echo "FATAL: failed to download KWS model to $MODEL_DIR; refusing to start" >&2

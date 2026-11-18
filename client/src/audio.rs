@@ -233,6 +233,29 @@ pub const PLAYBACK_DEVICE_DEFAULT: &str = "hw:0,2";
 /// ALSA 缓冲：4 个 20ms 周期（80ms），兼顾延迟与抗抖动。
 const ALSA_BUFFER_PERIODS: u32 = 4;
 
+/// 一路 PCM 在 hw_params 生效后回读的实际缓冲参数（C-1）。
+/// `set_*_near` 只是“尽量接近”，硬件可取整——AEC 的参考延迟必须按
+/// 回读值推导，不能按请求值假设。字段用 i64：`alsa::pcm::Frames`
+/// 在 64-bit 是 i64、32-bit ARM 是 i32，两边都能无损转入。
+/// 本结构不依赖 alsa 类型，故不做 feature 门控（trait 默认方法也要用它）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PcmBufferInfo {
+    /// 实际缓冲大小（帧数）。
+    pub buffer_frames: i64,
+    /// 实际周期大小（帧数）。
+    pub period_frames: i64,
+}
+
+impl PcmBufferInfo {
+    /// 实际缓冲相当于几个周期（buffer/period，四舍五入）；周期 ≤0 时返回 0。
+    pub fn period_count(&self) -> u32 {
+        if self.period_frames <= 0 {
+            return 0;
+        }
+        ((self.buffer_frames + self.period_frames / 2) / self.period_frames).max(0) as u32
+    }
+}
+
 /// 音频硬件抽象：采集一帧 / 播放一段 PCM。真实 ALSA、Fake、NoDevice
 /// 都实现同一 trait，`Audio` 只依赖它，不直接碰硬件。
 /// 注意：`capture` 是阻塞调用（约 20ms 等一帧），调用方应在独立任务里跑。
@@ -243,6 +266,11 @@ pub trait AudioDevice: Send {
     fn play(&mut self, pcm: &[i16]) -> Result<()>;
     /// 一行状态描述（设备名 + 打开结果），供日志/诊断用。
     fn describe(&self) -> String;
+    /// 播放方向回读的实际缓冲信息（C-1：AEC 参考延迟据此推导）。
+    /// 未打开播放方向 / 非 ALSA 设备时返回 None。
+    fn playback_buffer_info(&self) -> Option<PcmBufferInfo> {
+        None
+    }
     /// 设置播放音量（0–100）。默认实现返回明确错误（该设备不支持调音量）；
     /// P1-N1：`set_volume` RPC 绝不谎报成功——混音器调不到就必须让调用方
     /// 收到 Err，而不是静默接受。真实 ALSA 设备见 `AlsaAudioDevice`。
@@ -320,6 +348,10 @@ pub struct AlsaAudioDevice {
     want_capture: bool,
     /// 本实例是否请求了播放方向（false = 根本没打开，见 P0-N1）。
     want_playback: bool,
+    /// 采集方向回读的实际缓冲（C-1；打开失败时 None）。
+    capture_buffer: Option<PcmBufferInfo>,
+    /// 播放方向回读的实际缓冲（C-1：AEC 参考延迟据此推导；打开失败时 None）。
+    playback_buffer: Option<PcmBufferInfo>,
 }
 
 #[cfg(feature = "alsa")]
@@ -335,25 +367,25 @@ impl AlsaAudioDevice {
     /// 按需打开：`None` 的方向不打开（`want_* = false`，`describe` 标
     /// `not requested`）；`Some` 的方向打开失败只记录、不整体失败。
     fn open_selected(capture_dev: Option<&str>, playback_dev: Option<&str>) -> Self {
-        let (capture, capture_err) = match capture_dev {
+        let (capture, capture_err, capture_buffer) = match capture_dev {
             Some(dev) => match open_pcm(dev, alsa::Direction::Capture) {
-                Ok(p) => (Some(p), None),
+                Ok((p, info)) => (Some(p), None, Some(info)),
                 Err(e) => {
                     tracing::warn!("ALSA capture device {dev} open failed: {e}");
-                    (None, Some(e))
+                    (None, Some(e), None)
                 }
             },
-            None => (None, None),
+            None => (None, None, None),
         };
-        let (playback, playback_err) = match playback_dev {
+        let (playback, playback_err, playback_buffer) = match playback_dev {
             Some(dev) => match open_pcm(dev, alsa::Direction::Playback) {
-                Ok(p) => (Some(p), None),
+                Ok((p, info)) => (Some(p), None, Some(info)),
                 Err(e) => {
                     tracing::warn!("ALSA playback device {dev} open failed: {e}");
-                    (None, Some(e))
+                    (None, Some(e), None)
                 }
             },
-            None => (None, None),
+            None => (None, None, None),
         };
         Self {
             capture,
@@ -364,6 +396,8 @@ impl AlsaAudioDevice {
             playback_dev: playback_dev.unwrap_or(PLAYBACK_DEVICE_DEFAULT).to_string(),
             want_capture: capture_dev.is_some(),
             want_playback: playback_dev.is_some(),
+            capture_buffer,
+            playback_buffer,
         }
     }
 
@@ -375,6 +409,19 @@ impl AlsaAudioDevice {
             "open".to_string()
         } else {
             format!("FAILED: {}", err.as_deref().unwrap_or("?"))
+        }
+    }
+
+    /// 已打开方向的回读缓冲（C-1）；未打开/未回读时为空串（describe
+    /// 里的 `[状态]` 部分格式不变，P0-N1 回归测试的断言不受影响）。
+    fn describe_buffer(info: &Option<PcmBufferInfo>) -> String {
+        match info {
+            Some(i) => format!(
+                " (buffer {}f, {} periods)",
+                i.buffer_frames,
+                i.period_count()
+            ),
+            None => String::new(),
         }
     }
 
@@ -432,8 +479,22 @@ impl AlsaAudioDevice {
 }
 
 /// 打开一路 PCM 并按协议设好硬件参数（S16LE / 16kHz / 单声道 / 20ms 周期）。
+/// 返回 PCM 与回读的实际缓冲信息（C-1）。
+///
+/// C-1：`set_period_size_near` / `set_buffer_size_near` 的 `_near` 只是
+/// “尽量接近”，硬件可取整——hw_params 生效后必须回读实际 `buffer_size` /
+/// `period_size`（`hw_params_current`），否则 AEC 拿着 4 周期的理论延迟
+/// 对 3/5 周期的真实缓冲静默失效。回读值记 info 日志；与请求值不符时
+/// 明确 warn（播放方向注明推导出的 AEC 延迟帧数）；回读失败不致命
+/// （设备已打开），按请求值假设并明确 warn。
+// `f as i64` 在 64-bit 是同类型转换（clippy 会报），但 32-bit ARM 上
+// `alsa::pcm::Frames` 是 i32、转换是必需的——此处允许，跨平台不断。
+#[allow(clippy::unnecessary_cast)]
 #[cfg(feature = "alsa")]
-fn open_pcm(device: &str, dir: alsa::Direction) -> std::result::Result<alsa::pcm::PCM, String> {
+fn open_pcm(
+    device: &str,
+    dir: alsa::Direction,
+) -> std::result::Result<(alsa::pcm::PCM, PcmBufferInfo), String> {
     let pcm = alsa::pcm::PCM::new(device, dir, false)
         .map_err(|e| format!("snd_pcm_open {device} failed: {e} (errno {})", e.errno()))?;
     // HwParams 借用 pcm，设完即 drop（HwParams 的 Drop 会释放参数结构），
@@ -466,7 +527,54 @@ fn open_pcm(device: &str, dir: alsa::Direction) -> std::result::Result<alsa::pcm
         pcm.hw_params(&hwp)
             .map_err(|e| format!("hw_params {device} failed: {e} (errno {})", e.errno()))?;
     }
-    Ok(pcm)
+    let requested_buffer = (ALSA_BUFFER_PERIODS as i64) * (FRAME_SAMPLES as i64);
+    let info = match pcm.hw_params_current().and_then(|cur| {
+        let buffer = cur.get_buffer_size().map(|f| f as i64);
+        let period = cur.get_period_size().map(|f| f as i64);
+        buffer.and_then(|b| period.map(|p| (b, p)))
+    }) {
+        Ok((buffer_frames, period_frames)) => PcmBufferInfo {
+            buffer_frames,
+            period_frames,
+        },
+        Err(e) => {
+            tracing::warn!(
+                "ALSA {device} ({dir:?}): failed to read back actual buffer/period ({e}) — assuming requested {requested_buffer}f/{FRAME_SAMPLES}f; AEC delay may be off"
+            );
+            PcmBufferInfo {
+                buffer_frames: requested_buffer,
+                period_frames: FRAME_SAMPLES as i64,
+            }
+        }
+    };
+    tracing::info!(
+        "ALSA {device} ({dir:?}): buffer {} frames ({} periods of {}f), requested {}f/{}f",
+        info.buffer_frames,
+        info.period_count(),
+        info.period_frames,
+        requested_buffer,
+        FRAME_SAMPLES
+    );
+    if info.buffer_frames != requested_buffer || info.period_frames != FRAME_SAMPLES as i64 {
+        if dir == alsa::Direction::Playback {
+            let derived = crate::aec::ref_delay_frames_for_buffer(info.buffer_frames);
+            tracing::warn!(
+                "ALSA {device} (playback): actual buffer {}f/period {}f differs from requested {requested_buffer}f/{}f — AEC reference delay derived from actual buffer: {derived} frames (nominal {})",
+                info.buffer_frames,
+                info.period_frames,
+                FRAME_SAMPLES,
+                crate::aec::AEC_REF_DELAY_FRAMES
+            );
+        } else {
+            tracing::warn!(
+                "ALSA {device} (capture): actual buffer {}f/period {}f differs from requested {requested_buffer}f/{}f",
+                info.buffer_frames,
+                info.period_frames,
+                FRAME_SAMPLES
+            );
+        }
+    }
+    Ok((pcm, info))
 }
 
 #[cfg(feature = "alsa")]
@@ -587,16 +695,23 @@ impl AudioDevice for AlsaAudioDevice {
 
     fn describe(&self) -> String {
         format!(
-            "AlsaAudioDevice capture={} [{}] playback={} [{}]",
+            "AlsaAudioDevice capture={} [{}]{} playback={} [{}]{}",
             self.capture_dev,
             Self::describe_side(self.capture.is_some(), self.want_capture, &self.capture_err),
+            Self::describe_buffer(&self.capture_buffer),
             self.playback_dev,
             Self::describe_side(
                 self.playback.is_some(),
                 self.want_playback,
                 &self.playback_err
             ),
+            Self::describe_buffer(&self.playback_buffer),
         )
+    }
+
+    /// C-1：播放方向回读的实际缓冲（AEC 参考延迟据此推导）。
+    fn playback_buffer_info(&self) -> Option<PcmBufferInfo> {
+        self.playback_buffer
     }
 
     /// P1-N1：真调 ALSA 混音器（见 `set_volume_via_mixer`）。本 VM 无硬件时
@@ -763,6 +878,14 @@ impl Audio {
     #[allow(dead_code)]
     pub fn describe(&self) -> String {
         self.device.describe()
+    }
+
+    /// 播放缓冲推导的 AEC 参考延迟帧数（C-1）：Some(n) 表示播放设备已按
+    /// 实际缓冲算出延迟；None 表示无播放设备/非 ALSA 设备（调用方保留默认值）。
+    pub fn playback_aec_delay_frames(&self) -> Option<usize> {
+        self.device
+            .playback_buffer_info()
+            .map(|info| crate::aec::ref_delay_frames_for_buffer(info.buffer_frames))
     }
 }
 
@@ -977,6 +1100,96 @@ mod tests {
             Ok(pcm) => assert_eq!(pcm.len(), FRAME_SAMPLES),
             Err(e) => assert!(e.to_string().contains("ALSA"), "unexpected error: {e}"),
         }
+    }
+
+    // --- C-1：ALSA 缓冲回读与 AEC 延迟推导 ---
+
+    #[test]
+    fn pcm_buffer_info_period_count() {
+        assert_eq!(
+            PcmBufferInfo {
+                buffer_frames: 1280,
+                period_frames: 320
+            }
+            .period_count(),
+            4
+        );
+        assert_eq!(
+            PcmBufferInfo {
+                buffer_frames: 960,
+                period_frames: 320
+            }
+            .period_count(),
+            3
+        );
+        // 周期被取整时仍按总帧数算周期数（1536/384 = 4）。
+        assert_eq!(
+            PcmBufferInfo {
+                buffer_frames: 1536,
+                period_frames: 384
+            }
+            .period_count(),
+            4
+        );
+        assert_eq!(
+            PcmBufferInfo {
+                buffer_frames: 1280,
+                period_frames: 0
+            }
+            .period_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn no_audio_device_reports_no_playback_buffer() {
+        // 非 ALSA 设备没有可推导的播放缓冲——调用方保留默认延迟 4 帧。
+        let audio = Audio::with_device(Box::new(NoAudioDevice::new("test: no hardware"))).unwrap();
+        assert_eq!(audio.playback_aec_delay_frames(), None);
+    }
+
+    #[test]
+    #[cfg(feature = "alsa")]
+    fn open_pcm_null_device_reads_back_requested_buffer() {
+        // ALSA `null` 插件不碰硬件：本 VM 也能跑通 open_pcm 全程（设参 +
+        // 回读），验证回读代码本身。null 插件接受请求值，回读应与请求一致，
+        // 推导出的延迟帧数即标称 4 帧。
+        let (pcm, info) = open_pcm("null", alsa::Direction::Playback).expect("null pcm must open");
+        drop(pcm);
+        assert_eq!(
+            info.period_frames, FRAME_SAMPLES as i64,
+            "period must read back as requested: {info:?}"
+        );
+        assert_eq!(
+            info.buffer_frames,
+            (ALSA_BUFFER_PERIODS as i64) * (FRAME_SAMPLES as i64),
+            "buffer must read back as requested: {info:?}"
+        );
+        assert_eq!(
+            crate::aec::ref_delay_frames_for_buffer(info.buffer_frames),
+            crate::aec::AEC_REF_DELAY_FRAMES
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "alsa")]
+    fn null_device_playback_buffer_appears_in_describe() {
+        // 回读的缓冲进 describe：`open` 后紧跟回读值；Fake/缺硬件路径
+        // 不应凭空出现 buffer 字样（见 P0-N1 测试的 FAILED/not requested）。
+        let audio = Audio::open_devices("null", "null").unwrap();
+        let desc = audio.describe();
+        assert!(
+            desc.contains("capture=null [open] (buffer 1280f, 4 periods)"),
+            "capture side must show read-back buffer: {desc}"
+        );
+        assert!(
+            desc.contains("playback=null [open] (buffer 1280f, 4 periods)"),
+            "playback side must show read-back buffer: {desc}"
+        );
+        assert_eq!(
+            audio.playback_aec_delay_frames(),
+            Some(crate::aec::AEC_REF_DELAY_FRAMES)
+        );
     }
 
     /// 测试用 Fake 设备：按队列吐采集帧，记录播放帧；与 AudioDevice 同 trait。

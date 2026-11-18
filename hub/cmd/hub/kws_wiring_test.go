@@ -168,6 +168,24 @@ func (f *kwsFakeSidecar) sendWake(t *testing.T, deviceID, keyword string, rms fl
 	}
 }
 
+// sendWakePeak 是带 rms_peak 的 wake 发送（S-1 回归测试用）：
+// 不改旧 sendWake 的签名，旧边车不发 rms_peak 的回退路径由旧测试覆盖。
+func (f *kwsFakeSidecar) sendWakePeak(t *testing.T, deviceID, keyword string, rms, rmsPeak float64) {
+	t.Helper()
+	f.mu.Lock()
+	conn, ok := f.conns[deviceID]
+	f.mu.Unlock()
+	if !ok {
+		t.Fatalf("假边车没有设备 %s 的连接，无法发 wake", deviceID)
+	}
+	if err := conn.WriteJSON(map[string]any{
+		"type": "wake", "device_id": deviceID, "keyword": keyword,
+		"rms": rms, "rms_peak": rmsPeak, "timestamp_ms": time.Now().UnixMilli(),
+	}); err != nil {
+		t.Fatalf("发 wake 失败: %v", err)
+	}
+}
+
 func (f *kwsFakeSidecar) closeConn(deviceID string) {
 	f.mu.Lock()
 	conn, ok := f.conns[deviceID]
@@ -447,5 +465,33 @@ func TestKWSRMSConversion(t *testing.T) {
 	h.handler.OnKWSWake(kws.WakeEvent{DeviceID: "lx06-1", Keyword: "你好小李", RMS: 0, TimestampMs: time.Now().UnixMilli()})
 	if w := h.waitWinner(t, 3*time.Second); w != "lx06-1" {
 		t.Fatalf("rms=0 的唤醒也应能仲裁，实际赢 %q", w)
+	}
+}
+
+// TestKWSArbitrationUsesRMSPeak（S-1）：含 rms_peak 的 wake 事件进仲裁
+// 用的应是峰值，不是会被 trailing 静音稀释的均值。
+// lx06-1 均值高（0.6）峰值低（0.25），oh2p-1 均值低（0.2）峰值高（0.65）：
+// 用均值仲裁 lx06-1 赢，用峰值仲裁 oh2p-1 赢；应以后者为准。
+func TestKWSArbitrationUsesRMSPeak(t *testing.T) {
+	fake := newKWSFakeSidecar(t)
+	h := newKWSHarness(t, fake.url())
+
+	h.feedLoud("lx06-1", 5)
+	h.feedLoud("oh2p-1", 5)
+	fake.waitPCMFrames(t, "lx06-1", 5, 3*time.Second)
+	fake.waitPCMFrames(t, "oh2p-1", 5, 3*time.Second)
+
+	fake.sendWakePeak(t, "lx06-1", "你好小李", 0.6, 0.25)
+	fake.sendWakePeak(t, "oh2p-1", "你好小李", 0.2, 0.65)
+	if w := h.waitWinner(t, 3*time.Second); w != "oh2p-1" {
+		t.Fatalf("峰值高的 oh2p-1 应赢（峰值 0.65 > 0.25），实际赢 %q", w)
+	}
+	select {
+	case losers := <-h.lost:
+		if len(losers) != 1 || losers[0] != "lx06-1" {
+			t.Fatalf("输家应只有 lx06-1，实际 %v", losers)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("超时：仲裁未报告输家")
 	}
 }
