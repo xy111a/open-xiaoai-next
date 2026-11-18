@@ -31,7 +31,7 @@ patch.sh lx06 1.94.13          # 补丁 + 重新打包 → work/lx06_1.94.13/roo
 | 校验 | miso：RSA + SHA1，签名覆盖包体从偏移 0xc 起；公钥走 `/dev/miso` 内核驱动 | REA_ANALYSIS.md |
 | DTS | 刷机后回不来（整条链断了），别修它；NAS 侧 EQ 补约 80% | REA_ANALYSIS.md |
 | root.squashfs | Squashfs v4.0 xz，2137 inodes，37,500,699 字节，blocksize 131072，1348 个文件 | REA_ANALYSIS.md / 实测 |
-| root 密码 | 无默认值：`SSH_PASSWORD` 未设时补丁直接失败退出；密码 ≥16 位，只从环境变量或交互式输入读，hash 为 sha512crypt（`$6$`，每次随机 16 字符盐，5000 轮），hash 永不打印 | openssl 实测 |
+| root 密码 | 无默认值：`SSH_PASSWORD` 未设时补丁直接失败退出；密码 ≥16 位，只从环境变量或交互式输入读，hash 为 sha512crypt（`$6$`，每次随机 16 字符盐，5000 轮），hash 永不打印；重编沿用旧 hash 时设 `PATCH_REUSE_ROOT_HASH_FILE` 指向备份文件（F-4，见 `FLASH_RUNBOOK.md` §1） | openssl 实测 |
 | libxaudio | `hw:0,3` 在 1.94.13 里唯一一次出现，偏移 773628，6 字节改为 `noop\x00\x00` | strings 实测 |
 
 ## 补丁内容（`scripts/patch_firmware.py`，纯 Python 自研实现）
@@ -44,10 +44,10 @@ patch.sh lx06 1.94.13          # 补丁 + 重新打包 → work/lx06_1.94.13/roo
 | SSH | `etc/init.d/dropbear`：去掉 `enable=0` 返回、蓝牙模式不启动、`/data/ssh_en` 门控；启动时 `mkdir -p /data/etc/dropbear`，缺 host key 则 keygen |
 | 登录 | `etc/shadow` root 密码换 sha512crypt（`$6$`，随机盐）；`etc/inittab` 的 ttyS0 仍走 `/bin/login`（需 root 密码，P1-36：原先免密 ash 已去掉）；`etc/pam.d/common-auth` 注释 `libmico-pam.so`、启用 `pam_unix.so` |
 | 禁 OTA | `bin/ota` 的 `download_upgrade()`/`upgrade()` 开头 `return 1`；`bin/flash.sh` 的 `upgrade_param_check()` 开头 `return 1`；`etc/init.d/wireless` 的 `ota()` 开头 `echo download_fail` + `exit 3` |
-| 启动 | `etc/rc.local` 增加 `[ -f "/data/init.sh" ] && sh /data/init.sh >/dev/null 2>&1 &` |
+| 启动 | `etc/rc.local` 增加 `[ -x /etc/open-xiaoai/init.sh ] && /etc/open-xiaoai/init.sh >/dev/null 2>&1 &`（走包装器，见下文“/data/init.sh 安装流程”；F-7：旧直行 `[ -f "/data/init.sh" ] && sh …` 已废弃，`patch_firmware.py:patch_start` 会把旧直行替换为包装器行） |
 | asound（LX06/OH2P） | `etc/asound.conf` 与 `etc/asound.conf.dts`：`pcm.mico_record`/`pcm.noop` 改走 `Capture`（dsnoop，hw:0,3，48kHz，S32_LE，8ch，period 384，buffer 6144）；`defaults.pcm.rate_converter "speexrate_medium"`（已有则不重复加） |
 | libxaudio（仅 LX06） | `usr/lib/libxaudio_engine.so` 里 `hw:0,3` 的 6 字节改为 `noop\x00\x00`；OH2P 跳过这一步 |
-| mTLS 证书（可选，`--cert-dir`） | 把 `gen-certs.sh` 生成的 `ca.crt`/`client.crt`/`client.key` 装进 `etc/open-xiaoai/tls/`（证书 0644、私钥 0600）；客户端凭此证书连 Hub :4399，Hub 校验客户端证书后才放行 |
+| mTLS 证书（可选，`--cert-dir`） | 把 `gen-certs.sh` 生成的 `ca.crt`/`client.crt`/`client.key` 装进 `etc/open-xiaoai/tls/`（证书 0644、私钥 0600）；客户端凭此证书连 Hub :4399，Hub 校验客户端证书后才放行。两台音箱共用同一份 client 证书/私钥（F-8：吊销无隔离——吊销或轮换会同时影响两台；见 `gen-certs.sh` 头注释） |
 
 每个补丁函数都是“检查前置条件 → 应用 → 校验结果”，可被 pytest 单独
 调用和断言；`patch_all()` 先对全部步骤做 preflight（只读），任一前置
@@ -154,6 +154,18 @@ python3 -m pytest tests/ -q
   flash.sh 调的是不带 `-u` 的 `miso -v`，换公钥文件也没用。第一次必须拆机刷，
   之后全部走 Hub 自有 OTA。
 - 刷机前 SSH 跑 `free -m` 确认 256MB；刷错型号固件（LX06/OH2P 混用）会变砖。
+
+## 已知接受（审计 F-9 / F-10，不修）
+
+- **F-9 原厂 `boot.img` ramdisk 内 `/init` 仍有免密兜底 shell（`exec sh`）。**
+  仅在 `switch_root` 失败的启动失败路径可达；`boot.img` 不在本次补丁
+  范围内（补丁只改 root.squashfs），要修需改 boot.img（签名/刷机流程
+  另议）。接受现状，不改。
+- **F-10 每日 03:00 cron 仍跑 `/bin/ota slient` 向小米查升级。**
+  仅查询、不致刷机：`bin/ota` 的 `check()` 只调只读的
+  `matool_check_upgrade`，`upgrade()` 开头 `return 1` 已死（补丁
+  `patch_disable_ota` 保证）。删 cron 行会改动镜像内容、触发重编，
+  对一个 P2 不值得。接受现状，不删该行。
 
 ## BLOCKED / 待确认
 

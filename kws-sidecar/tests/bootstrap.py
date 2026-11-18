@@ -249,20 +249,21 @@ def _download(url: str, dest: Path, sha256=None) -> None:
 def _ensure_voice(root: Path) -> Path:
     tts_dir = root / "tts"
     voice_onnx = tts_dir / VOICE_FILES[0][0]
+    # S-9（第三轮审计）：已存在的文件逐个验 SHA——此前只在“两个文件
+    # 都已存在”时才验，缺一个文件时现存那个直接跳过校验用到底。
+    # 坏的删掉重下，与全存在路径一致；未 pin 的文件 _voice_sha_ok
+    # 返回 True，不触发重下。
+    for name, _ in VOICE_FILES:
+        dest = tts_dir / name
+        if dest.is_file() and not _voice_sha_ok(dest):
+            print(f"[bootstrap] voice file {name} failed SHA256 check; "
+                  f"deleting and re-downloading ...", flush=True)
+            dest.unlink()
     if all((tts_dir / name).is_file() for name, _ in VOICE_FILES):
-        # SC-P2-8：已存在的文件也验 SHA——损坏的语音文件否则要到
-        # piper 合成失败才暴露；不符即删掉重下，不静默用坏文件。
-        bad = [name for name, _ in VOICE_FILES
-               if not _voice_sha_ok(tts_dir / name)]
-        if not bad:
-            print(f"[bootstrap] voice files present and SHA256 OK "
-                  f"({', '.join(name for name, _ in VOICE_FILES)})",
-                  flush=True)
-            return voice_onnx
-        print(f"[bootstrap] voice file(s) failed SHA256 check: "
-              f"{', '.join(bad)}; re-downloading ...", flush=True)
-        for name in bad:
-            (tts_dir / name).unlink()
+        print(f"[bootstrap] voice files present and SHA256 OK "
+              f"({', '.join(name for name, _ in VOICE_FILES)})",
+              flush=True)
+        return voice_onnx
     for name, url in VOICE_FILES:
         dest = tts_dir / name
         if not dest.is_file():

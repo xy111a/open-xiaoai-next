@@ -35,7 +35,7 @@ use std::sync::{
 };
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 mod aec;
 mod audio;
@@ -526,6 +526,10 @@ async fn main() -> Result<()> {
             FailureThrottle::new(std::time::Duration::from_secs(1), ENCODE_REBUILD_AFTER);
         let mut dropped_frames: u64 = 0;
         let mut last_drop_log: Option<std::time::Instant> = None;
+        // C-10：wake_tx 满时的丢事件计数（与 audio_tx 的 P2-N5 共用
+        // DropTracker 口径；wake 事件丢了只影响一次仲裁上报，绝不能
+        // 反压堵住采集/AEC/编码）。
+        let mut wake_drops = DropTracker::new();
         let mut backoff_attempt: u32 = 0;
         loop {
             let mut audio = match Audio::open_capture_only() {
@@ -569,8 +573,21 @@ async fn main() -> Result<()> {
                         if let Some(k) = kws.as_mut() {
                             match k.feed(&pcm) {
                                 Ok(Some(ev)) => {
-                                    if wake_tx.send(ev).await.is_err() {
-                                        return;
+                                    // C-10：wake 上报改 try_send，与 audio_tx
+                                    // （P2-N5）一致——run_session 的 select!
+                                    // 若在半死连接上挂住，wake_rx 长时间不
+                                    // 收，旧的 `.send(ev).await` 会把录音
+                                    // 任务整个堵住（采集、AEC、编码全停）。
+                                    // 通道满时丢本次唤醒事件并计数（5 秒一
+                                    // 条节流 warn）；通道关闭时任务结束。
+                                    match wake_tx.try_send(ev) {
+                                        Ok(()) => {}
+                                        Err(TrySendError::Full(_)) => {
+                                            if let Some(total) = wake_drops.note_dropped() {
+                                                warn!("wake_tx full, dropping wake events ({total} dropped since last log) — run_session is consuming slowly, capture never blocks");
+                                            }
+                                        }
+                                        Err(TrySendError::Closed(_)) => return,
                                     }
                                 }
                                 Ok(None) => {}
@@ -747,6 +764,45 @@ async fn main() -> Result<()> {
     }
 }
 
+/// 满通道丢帧计数 + 5 秒节流日志（P2-N5 / C-5 / C-10 共用）。
+/// 每次丢帧调 `note_dropped`；只有第一次与距上次日志 ≥5s 时返回
+/// `Some(自上次日志以来的累计丢帧数)`（调用方打一条 warn），其余
+/// 返回 None。计数在打日志后清零——与 P2-N5 的 audio_tx 行为一致，
+/// 日志里的数是“自上次日志以来”的丢帧数，不是总量。
+struct DropTracker {
+    dropped: u64,
+    last_log: Option<std::time::Instant>,
+}
+
+impl DropTracker {
+    fn new() -> Self {
+        Self {
+            dropped: 0,
+            last_log: None,
+        }
+    }
+
+    fn note_dropped(&mut self) -> Option<u64> {
+        self.note_dropped_at(std::time::Instant::now())
+    }
+
+    fn note_dropped_at(&mut self, now: std::time::Instant) -> Option<u64> {
+        self.dropped += 1;
+        if self
+            .last_log
+            .map(|t| now.duration_since(t) > std::time::Duration::from_secs(5))
+            .unwrap_or(true)
+        {
+            self.last_log = Some(now);
+            let total = self.dropped;
+            self.dropped = 0;
+            Some(total)
+        } else {
+            None
+        }
+    }
+}
+
 enum SessionEnd {
     Disconnected,
     Shutdown,
@@ -780,6 +836,8 @@ async fn run_session(
     // 改为最多 5 秒一条（含累计丢帧数），失败原因仍明确可见。
     let mut playback_err_count: u64 = 0;
     let mut last_playback_err_log: Option<std::time::Instant> = None;
+    // C-5：播放参考丢帧计数（与 P2-N5 的 audio_tx 同口径）。
+    let mut ref_drops = DropTracker::new();
     // server 模式：会话一建立就发 audio_start，开始持续推流（不等 wake_win）。
     if session.server_mode {
         session.streaming = true;
@@ -825,9 +883,22 @@ async fn run_session(
                                     if pcm.len() == audio::FRAME_SAMPLES {
                                         let mut frame = [0i16; audio::FRAME_SAMPLES];
                                         frame.copy_from_slice(&pcm);
-                                        let _ = ref_tx.try_send(frame);
+                                        // C-5：ref_tx 满时不再静默丢帧——
+                                        // 丢参考恰好是扰动 AEC 对齐的事件，
+                                        // 计数 + 5 秒节流 warn（P2-N5 同款）；
+                                        // 通道关闭（录音任务已退出）时静默
+                                        // 丢弃，参考无处可去是预期行为。
+                                        match ref_tx.try_send(frame) {
+                                            Ok(()) => {}
+                                            Err(TrySendError::Full(_)) => {
+                                                if let Some(total) = ref_drops.note_dropped() {
+                                                    warn!("ref_tx full, dropping playback reference frames ({total} dropped since last log) — AEC alignment may degrade briefly");
+                                                }
+                                            }
+                                            Err(TrySendError::Closed(_)) => {}
+                                        }
                                     }
-                                    info!("played {}-sample frame via ALSA", pcm.len());
+                                    debug!("played {}-sample frame via ALSA", pcm.len());
                                 }
                                 Err(e) => {
                                     playback_err_count += 1;
@@ -900,6 +971,9 @@ async fn run_session(
             }
             // 30s 状态上报 + 心跳（P1-44：每 30s 发 heartbeat，与 status
             // 同一节拍；任一发送失败即断线重连，与 status 同待遇）。
+            // C-10：同一节拍再发 WS Ping——Hub 只停读不发 FIN/RST 的半死
+            // 连接上，Ping/Pong 往返是比等 30s 状态更早的活性探测；
+            // send_* 本身另有 SEND_TIMEOUT 兜底（见 transport.rs）。
             _ = status_tick.tick() => {
                 let version = env!("CARGO_PKG_VERSION");
                 if let Err(e) = transport.send_status(session.volume, session.playing, version).await {
@@ -908,6 +982,10 @@ async fn run_session(
                 }
                 if let Err(e) = transport.send_heartbeat().await {
                     warn!("send heartbeat failed: {e}");
+                    return SessionEnd::Disconnected;
+                }
+                if let Err(e) = transport.send_ping().await {
+                    warn!("send ping failed: {e}");
                     return SessionEnd::Disconnected;
                 }
             }
@@ -1002,6 +1080,49 @@ async fn apply_action(
 mod tests {
     use super::*;
     use transport::HubMsg;
+
+    // --- C-5 / C-10：满通道丢帧计数 + 5 秒节流日志（DropTracker）---
+    // run_session 的 ref_tx 与录音任务的 wake_tx 共用本计数器；节流
+    // 逻辑是纯函数，用注入的 Instant 测满 5 秒边界，不真睡 5 秒。
+    #[test]
+    fn drop_tracker_logs_first_drop_then_throttles_until_5s() {
+        let mut t = DropTracker::new();
+        let t0 = std::time::Instant::now();
+        // 第一次丢帧即打日志（返回自上次日志以来的累计数 1）。
+        assert_eq!(t.note_dropped_at(t0), Some(1));
+        // 5 秒内再丢只计数、不打日志。
+        assert_eq!(
+            t.note_dropped_at(t0 + std::time::Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            t.note_dropped_at(t0 + std::time::Duration::from_secs(4)),
+            None
+        );
+        // 5 秒边界内（恰好 5s）仍节流：条件是“> 5s”，不是“>= 5s”。
+        assert_eq!(
+            t.note_dropped_at(t0 + std::time::Duration::from_secs(5)),
+            None
+        );
+        // 超过 5 秒再丢，打一条日志，数是期间累计的 4（第 2~5 次丢帧）。
+        assert_eq!(
+            t.note_dropped_at(
+                t0 + std::time::Duration::from_secs(5) + std::time::Duration::from_millis(1)
+            ),
+            Some(4)
+        );
+        // 打日志后计数清零：紧接着一次丢帧是新一轮的第一次。
+        assert_eq!(
+            t.note_dropped_at(t0 + std::time::Duration::from_secs(10)),
+            None,
+            "5s not elapsed since the second log, must stay throttled"
+        );
+        assert_eq!(
+            t.note_dropped_at(t0 + std::time::Duration::from_secs(11)),
+            Some(2),
+            "second log must report the 2 drops since the previous log"
+        );
+    }
 
     #[test]
     fn wake_win_starts_streaming_and_sends_audio_start() {

@@ -24,13 +24,16 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
   返回 `error` 后以 1008 关闭。边车未配 Token 时拒绝启动。
   WS 连接数上限默认 16，超限的新连接返回 `error` 后以 1013 关闭。
 - Hub → 边车，二进制帧：原始 PCM int16 LE 单声道 16kHz，
-  20ms 一帧 = 640 字节（超长帧按 20ms 切分喂入）。
+  20ms 一帧 = 640 字节；非 640 字节的帧返回 `error` 后丢弃
+  （S-4，不再切分喂入；超长帧此前切 1562 块会堵事件循环）。
 - 边车 → Hub（JSON 文本）：
   - `{"type":"ready"}`：hello 确认；
-  - `{"type":"wake","device_id":"...","keyword":"你好小李","rms":0.42,"rms_peak":0.55,"timestamp_ms":...}`：
+  - `{"type":"wake","device_id":"...","keyword":"你好小李","rms":0.42,"rms_peak":0.55,"wake_no":1,"frames_since_wake":12,"timestamp_ms":...}`：
     检出唤醒词；`rms` 为检出时最近 1s 音频的 RMS（0~1），`rms_peak`
     为同一窗口内单帧 RMS 的峰值——`rms` 会被检出前的 trailing 静音
     稀释（检出越晚稀释越多），仲裁比较响度时应优先用 `rms_peak`；
+    `wake_no` 为该设备流自连接以来的第 N 次检出，`frames_since_wake`
+    为上次检出后喂入的帧数（每帧 20ms，检出延迟的近似度量，S-13）；
     `timestamp_ms` 为服务端 Unix 毫秒时间戳；检出后该设备流自动
     复位（re-arm），可继续检下一次唤醒；
   - `{"type":"error","message":"..."}`：协议错误或模型故障。
@@ -38,11 +41,17 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
     后以 1008 关闭（预期内的协议行为，不打 traceback）。
 - 健康检查：`GET /health` → 200
   `{"status":"ok","model_loaded":true,"keywords":1,"devices":0,
-    "uptime_s":...,"total_wakes":0,"device_wakes":{}}`；模型未加载、
-  关键词表为空或推理连续失败（≥5 次）时 503
+    "connections":0,"authenticated_connections":0,
+    "uptime_s":...,"total_wakes":0,"lost_wakes":0,"device_wakes":{}}`；
+  模型未加载、关键词表为空或推理连续失败（同一设备 ≥5 次）时 503
   `{"status":"error",...,"reason":"..."}`。`device_wakes` 为每设备
-  自连接以来的累计唤醒次数（排障：某设备远高于同屋另一台即疑似
-  误触发）。模型加载失败时进程直接非零退出（不静默跑）。
+  累计唤醒次数，断开后仍保留（S-10；排障：某设备远高于同屋另一台
+  即疑似误触发）。`lost_wakes` 为断开时 flush 检出、事件无处可发的
+  唤醒数（同样计入 `total_wakes`）。`connections` 含未完成 hello 的
+  半开连接，`authenticated_connections` 只计已通过 hello + token 的
+  连接（S-11）。推理连续失败置起的不健康标志，在连续 5 次成功喂入
+  后自动清除（S-5，不再粘住到重启）。模型加载失败时进程直接非零
+  退出（不静默跑）。
 
 ## 并发与状态
 
@@ -54,7 +63,12 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
   test_reconnect_drops_old_state`）。断开时先补喂 25 帧（500ms）
   静音做最后一次检出（模型需要关键词后约 200ms trailing 音频才
   吐结果；关键词尾音处恰好断线时不 flush 就会丢这句唤醒）——连接
-  已断，检出只记一条 `wake lost on disconnect` 日志，不发事件。
+  已断，检出不发事件，只记一条 `wake lost on disconnect` 日志，
+  但计入 `total_wakes` 并单记 `lost_wakes`（S-10）。
+- 单帧喂入异常（解码失败）不再直接撕掉整条连接：记 error、复位该
+  设备流并继续喂下一帧，仅当该设备连续失败达 5 次才断连接（S-6，
+  与 S-5 的按设备分桶计数联动）；另一台设备的成功喂入不影响该设备
+  的分桶计数（S-5）。
 - 同一 `device_id` 在旧连接未断时又连上来（且新连接已通过鉴权），
   旧连接被主动关闭（1000 "replaced by new connection"），旧流状态
   丢弃、旧连接此后不再产生 wake（见 `test_duplicate_device_id_
@@ -67,12 +81,12 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `KWS_HOST` | `127.0.0.1` | 监听地址（默认只绑回环，见下“安全假设”；需局域网暴露时再显式改，不要悄悄改回 `0.0.0.0`） |
-| `KWS_PORT` | `10400` | 监听端口（已确认与现有服务无冲突） |
+| `KWS_PORT` | `10400` | 监听端口（已确认与现有服务无冲突）；合法范围 1~65535（S-12） |
 | `KWS_MODEL_DIR` | `/data/kws/models` | 模型目录 |
 | `KWS_KEYWORDS_FILE` | `<模型目录>/keywords.txt` | 关键词表（默认含“你好小李”） |
 | `KWS_THRESHOLD` | `0.25` | keywords_threshold（实验验证值）；合法范围 (0, 1]，越界时边车拒绝启动。改阈值须同步改 `tests/bootstrap.py` 的样本校验（它读同一环境变量，见下） |
-| `KWS_SCORE` | `1.0` | keywords_score（实验验证值）；合法范围 ≥0，越界时边车拒绝启动 |
-| `KWS_NUM_THREADS` | `1` | sherpa 解码线程数 |
+| `KWS_SCORE` | `1.0` | keywords_score（实验验证值）；合法范围 [0, 10]，越界时边车拒绝启动（S-12） |
+| `KWS_NUM_THREADS` | `1` | sherpa 解码线程数；合法范围 1~8（S-12） |
 | `OPEN_XIAOAI_TOKEN`（或 `--token`） | （必填，无默认） | WS hello 鉴权 Token，与 Hub 的 `OPEN_XIAOAI_TOKEN` 同一机密（≥16 位）；未配或太短时边车拒绝启动。Token 只经环境变量/命令行传入，绝不写进仓库、日志或代码 |
 | `KWS_MAX_CONNECTIONS`（或 `--max-connections`） | `16` | WS 连接数上限；超限的新连接以 1013 拒绝 |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
@@ -106,6 +120,13 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
 卷目录可写，写不进时给可读 FATAL（含修复命令）再退出，而不是在
 `download-model.sh` 的 `cp` 上失败。已存在的 root 属主旧卷不受
 copy-up 影响，仍需 `nas-install.sh` §4 的 chown one-shot 迁移。
+
+镜像 pin（S-7，2026-11-18 第三轮审计 P2）：`Dockerfile` 的基础镜像
+按 P1-4 同样做法钉 digest（`python:3.12-slim@sha256:5e2bdb…`，查询
+方法与更新流程见 `Dockerfile` 头注释），apt 包 `curl`/`bzip2` 同样
+钉版本；镜像内以 `USER 1000:1000` 运行（与 compose 的
+`user: "1000:1000"` 一致，独立 `docker run` 也不跑 root）。本机无
+docker，构建验证待 NAS 实测。
 
 ## 安全假设（S-3：边车不启用 TLS，待 bai 定夺）
 

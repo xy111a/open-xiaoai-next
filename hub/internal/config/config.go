@@ -272,16 +272,11 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("kws.keywords 里有空唤醒词")
 			}
 		}
-		// N-P2-10：边车指纹须是 64 位小写 hex（SHA-256），否则配了也认不出。
+		// N-P2-10 / S-14：边车指纹须是 64 位 hex（大小写不限，SHA-256），
+		// 否则配了也认不出；归一化与 kws 包共用 NormalizeFingerprintHex。
 		if c.KWS.Fingerprint != "" {
-			fp := strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(c.KWS.Fingerprint, ":", ""), " ", ""))
-			if len(fp) != 64 {
-				return fmt.Errorf("kws.fingerprint 必须是 64 位 hex（证书 SHA-256 指纹），实际 %d 位", len(fp))
-			}
-			for _, r := range fp {
-				if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
-					return fmt.Errorf("kws.fingerprint 含非 hex 字符")
-				}
+			if _, err := NormalizeFingerprintHex(c.KWS.Fingerprint); err != nil {
+				return fmt.Errorf("kws.fingerprint %w", err)
 			}
 		}
 	}
@@ -310,6 +305,23 @@ func validateKWSURL(raw string) error {
 		return fmt.Errorf("kws.url 必须带路径（边车 WS 路径，如 /v1/kws），实际是 %q", raw)
 	}
 	return nil
+}
+
+// NormalizeFingerprintHex 归一化 SHA-256 指纹（S-14：config 与 kws 共用
+// 同一个函数）：去冒号/空格/连字符，转小写；必须是 64 位 hex（大小写不限），
+// 否则返回错误。旧版 config 只 strip 冒号和空格、kws 还 strip 连字符，
+// 带 "-" 的指纹会被 config 拒绝、却是 kws 能接受的格式，现已统一。
+func NormalizeFingerprintHex(fp string) (string, error) {
+	fp = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(fp, ":", ""), " ", ""), "-", ""))
+	if len(fp) != 64 {
+		return "", fmt.Errorf("必须是 64 位 hex（大小写不限），实际 %d 位", len(fp))
+	}
+	for _, r := range fp {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return "", fmt.Errorf("含非 hex 字符")
+		}
+	}
+	return fp, nil
 }
 
 // validateDND 校验勿扰时段格式 HH:MM-HH:MM（时 0–23，分 0–59）。

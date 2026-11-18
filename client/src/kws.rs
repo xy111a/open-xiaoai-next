@@ -307,8 +307,21 @@ impl Kws {
             self.frames_seen += 1;
             #[cfg(feature = "sherpa-kws")]
             if let Some(spotter) = self.sherpa.as_mut() {
-                let frame_arr: &[i16; FRAME_SAMPLES] =
-                    frame.as_slice().try_into().expect("frame is 320 samples");
+                // C-8：frame 恰由上行 `drain(..FRAME_SAMPLES)` 切出，
+                // 长度恒为 320，`try_into` 理论上不可败；但生产路径不
+                // 能留 `.expect` panic 点（FIXES_P2.md:85 的绝对化表述
+                // 因此不成立，见该文件的收窄建议）。debug 构建中断言，
+                // release 构建返回 Err（`feed` 的调用方已处理 Err）。
+                debug_assert_eq!(frame.len(), FRAME_SAMPLES);
+                let frame_arr: &[i16; FRAME_SAMPLES] = match frame.as_slice().try_into() {
+                    Ok(arr) => arr,
+                    Err(_) => {
+                        return Err(anyhow!(
+                            "kws frame length is {}, want {FRAME_SAMPLES} (unreachable: frame was cut by drain)",
+                            frame.len()
+                        ));
+                    }
+                };
                 match spotter.feed_frame(frame_arr) {
                     Ok(Some(keyword)) => {
                         self.feed_throttle.note_success();

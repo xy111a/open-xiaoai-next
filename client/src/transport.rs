@@ -3,8 +3,11 @@
 //! 按 docs/PROTOCOL.md（v1 冻结）：
 //!   - wss 连接 Hub :4399，`hello` 带 token 鉴权；鉴权失败（hello_reject）即关闭并报错；
 //!   - Hub 自签证书：用 client.toml 的 `hub_ca_fingerprint`（SHA-256）校验；
-//!     未配置指纹时跳过校验并打警告（仅测试环境可接受）；
-//!   - 断线后指数退避重连：首 100ms，上限 1s，30s 内恢复；
+//!     指纹必填（P1-10：`config.rs` validate 缺指纹即拒绝启动）；
+//!     `build_tls_config` 里仍有无指纹回退分支（系统根证书），仅当
+//!     validate 被绕过（如测试直调）时才可达，生产路径走不到；
+//!   - 断线后指数退避重连：首 100ms，上限 30s（P1-43：旧上限 1s 让两台
+//!     设备以 1 次/秒永重试，无 jitter 还会同步成重连脉冲）；
 //!   - `tls: false` 时用纯 ws（仅本地测试）。
 
 use std::path::{Path, PathBuf};
@@ -48,6 +51,16 @@ pub fn ws_config() -> WebSocketConfig {
 }
 /// 定期状态上报间隔（协议：每 30s）。
 pub const STATUS_INTERVAL: Duration = Duration::from_secs(30);
+/// C-10：单次 WS 发送上限 5s。Hub 只停读不发 FIN/RST 的半死连接上，
+/// 无超时的 `send_*` 会无限挂起并 wedged 整个 run_session（`select!`
+/// 停住）；超时即按断线重连（调用方收到 Err 后返回 Disconnected）。
+/// 5s 远大于正常发送耗时（局域网毫秒级），只拦挂死的发送。
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// C-10：TCP keepalive 参数（内核级半死连接探测，与 WS Ping 互补）：
+/// 30s 空闲后开始探测，每 10s 一次，3 次无应答即 RST，读侧随即断线重连。
+pub const TCP_KEEPALIVE_IDLE_SECS: libc::c_int = 30;
+pub const TCP_KEEPALIVE_INTERVAL_SECS: libc::c_int = 10;
+pub const TCP_KEEPALIVE_COUNT: libc::c_int = 3;
 /// 重连退避：首次 100ms。
 pub const BACKOFF_INITIAL_MS: u64 = 100;
 /// 重连退避上限：30s（P1-43：旧上限 1s 让两台设备以 1 次/秒永重试，
@@ -72,7 +85,8 @@ pub fn backoff_delay(attempt: u32) -> Duration {
 
 /// 鉴权失败是否属于“配置错，不应永重试”（P1-43）：Hub 明确拒绝 hello
 /// （Token 错）或本地弱 Token 检查失败。`connect_with_retry` 对这类错误
-/// 只重试 3 次，随后返回 Err、主循环非零退出。
+/// 只重试 3 次（累计 3 次，非连续 3 次——见 `connect_with_retry`），
+/// 随后返回 Err、主循环非零退出。
 pub fn is_auth_rejection(e: &anyhow::Error) -> bool {
     let msg = e.to_string();
     msg.contains("hub rejected hello") || msg.contains("hub token is weak")
@@ -505,22 +519,28 @@ pub struct Transport {
 }
 
 impl Transport {
-    /// 发送一条 JSON 文本消息。
-    pub async fn send_json(&mut self, text: &str) -> Result<()> {
-        self.ws
-            .send(Message::Text(text.to_string().into()))
+    /// 带 SEND_TIMEOUT 的底层发送（全部 `send_*` 与 Pong 回复共用）。
+    /// 超时与发送失败都返回 Err——调用方（run_session）按断线重连处理。
+    async fn ws_send(&mut self, msg: Message) -> Result<()> {
+        tokio::time::timeout(SEND_TIMEOUT, self.ws.send(msg))
             .await
+            .map_err(|_| {
+                anyhow!("ws send timed out after {SEND_TIMEOUT:?} (peer not reading; treating as disconnect)")
+            })?
             .map_err(|e| anyhow!("ws send failed: {e}"))?;
         Ok(())
     }
 
+    /// 发送一条 JSON 文本消息。
+    pub async fn send_json(&mut self, text: &str) -> Result<()> {
+        self.ws_send(Message::Text(text.to_string().into())).await
+    }
+
     /// 发送一帧 Opus 音频（二进制帧，首字节 0x01）。
     pub async fn send_audio_frame(&mut self, opus: &[u8]) -> Result<()> {
-        self.ws
-            .send(Message::Binary(wrap_audio_frame(opus).into()))
+        self.ws_send(Message::Binary(wrap_audio_frame(opus).into()))
             .await
-            .map_err(|e| anyhow!("ws send audio frame failed: {e}"))?;
-        Ok(())
+            .map_err(|e| anyhow!("ws send audio frame failed: {e}"))
     }
 
     /// 上报唤醒事件（KWS 命中后）。
@@ -595,6 +615,16 @@ impl Transport {
             .await
     }
 
+    /// C-10：发 WS Ping（每 30s 随 heartbeat 发一次，见 run_session 的
+    /// 状态节拍）。对端按协议回 Pong；`next_raw`/`next_msg` 收到 Pong
+    /// 即丢弃。发送本身同样受 SEND_TIMEOUT 约束，超时按断线重连。
+    /// 注意：只发 Ping，不在这里等 Pong——等 Pong 会阻塞 run_session
+    /// 的 select!，活性由“发送成功 + 后续收帧”共同证明。
+    pub async fn send_ping(&mut self) -> Result<()> {
+        self.ws_send(Message::Ping(b"open-xiaoai-ping".as_ref().into()))
+            .await
+    }
+
     /// 回应 Hub 的 rpc。
     pub async fn send_rpc_result(&mut self, id: &str, ok: bool, error: Option<&str>) -> Result<()> {
         let mut body = serde_json::json!({ "id": id, "ok": ok });
@@ -634,8 +664,7 @@ impl Transport {
                     continue;
                 }
                 Some(Ok(Message::Ping(payload))) => {
-                    self.ws
-                        .send(Message::Pong(payload))
+                    self.ws_send(Message::Pong(payload))
                         .await
                         .map_err(|e| anyhow!("pong failed: {e}"))?;
                     continue;
@@ -665,7 +694,7 @@ impl Transport {
                     continue;
                 }
                 Some(Ok(Message::Ping(payload))) => {
-                    self.ws.send(Message::Pong(payload)).await.ok();
+                    self.ws_send(Message::Pong(payload)).await.ok();
                     continue;
                 }
                 Some(Ok(Message::Pong(_))) => continue,
@@ -681,6 +710,30 @@ impl Transport {
     #[allow(dead_code)]
     pub async fn close(mut self) {
         let _ = self.ws.close(None).await;
+    }
+
+    /// 测试用：底层 TCP 的 SO_KEEPALIVE 是否已开（C-10 回归）。
+    #[cfg(test)]
+    pub fn tcp_keepalive_enabled(&self) -> bool {
+        use std::os::unix::io::AsRawFd;
+        let tcp: &TcpStream = match self.ws.get_ref() {
+            MaybeTlsStream::Plain(tcp) => tcp,
+            MaybeTlsStream::Rustls(tls) => tls.get_ref().0,
+            #[allow(unreachable_patterns)]
+            _ => return false,
+        };
+        unsafe {
+            let mut val: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            libc::getsockopt(
+                tcp.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_KEEPALIVE,
+                &mut val as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            ) == 0
+                && val != 0
+        }
     }
 }
 
@@ -699,6 +752,56 @@ pub fn client_cert_fingerprint() -> Option<String> {
     let (cert_path, key_path) = client_identity_paths()?;
     let (certs, _key) = load_client_identity(&cert_path, &key_path).ok()?;
     certs.first().map(|c| sha256_fingerprint_hex(c.as_ref()))
+}
+
+/// C-10：给底层 TCP 连接开 SO_KEEPALIVE（半死连接的内核级探测）。
+/// Hub 只停读不发 FIN/RST 时，发送超时（SEND_TIMEOUT）与 WS Ping 是
+/// 主防线；keepalive 是兜底——空闲 TCP_KEEPALIVE_IDLE_SECS 秒后每
+/// TCP_KEEPALIVE_INTERVAL_SECS 秒探一次，TCP_KEEPALIVE_COUNT 次无应答
+/// 即 RST，读侧随即断线重连。设置失败只记 warn，不阻塞建连（无 keepalive
+/// 的连接仍能靠发送超时 + Ping 自保）。用 libc 直接调 setsockopt：
+/// tokio 的 TcpStream 没有 keepalive API，socket2 只是 tokio 的传递依赖，
+/// 不为此新增直接依赖。
+fn enable_tcp_keepalive(ws: &WebSocketStream<MaybeTlsStream<TcpStream>>) {
+    let tcp: &TcpStream = match ws.get_ref() {
+        MaybeTlsStream::Plain(tcp) => tcp,
+        MaybeTlsStream::Rustls(tls) => tls.get_ref().0,
+        #[allow(unreachable_patterns)]
+        _ => return,
+    };
+    enable_tcp_keepalive_on(tcp);
+}
+
+fn enable_tcp_keepalive_on(tcp: &TcpStream) {
+    use std::os::unix::io::AsRawFd;
+    unsafe {
+        let fd = tcp.as_raw_fd();
+        let mut ok = true;
+        let set = |level: libc::c_int, opt: libc::c_int, val: libc::c_int| -> bool {
+            libc::setsockopt(
+                fd,
+                level,
+                opt,
+                &val as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) == 0
+        };
+        ok &= set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+        ok &= set(
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPIDLE,
+            TCP_KEEPALIVE_IDLE_SECS,
+        );
+        ok &= set(
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            TCP_KEEPALIVE_INTERVAL_SECS,
+        );
+        ok &= set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, TCP_KEEPALIVE_COUNT);
+        if !ok {
+            warn!("tcp keepalive setup failed (continuing without it; send timeout + WS Ping still apply)");
+        }
+    }
 }
 
 /// 单次连接 + hello 握手（不重试）。鉴权失败（hello_reject）立即关闭并报错。
@@ -732,6 +835,9 @@ pub async fn connect_once(cfg: &Config) -> Result<Transport> {
             .await
             .map_err(|e| anyhow!("ws connect failed: {e}"))?
     };
+
+    // C-10：WS 建连后立即开 TCP keepalive（见 enable_tcp_keepalive）。
+    enable_tcp_keepalive(&ws);
 
     // hello：连接后第一条消息，带 token 鉴权。
     let hello = HelloMsg {
@@ -815,6 +921,9 @@ pub async fn connect_once(cfg: &Config) -> Result<Transport> {
 /// ±50% jitter）。用于断线恢复；调用方应在 30s 内看到恢复（测试断言）。
 /// P1-43：鉴权失败（`hello_reject` / 弱 Token）只重试 3 次，随后返回 Err——
 /// Token 配错是配置错，不应 1 次/秒永重试刷屏；主循环收到该 Err 后非零退出。
+/// 注意（C-13）：3 次是累计计数，不是“连续 3 次”——`auth_failures` 从不
+/// 归零，中间夹杂网络失败也不重置；注释与报错文案里的 “in a row” 是错的，
+/// 已改成累计口径。
 /// Ctrl-C 由主循环的 `select!` 监听（`connect_with_retry` 本身不监听信号，
 /// 主循环取消它即可中断退避等待）。
 pub async fn connect_with_retry(cfg: &Config) -> Result<Transport> {
@@ -828,7 +937,7 @@ pub async fn connect_with_retry(cfg: &Config) -> Result<Transport> {
                     auth_failures += 1;
                     if auth_failures >= 3 {
                         return Err(anyhow!(
-                            "hub rejected authentication {auth_failures} times in a row, giving up (last: {e}); check the token in client.toml"
+                            "hub rejected authentication {auth_failures} times (cumulative, not necessarily in a row), giving up (last: {e}); check the token in client.toml"
                         ));
                     }
                 }
@@ -1605,6 +1714,118 @@ mod tests {
             other => panic!("expected WakeWin after Ping, got {other:?}"),
         }
         t.close().await;
+        hub.abort();
+    }
+
+    // --- C-10：客户端发 WS Ping + 建连即开 TCP keepalive ---
+
+    #[tokio::test]
+    async fn client_sends_ping_and_enables_tcp_keepalive() {
+        use futures_util::{SinkExt, StreamExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        // Fake Hub：hello_ok 后等客户端的 Ping（须带 send_ping 的 payload）。
+        let (ping_tx, ping_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let hub = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let first = ws.next().await.unwrap().unwrap();
+            assert!(matches!(first, Message::Text(_)));
+            ws.send(txt(
+                serde_json::json!({"type": "hello_ok", "device_id": "test-device-1", "room": "客厅"})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+            // register 是连接建立后立即发的第二条消息，先读掉它。
+            let second = ws.next().await.unwrap().unwrap();
+            assert!(matches!(second, Message::Text(_)));
+            let got = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Ping(p))) => break p.to_vec(),
+                        Some(Ok(_)) => continue,
+                        _ => break Vec::new(),
+                    }
+                }
+            })
+            .await;
+            let _ = ping_tx.send(got.unwrap_or_default());
+        });
+
+        let cfg = test_config(&format!("ws://{addr}"), TEST_TOKEN, false);
+        let mut t = connect_once(&cfg).await.expect("connect must pass");
+        // 建连即开 TCP keepalive（内核级半死连接探测）。
+        assert!(
+            t.tcp_keepalive_enabled(),
+            "SO_KEEPALIVE must be on after connect"
+        );
+        t.send_ping().await.expect("send_ping must succeed");
+        let payload = tokio::time::timeout(Duration::from_secs(10), ping_rx)
+            .await
+            .expect("server must see the Ping")
+            .expect("ping channel must deliver");
+        assert_eq!(
+            payload, b"open-xiaoai-ping",
+            "unexpected Ping payload: {payload:?}"
+        );
+        t.close().await;
+        hub.abort();
+    }
+
+    // --- C-10：半死连接（对端停读、不发 FIN/RST）上发送必须超时 ---
+
+    #[tokio::test]
+    async fn send_times_out_when_peer_stops_reading() {
+        use futures_util::{SinkExt, StreamExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        // Fake Hub：握手后即停读（只 sleep，不 poll ws）——模拟只停读
+        // 不发 FIN/RST 的半死连接。客户端循环发 1KB 音频帧，发送必须在
+        // SEND_TIMEOUT 量级内报错，而不是无限挂起（旧代码无超时，
+        // run_session 的 select! 会被 wedged 住）。
+        let hub = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let first = ws.next().await.unwrap().unwrap();
+            assert!(matches!(first, Message::Text(_)));
+            ws.send(txt(
+                serde_json::json!({"type": "hello_ok", "device_id": "test-device-1", "room": "客厅"})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+            // 停读 60s：握住连接，期间不读任何帧（TCP 接收缓冲满后，
+            // 客户端的发送即反压挂起）。
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let cfg = test_config(&format!("ws://{addr}"), TEST_TOKEN, false);
+        let mut t = connect_once(&cfg).await.expect("connect must pass");
+        let start = std::time::Instant::now();
+        let frame = vec![0xABu8; 1024];
+        let mut err: Option<anyhow::Error> = None;
+        for _ in 0..100_000 {
+            match t.send_audio_frame(&frame).await {
+                Ok(()) => continue,
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = err.expect("send must fail once the peer stops reading");
+        assert!(
+            err.to_string().contains("timed out"),
+            "send must fail with a timeout, got: {err}"
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < SEND_TIMEOUT + Duration::from_secs(5),
+            "send took {elapsed:?}, expected to fail within ~SEND_TIMEOUT of backpressure"
+        );
+        // 连接已 wedged：不调 close（Close 帧同样发不出去），直接 drop。
+        drop(t);
         hub.abort();
     }
 

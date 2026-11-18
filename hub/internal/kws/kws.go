@@ -32,7 +32,6 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -252,19 +251,15 @@ func New(rawURL string, opts Options) (*Client, error) {
 	return c, nil
 }
 
-// normalizeFingerprintHex 归一化指纹（去冒号/空格，转小写），
-// 必须是 64 位 hex，否则返回错误。
+// normalizeFingerprintHex 归一化指纹（S-14：与 config 共用同一个
+// 函数 NormalizeFingerprintHex，去冒号/空格/连字符，转小写），
+// 必须是 64 位 hex（大小写不限），否则返回错误。
 func normalizeFingerprintHex(fp string) (string, error) {
-	fp = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(fp, ":", ""), " ", ""), "-", ""))
-	if len(fp) != 64 {
-		return "", fmt.Errorf("kws TLS 指纹必须是 64 位 hex，实际 %d 位", len(fp))
+	normalized, err := config.NormalizeFingerprintHex(fp)
+	if err != nil {
+		return "", fmt.Errorf("kws TLS 指纹%w", err)
 	}
-	for _, r := range fp {
-		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
-			return "", fmt.Errorf("kws TLS 指纹含非 hex 字符")
-		}
-	}
-	return fp, nil
+	return normalized, nil
 }
 
 // tlsConfig 返回边车连接的 TLS 配置（N-P2-10）：

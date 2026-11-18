@@ -13,7 +13,8 @@
 //!     测试用 `FakeAudioDevice`，无硬件/未编译 ALSA 时用 `NoAudioDevice`。
 //!   - 设备名（按 REA_ANALYSIS.md asound.conf）：采集 `hw:0,0`，播放 `hw:0,2`；
 //!     格式 S16LE / 16kHz / 单声道 / 20ms 周期（320 采样点），缓冲 4 周期。
-//!   - 无硬件时：`Audio::open()` 仍成功（构造器不因缺硬件失败），`capture_pcm` /
+//!   - 无硬件时：`Audio::open()`（仅测试，见 C-13）仍成功（构造器不因
+//!     缺硬件失败），`capture_pcm` /
 //!     `play_frame` 返回明确错误（带设备名与原因），调用方（main.rs 录音任务）
 //!     记日志后退出，主循环继续跑传输、不崩溃、不造假音频（冒烟行为保持）。
 //!   - XRUN（EPIPE）：`prepare()` 后各重试一次，仍失败才返回错误。
@@ -325,8 +326,9 @@ impl AudioDevice for NoAudioDevice {
 ///
 /// 两路独立打开、互不拖累：采集打不开不影响播放，反之亦然；打开失败的那路
 /// 记下原因，`capture`/`play` 用到时才返回带设备名的明确错误。
-/// 构造器本身永不因缺硬件失败——`Audio::open()` 在无硬件机器上也成功，
-/// 保持 Phase 1 冒烟行为（录音任务记日志退出，主循环继续跑传输）。
+/// 构造器本身永不因缺硬件失败——`Audio::open()`（仅测试，见 C-13）
+/// 在无硬件机器上也成功，保持 Phase 1 冒烟行为（录音任务记日志退出，
+/// 主循环继续跑传输）。
 ///
 /// P0-N1（2026-11-17）：`hw` PCM 设备是独占的——两个 `Audio` 实例各开一次
 /// `hw:0,0` + `hw:0,2` 时，第二路 `snd_pcm_open` 大概率 EBUSY，会话的
@@ -357,9 +359,10 @@ pub struct AlsaAudioDevice {
 #[cfg(feature = "alsa")]
 impl AlsaAudioDevice {
     /// 打开采集 + 播放设备（各路失败只记录，不整体失败）。
-    /// 非测试构建里无生产调用（生产走 `Audio::open_*` → `open_selected`），
-    /// 但 `alsa_open_bogus_device_reports_clear_error` 测试用它；保留。
-    #[allow(dead_code)]
+    /// C-13：只在测试里用（`alsa_open_bogus_device_reports_clear_error`），
+    /// 改为 `#[cfg(test)]`——与 `Audio::open/open_devices` 同理，生产
+    /// 路径双开不再只靠注释拦。
+    #[cfg(test)]
     pub fn open_devices(capture_dev: &str, playback_dev: &str) -> Self {
         Self::open_selected(Some(capture_dev), Some(playback_dev))
     }
@@ -755,7 +758,8 @@ impl AudioDevice for AlsaAudioDevice {
 }
 
 /// 音频设备：Opus 编解码器 + 一个 `AudioDevice`（真实 ALSA / Fake / 无设备）。
-/// 构造器 `open()` 永远不因缺硬件失败；缺硬件时 `capture_pcm`/`play_frame`
+/// 构造器（`open_capture_only` / `open_playback_only`，测试另有 `open()`）
+/// 永远不因缺硬件失败；缺硬件时 `capture_pcm`/`play_frame`
 /// 返回明确错误（见 NoAudioDevice）。
 pub struct Audio {
     codec: OpusCodec,
@@ -765,10 +769,11 @@ pub struct Audio {
 impl Audio {
     /// 打开默认设备（采集 `hw:0,0` / 播放 `hw:0,2`）。无硬件时仍成功，
     /// 只是 capture/play 会返回明确错误；Opus 初始化失败时才返回 Err。
-    /// P0-N1：禁止生产路径用本函数开两个实例（录音任务 + 会话各一次会
-    /// 双开 ALSA，第二路大概率 EBUSY）——录音任务用 `open_capture_only`，
-    /// 会话用 `open_playback_only`。本函数只保留给测试与单实例场景。
-    #[allow(dead_code)]
+    /// C-13：本函数只在测试里用，改为 `#[cfg(test)]`——生产路径调它
+    /// 即编译失败。P0-N1 的双开回归不再只靠注释：录音任务用
+    /// `open_capture_only`，会话用 `open_playback_only`（main.rs 已
+    /// 如此，见 `audio.rs` 的 P0-N1 测试）。
+    #[cfg(test)]
     pub fn open() -> Result<Self> {
         Self::open_devices(CAPTURE_DEVICE_DEFAULT, PLAYBACK_DEVICE_DEFAULT)
     }
@@ -788,8 +793,9 @@ impl Audio {
     }
 
     /// 打开指定设备名（供配置/测试覆盖默认设备名用）。两路各开各的，
-    /// 失败只记录、不整体失败。只被 `open()` 调用；测试与单实例场景保留。
-    #[allow(dead_code)]
+    /// 失败只记录、不整体失败。只被 `open()` 调用；C-13：与 `open()`
+    /// 同理只在测试里用，改为 `#[cfg(test)]`。
+    #[cfg(test)]
     pub fn open_devices(capture_dev: &str, playback_dev: &str) -> Result<Self> {
         Self::open_selected(Some(capture_dev), Some(playback_dev))
     }

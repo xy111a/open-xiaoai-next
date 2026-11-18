@@ -162,6 +162,76 @@ def test_patch_sh_requires_cert_dir(tmp_path):
     assert r2.returncode != 0
     assert "证书目录不存在" not in (r2.stdout + r2.stderr)
     assert "找不到" in (r2.stdout + r2.stderr)  # rootfs 缺失
+    # F-5：PATCH_NO_CERTS=0 必须与未设一样（证书目录不存在即失败），
+    # 不能被 [ -n ... ] 当成跳过。
+    env3 = {"PATCH_WORK_DIR": str(work), "SSH_PASSWORD": "test-password-0123456789",
+            "CERT_DIR": str(tmp_path / "no-such-certs"), "PATCH_NO_CERTS": "0"}
+    r3 = run(["bash", str(SCRIPTS / "patch.sh"), "lx06", "1.94.13"],
+             env_extra=env3, timeout=120)
+    assert r3.returncode != 0
+    assert "证书目录不存在" in (r3.stdout + r3.stderr)
+    # 其余非 1 取值同样不跳过。
+    env4 = {"PATCH_WORK_DIR": str(work), "SSH_PASSWORD": "test-password-0123456789",
+            "CERT_DIR": str(tmp_path / "no-such-certs"), "PATCH_NO_CERTS": "yes"}
+    r4 = run(["bash", str(SCRIPTS / "patch.sh"), "lx06", "1.94.13"],
+             env_extra=env4, timeout=120)
+    assert r4.returncode != 0
+    assert "证书目录不存在" in (r4.stdout + r4.stderr)
+
+
+def _unsquashfs_no_inodes_shim(tmp_path):
+    """F-6 回归夹具：返回一个 PATH 前缀目录，里面的 unsquashfs 在 -s 时
+    去掉 "Number of inodes" 行（模拟读不到 inode 数），其余调用原样透传
+    给真实 unsquashfs。缺真实 unsquashfs 时跳过。"""
+    real = shutil.which("unsquashfs")
+    if not real:
+        pytest.skip("缺 unsquashfs（F-6 回归夹具需要真实 unsquashfs 透传）")
+    shim_dir = tmp_path / "shim-bin"
+    shim_dir.mkdir()
+    shim = shim_dir / "unsquashfs"
+    shim.write_text(
+        "#!/bin/bash\n"
+        "# F-6 回归：-s 时去掉 inode 行，其余原样透传。\n"
+        "if [ \"$1\" = \"-s\" ]; then\n"
+        f"  \"{real}\" \"$@\" | grep -v 'Number of inodes'\n"
+        "  exit 0\n"
+        "fi\n"
+        f"exec \"{real}\" \"$@\"\n"
+    )
+    shim.chmod(0o755)
+    return str(shim_dir) + os.pathsep + os.environ["PATH"]
+
+
+def test_patch_sh_fails_when_inode_count_unreadable(unpacked_work, tmp_path):
+    """F-6：patch.sh §6 读不到 unsquashfs -s 的 inode 数时必须 FAIL（且不
+    输出镜像），不能只警告跳过数量硬门。"""
+    work = unpacked_work
+    env = {"PATCH_WORK_DIR": str(work), "SSH_PASSWORD": "test-password-0123456789",
+           "PATCH_NO_CERTS": "1",
+           "PATH": _unsquashfs_no_inodes_shim(tmp_path)}
+    r = run(["bash", str(SCRIPTS / "patch.sh"), "lx06", "1.94.13"],
+            env_extra=env, timeout=900)
+    assert r.returncode != 0
+    assert "读不到" in (r.stdout + r.stderr) and "inode" in (r.stdout + r.stderr)
+    assert not (work / "lx06_1.94.13" / "root-patched.squashfs").exists()
+
+
+def test_unpack_sh_fails_when_inode_count_unreadable(tmp_path):
+    """F-6：unpack.sh 同款——读不到 unsquashfs -s 的 inode 数时必须失败，
+    不能只警告跳过数量硬门。"""
+    require_firmware_bin()
+    work = tmp_path / "work"
+    work.mkdir()
+    shutil.copyfile(FIRMWARE_BIN, work / "lx06_1.94.13.bin")
+    env = {"PATCH_WORK_DIR": str(work),
+           "PATH": _unsquashfs_no_inodes_shim(tmp_path)}
+    rea_unblob = os.path.expanduser("~/workspace/tools/rea-venv/bin/unblob")
+    if os.path.exists(rea_unblob):
+        env["REA_UNBLOB_COMMAND"] = rea_unblob
+    r = run(["bash", str(SCRIPTS / "unpack.sh"), "lx06", "1.94.13"],
+            env_extra=env, timeout=1200)
+    assert r.returncode != 0
+    assert "读不到" in (r.stdout + r.stderr) and "inode" in (r.stdout + r.stderr)
 
 
 def test_oh2p_factory_asound_has_capture_marker_and_bak_matches(tmp_path):

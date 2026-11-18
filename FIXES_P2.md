@@ -82,7 +82,7 @@ pytest 固件 **86**、边车 **55**、lint.sh **全部通过**、go `-race` kws
 | P2-40 | 修了 | 录音任务 ALSA 打开/采集失败不再退出：按 100ms 起步翻倍、上限 5s 的退避重开设备（只有采到一帧才清零退避计数，持续失败时日志 cadence 衰减到 5 秒一条）；只有主循环退出（通道关闭）时任务才结束。 |
 | P2-42 | 修了（残留 1 项） | `load_from_path` 缺失/不可读时明确报错退出（写清路径与补救方法），不再静默回退默认配置。残留：`hub_url` 默认仍是写死的 `wss://192.168.1.10:4399`——未改：Token 默认已空、指纹必填，错配的默认 Hub 无法鉴权，危险部分已被 fail-closed 兜住；彻底去掉需改配置格式（hub_url 必填），属 breaking change，留待 bai 拍板（见 §7）。 |
 | P2-52 | 修了 | `build-armv7.sh`：musl libasound 缺失时默认 `ASSERT FAIL` exit 1，不再静默产出无 ALSA 应急版；只有显式 `--allow-no-alsa` 才降级；构建后断言产物含 ALSA 标记（新增 `#[used] ALSA_BACKEND_MARKER`）。失败路径已实测。 |
-| P2-54 | 修了 | `encode_pcm_frame` / `decode_opus_frame` 改返回 `Result`：线程本地存 `Result<OpusCodec>`（初始化失败返回 Err），`try_borrow_mut`（重入返回 Err），不再有任何 `.expect` panic 路径。 |
+| P2-54 | 修了 | `encode_pcm_frame` / `decode_opus_frame` 改返回 `Result`：线程本地存 `Result<OpusCodec>`（初始化失败返回 Err），`try_borrow_mut`（重入返回 Err），编解码函数不再有任何 `.expect` panic 路径。 |
 | P2-N1 | 修了 | `interrupt` 的 `StopPlayback` 动作真调 `Audio::stop_playback()`（ALSA `snd_pcm_drop` 丢弃约 80ms 尾音 + `prepare` 复位）；`AudioDevice` 加 `stop_playback`（默认明确 Err；Fake 设备清空已播缓冲并计数）。 |
 | P2-N2 | 修了 | 入站 WS 配置收紧为 64KB（`max_message_size` 与 `max_frame_size` 均为 64KB；协议最大帧是 <1.3KB 的 Opus 帧与 <1KB 的文本消息），TLS 与明文两路都传显式配置；超限即 tungstenite 断线，主循环按断线重连。 |
 | P2-N4 | 修了 | 录音任务编码失败不再静默吞掉：节流 warn（1 秒一条 + 累计），连续失败 50 次后记 error 并 `Audio::rebuild_codec()` 重建编解码器。 |
@@ -127,7 +127,7 @@ pytest 固件 **86**、边车 **55**、lint.sh **全部通过**、go `-race` kws
 | P2-36 | 修了 | 与 P1-4 收尾一并做（见 §2）：Dockerfile.hub 加 `appuser`（uid 1000）+ `USER appuser` + HEALTHCHECK + `.dockerignore`。 |
 | P2-37 | 修了 | 与 P1-4 收尾一并做（见 §2）：compose 7 个服务全加 `cap_drop: [ALL]`，hub + kws-sidecar 加 `user: "1000:1000"`。 |
 | P2-38 | 修了（文档） | runbook 新增 §1.5——绝不复用原厂 `bin/flash.sh` 推补丁镜像；`VerifyTimeout` 30 秒（`hub/internal/ota/ota.go:65`，PushTimeout 10 分钟是另一项），设备须 30 秒内回 hello 否则任务标失败，误判先看设备日志再决定是否重推。 |
-| P2-39 | 修了 | inode 计数硬门（期望数 = `unsquashfs -s` 的 inodes − stderr 里 device 创建失败行数）+ stderr 过滤（仅允许建 device 失败与 xz 选项行，其余含 error/failed 的行即 FAIL）；patch.sh §6 与 unpack.sh 同款。实测：原厂 root.squashfs 2137 inodes / 解出 2136、stderr 唯一良性行是建 /dev/console 失败；补丁镜像 2141/2141、stderr 为空。 |
+| P2-39 | 修了 | inode 计数硬门（期望数 = `unsquashfs -s` 的 inodes − stderr 里 device 创建失败行数）+ stderr 过滤（仅允许建 device 失败与 xz 选项行，其余含 error/failed 的行即 FAIL）；patch.sh §6 与 unpack.sh 同款。实测：原厂 root.squashfs 2137 inodes / 解出 2136、stderr 唯一良性行是建 /dev/console 失败；补丁镜像 2141/2141（2026-11-17 旧重编值；2026-11-18 P1 修复轮重编后实测 LX06 2144/2144、OH2P 2105/2105，`unsquashfs -s` 与 find 计数一致）、stderr 为空。 |
 | P2-55 | 修了 | nas-install.sh §0 加 Hub 二进制清单校验（`deploy/hub-linux-amd64.sha256` 存在时比对 SHA256 与大小，不一致 FAIL；不存在时 WARN）；§2 用 tar 传 kws-sidecar 构建源文件（Dockerfile/server.py/entrypoint.sh/requirements.txt/scripts/，tests/ 与 .venv 不传）。 |
 | FW-P2-1 | 修了 | ci.yml Go job 加 `gofmt -l hub scripts`（失败即红）；golangci-lint 本地与 CI 同为 v1.64.8，写进注释；CI 不直接跑 lint.sh 的结构性差距已记（lint.sh 依赖 `~/workspace/tools` 绝对路径）。 |
 | FW-P2-2 | 核实闭合 | pytest 已钉版本、固件 e2e 跳过原因与本地补跑命令注释已在 ci.yml（P1 轮已修）。 |

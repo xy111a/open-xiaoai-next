@@ -1050,6 +1050,11 @@ func (r *Router) MusicQueue(_ context.Context) ([]music.MPDSong, error) {
 // MusicLyric 取歌词（Web /api/music/lyric 与语音“歌词”共用）：
 // id==0 时用内存里当前曲的 ID；没有在放的歌时明确报错。
 func (r *Router) MusicLyric(ctx context.Context, id int64) (string, error) {
+	// H-11 顺带：负数 id 在此也拦一道（Web 层已回 400，本处防
+	// 其他调用方把负数拼进上游 /lyric?id=）。
+	if id < 0 {
+		return "", fmt.Errorf("id 非法")
+	}
 	if id == 0 {
 		if song, _, ok := r.CurrentTrack(); ok {
 			id = song.ID

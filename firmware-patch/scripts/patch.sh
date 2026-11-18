@@ -69,11 +69,12 @@ trap 'rm -f "$OUT"; [ -n "$VERIFY_DIR" ] && rm -rf "$VERIFY_DIR"; [ -n "$SQFS_RO
 # 目录不存在时直接失败——静默产出无证书镜像是发布事故（2026-11-17 的
 # 首版镜像是绕过 patch.sh、直接调 patch_firmware.py --cert-dir 打的，
 # patch.sh 本身从未传过证书）。仅测试可设 PATCH_NO_CERTS=1 跳过。
+# F-5：只认 =1——[ -n ... ] 会把 PATCH_NO_CERTS=0 也当成跳过。
 CERT_DIR="${CERT_DIR:-$HERE/work/certs}"
 CERT_ARGS=()
 if [ -d "$CERT_DIR" ]; then
     CERT_ARGS=(--cert-dir "$CERT_DIR")
-elif [ -n "${PATCH_NO_CERTS:-}" ]; then
+elif [ "${PATCH_NO_CERTS:-}" = "1" ]; then
     echo "警告：PATCH_NO_CERTS=1，跳过证书装入（仅测试）" >&2
 else
     fail "证书目录不存在：$CERT_DIR（先跑 scripts/gen-certs.sh，或设 CERT_DIR / PATCH_NO_CERTS=1）"
@@ -201,7 +202,9 @@ if [ -n "$EXPECT_INODES" ]; then
     EXPECT_FOUND="$((EXPECT_INODES - DEV_FAILS))"
     [ "$FOUND" -eq "$EXPECT_FOUND" ] || fail "解包数量不符：解出 $FOUND，期望 $EXPECT_FOUND（inodes $EXPECT_INODES − 建设备失败 $DEV_FAILS）"
 else
-    echo "警告：读不到 unsquashfs -s 的 inode 数，跳过数量硬门" >&2
+    # F-6：读不到 inode 数即 FAIL（fail-closed）——只警告跳过会让数量硬门
+    # 在 unsquashfs -s 输出格式变化时静默失效；硬门失效必须拦住出包。
+    fail "读不到 unsquashfs -s 的 inode 数，拒绝输出镜像（数量硬门无法校验）"
 fi
 # stderr 过滤：除两类良性行外，含 error/failed（不区分大小写）即 FAIL。
 if grep -iE 'error|failed' "$UNSQUASH_LOG" \

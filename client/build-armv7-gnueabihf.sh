@@ -7,8 +7,9 @@
 #
 # 用法：./build-armv7-gnueabihf.sh [--no-sherpa-kws] [其余参数原样透传给 cargo build]
 # 默认开 --features sherpa-kws（P1-40：ARM 交付二进制必须含 KWS）；
-# --no-sherpa-kws 仅供应急构建。构建末尾断言：ARM ELF（EABI5、硬浮点）、
-# sherpa 标记 3 个、Version needs 里 GLIBC 最高 ≤2.25（超了即失败退出）、
+# --no-sherpa-kws 仅供应急构建。显式透传 --no-default-features 时跳过
+# ALSA 标记断言并打 WARNING（C-6，与 musl 脚本的 --allow-no-alsa 同义）。
+# 构建末尾断言：ARM ELF（EABI5、硬浮点）、ALSA 标记、sherpa 标记 3 个、
 # NEEDED 的每个库都能在音箱 rootfs 里找到、rpath 含 $ORIGIN/lib。
 # 产物：target/armv7-unknown-linux-gnueabihf/release/open-xiaoai-client
 set -euo pipefail
@@ -132,6 +133,27 @@ if [ "${#SHERPA_FEATURE_ARGS[@]}" -gt 0 ]; then
     fi
   done
   echo "ASSERT OK: ARM binary contains sherpa-kws markers (feature enabled)"
+fi
+# 2b) ALSA 标记（C-6，P2-52 同款，照抄 build-armv7.sh 的 2b 节）：
+#    src/audio.rs 的 ALSA_BACKEND_MARKER（#[used] 静态标记）必须出现
+#    在产物里——否则构建悄悄编出了无 ALSA 版。显式透传
+#    --no-default-features 的构建跳过本条并打 WARNING（与 musl 脚本
+#    的 --allow-no-alsa 语义对齐：应急版无此标记是预期的）。
+#    注意：不要碰下面第 6 节 vendor .so 的警告/失败逻辑（那是等 bai
+#    拍板的另一件事）。
+ALSA_ASSERT_SKIP=0
+for arg in "${CARGO_ARGS[@]}"; do
+  case "$arg" in
+    --no-default-features) ALSA_ASSERT_SKIP=1 ;;
+  esac
+done
+if [ "$ALSA_ASSERT_SKIP" = "1" ]; then
+  echo "WARNING: --no-default-features given explicitly — skipping ALSA backend marker assertion (no-ALSA emergency build has no marker by design)"
+elif ! grep -qF "open-xiaoai-audio-backend=alsa" "$STRINGS_TXT"; then
+  echo "ASSERT FAIL: ALSA backend marker missing from $BIN (built without the alsa feature?)" >&2
+  exit 1
+else
+  echo "ASSERT OK: ARM binary contains ALSA backend marker (alsa feature enabled)"
 fi
 # 3) Version needs：GLIBC 最高 ≤2.25、GLIBCXX 最高 ≤3.4.22（音箱 rootfs 上限）。
 #    超了即失败退出，不许将就——否则 dlopen/启动时报 version not found。

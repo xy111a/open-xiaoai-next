@@ -135,14 +135,14 @@ func (s *SnapClient) call(method string, params map[string]any) (json.RawMessage
 }
 
 // readLimitedLine 限长读一行（含换行符）：超过上限即报错，
-// 不让异常服务端用无界长行打满内存。
+// 不让异常服务端用无界长行打满内存。Snapcast 与 MPD 共用。
 func readLimitedLine(r *bufio.Reader, maxBytes int) ([]byte, error) {
 	var line []byte
 	for {
 		frag, err := r.ReadSlice('\n')
 		line = append(line, frag...)
 		if len(line) > maxBytes {
-			return nil, fmt.Errorf("snapcast: 响应行超过 %d 字节上限", maxBytes)
+			return nil, fmt.Errorf("响应行超过 %d 字节上限", maxBytes)
 		}
 		if err == bufio.ErrBufferFull {
 			continue
@@ -299,7 +299,48 @@ func (c *NeteaseClient) SongURL(ctx context.Context, id int64) (string, error) {
 	if len(out.Data) == 0 || out.Data[0].URL == "" {
 		return "", fmt.Errorf("netease: 歌曲 %d 无可播地址（可能需 VIP）", id)
 	}
+	// H-3：上游返回的 URL 先验白名单再交出去；非法 URL 按“无可播地址”
+	// 处理，调用方（router）即走本地兜底，不把非法地址交给 MPD。
+	if err := validatePlayableURL(out.Data[0].URL); err != nil {
+		return "", fmt.Errorf("netease: 歌曲 %d 无可播地址（URL 非法）: %w", id, err)
+	}
 	return out.Data[0].URL, nil
+}
+
+// validatePlayableURL 校验可播地址（H-3，SongURL 与 PlayURL 共用）：
+// 只许 http(s)，拒绝 file:// 等 scheme、localhost/单标签主机名、
+// 以及任何裸 IP（上游是域名 CDN，不用裸 IP；内网 IP 与公网裸 IP
+// 一律拒绝，堵 MPD 代为请求内网地址的 SSRF 面）。
+// 注意：这里只做 scheme/host 形状校验，不做 DNS 解析——域名解析到
+// 内网 IP 的 DNS 重绑定不在本项范围。
+func validatePlayableURL(raw string) error {
+	if raw == "" {
+		return fmt.Errorf("mpd: URL 为空")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("mpd: URL 解析失败")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("mpd: URL 只许 http/https，实际是 %q", u.Scheme)
+	}
+	if u.User != nil {
+		return fmt.Errorf("mpd: URL 不许带 userinfo")
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return fmt.Errorf("mpd: URL 缺少 host")
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return fmt.Errorf("mpd: URL host 不许是 localhost")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return fmt.Errorf("mpd: URL host 不许是裸 IP")
+	}
+	if !strings.Contains(host, ".") {
+		return fmt.Errorf("mpd: URL host 不许是单标签主机名")
+	}
+	return nil
 }
 
 // cappedBodyDecoder 限长解 JSON（网易云上游响应体上限，P2-7 顺带）。
@@ -374,6 +415,18 @@ func (c *MPDClient) cmd(format string, args ...any) error {
 	return err
 }
 
+// maxMPDLineBytes 是 MPD 单行响应的上限（H-2，与 Snapcast 侧同款 64KB）。
+const maxMPDLineBytes = 64 << 10
+
+// maxMPDResponseLines / maxMPDResponseBytes 是单次 query() 响应的总上限
+// （H-2）：异常/卡住的 MPD 用行流打满内存的缺口。正常响应（status、
+// currentsong、playlistinfo 几百首队列）远小于此；超限即报错并断开
+// 连接，看门狗会重拨 MPD。
+const (
+	maxMPDResponseLines = 10000
+	maxMPDResponseBytes = 4 << 20
+)
+
 // query 发一条 MPD 命令，返回 OK 之前的所有响应行（ACK 即报错）。
 // cmd() 是它的丢弃响应版；status/currentsong/playlistinfo/search 用它取值。
 func (c *MPDClient) query(format string, args ...any) ([]string, error) {
@@ -385,12 +438,21 @@ func (c *MPDClient) query(format string, args ...any) ([]string, error) {
 	}
 	_ = c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	var lines []string
+	totalBytes := 0
 	for {
-		line, err := c.r.ReadString('\n')
+		raw, err := readLimitedLine(c.r, maxMPDLineBytes)
 		if err != nil {
+			// 读错即断开：超长行可能只读了一半进缓冲，下次 query
+			// 会把残行当新响应误解析；看门狗会重拨。
+			_ = c.conn.Close()
 			return nil, err
 		}
-		line = strings.TrimRight(line, "\r\n")
+		totalBytes += len(raw)
+		if totalBytes > maxMPDResponseBytes {
+			_ = c.conn.Close()
+			return nil, fmt.Errorf("mpd: 响应超过 %d 字节上限", maxMPDResponseBytes)
+		}
+		line := strings.TrimRight(string(raw), "\r\n")
 		if strings.HasPrefix(line, "OK") {
 			return lines, nil
 		}
@@ -398,6 +460,10 @@ func (c *MPDClient) query(format string, args ...any) ([]string, error) {
 			return nil, fmt.Errorf("mpd: %s", line)
 		}
 		lines = append(lines, line)
+		if len(lines) > maxMPDResponseLines {
+			_ = c.conn.Close()
+			return nil, fmt.Errorf("mpd: 响应超过 %d 行上限", maxMPDResponseLines)
+		}
 	}
 }
 
@@ -417,12 +483,16 @@ func (c *MPDClient) PlayURL(url string) error {
 	return c.cmd("play")
 }
 
-// validateMPDURL 拒绝含换行/控制字符的 URL（MPD 换行注入防护）。
+// validateMPDURL 拒绝含换行/控制字符的 URL（MPD 换行注入防护，P1-7），
+// 再过 H-3 的可播地址白名单（只许 http(s)，拒绝 file://、内网 IP、localhost）。
 func validateMPDURL(url string) error {
 	if url == "" {
 		return fmt.Errorf("mpd: URL 为空")
 	}
-	return validateMPDArg(url)
+	if err := validateMPDArg(url); err != nil {
+		return err
+	}
+	return validatePlayableURL(url)
 }
 
 // validateMPDArg 拒绝含换行/控制字符的 MPD 参数（URL 或本地文件路径共用）：

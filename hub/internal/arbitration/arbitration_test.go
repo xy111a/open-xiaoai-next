@@ -30,7 +30,10 @@ func TestArbitrate(t *testing.T) {
 	}
 }
 
-// 窗口计时是真计时：两条事件 50ms 内进 100ms 窗口，只出一个赢家。
+// 窗口计时是真计时：两条事件背靠背进 100ms 窗口，只出一个赢家。
+// C-12：旧代码在两事件间 Sleep(50ms)，50ms 睡眠对 100ms 窗口只剩
+// 50ms 裕量，CI 负载下调度超调即漏窗、赢家断言 flake；背靠背提交
+// 仍在同一窗口内，测试意图不变，flake 根除。生产仲裁逻辑不动。
 func TestArbiterWindow(t *testing.T) {
 	done := make(chan struct{}, 1)
 	var winner string
@@ -41,7 +44,6 @@ func TestArbiterWindow(t *testing.T) {
 		done <- struct{}{}
 	})
 	a.Submit(WakeEvent{DeviceID: "lx06-1", RMSdB: -30})
-	time.Sleep(50 * time.Millisecond)
 	a.Submit(WakeEvent{DeviceID: "oh2p-1", RMSdB: -15})
 	select {
 	case <-done:
