@@ -16,6 +16,7 @@ import patch_firmware
 from patch_firmware import (
     PatchError,
     _random_salt,
+    _reuse_root_hash,
     check_asound,
     check_certs,
     check_disable_ota,
@@ -165,6 +166,10 @@ def test_patch_login(patched_rootfs):
     # P1-36：串口仍走 /bin/login（需 root 密码），不再是免密 ash。
     assert "ttyS0::askfirst:/bin/login" in inittab
     assert "ttyS0::askfirst:/bin/ash --login" not in inittab
+    # F-2：另两行控制台同样走 /bin/login，全表无免密 ash。
+    assert "tts/0::askfirst:/bin/login" in inittab
+    assert "tty1::askfirst:/bin/login" in inittab
+    assert "/bin/ash --login" not in inittab
     pam = (patched_rootfs / "etc/pam.d/common-auth").read_text()
     assert "# auth sufficient libmico-pam.so" in pam
     assert "# account sufficient libmico-pam.so" in pam
@@ -209,6 +214,84 @@ def test_patch_login_twice_on_sha512_shadow(tmp_path):
     assert "# # auth sufficient" not in pam
     assert "# # account sufficient" not in pam
     assert "auth\t[success=1 default=ignore]\tpam_unix.so nullok_secure" in pam
+
+
+def test_patch_login_rewrites_all_consoles(tmp_path):
+    # F-2：三行控制台统一走 /bin/login。原厂 inittab 是 tts/0 + tty1 免密
+    # ash、ttyS0 login；打完补丁三行都是 login，全表无 ash --login。
+    root = copy_rootfs(tmp_path / "rootfs")
+    before = (root / "etc/inittab").read_text()
+    assert "tts/0::askfirst:/bin/ash --login" in before
+    assert "tty1::askfirst:/bin/ash --login" in before
+    patch_login(root)
+    after = (root / "etc/inittab").read_text()
+    for dev in ("tts/0", "ttyS0", "tty1"):
+        assert f"{dev}::askfirst:/bin/login" in after
+    assert "/bin/ash --login" not in after
+    # 幂等：第二遍不报错、不改内容。
+    patch_login(root)
+    assert (root / "etc/inittab").read_text() == after
+    # sysinit/shutdown 行未动。
+    assert "::sysinit:/etc/init.d/rcS S boot" in after
+    assert "::shutdown:/etc/init.d/rcS K shutdown" in after
+
+
+def test_check_login_accepts_factory_and_patched_inittab(tmp_path):
+    # F-2：check_login 接受原厂态（tts/0 + tty1 是 ash）与已打补丁态
+    # （三行都是 login）；缺一行或换成别的 shell 即拒绝。
+    root = copy_rootfs(tmp_path / "rootfs")
+    check_login(root)  # 原厂态通过
+    patch_login(root)
+    check_login(root)  # 已打补丁态通过
+    inittab = root / "etc/inittab"
+    text = inittab.read_text()
+    inittab.write_text(text.replace("tty1::askfirst:/bin/login\n", ""))
+    with pytest.raises(PatchError):
+        check_login(root)
+    inittab.write_text(text.replace("tty1::askfirst:/bin/login",
+                                    "tty1::askfirst:/bin/sh"))
+    with pytest.raises(PatchError):
+        check_login(root)
+
+
+def test_patch_login_reuses_hash_from_file(tmp_path, monkeypatch):
+    # F-2 重编支持：PATCH_REUSE_ROOT_HASH_FILE 指向含一行完整 $6$ hash 的
+    # 文件时，patch_login 直接沿用该 hash，不读密码、不生成新盐，root 密码不变。
+    root = copy_rootfs(tmp_path / "rootfs")
+    reused = sha512_crypt(TEST_SSH_PASSWORD, "reusesalt1234567")
+    hash_file = tmp_path / "reuse-hash.txt"
+    hash_file.write_text(reused + "\n")
+    monkeypatch.setenv("PATCH_REUSE_ROOT_HASH_FILE", str(hash_file))
+    monkeypatch.delenv("SSH_PASSWORD", raising=False)
+    monkeypatch.delenv("SSH_PASSWORD_FILE", raising=False)
+    monkeypatch.setattr(sys, "stdin", io.StringIO())  # 非终端：无密码也必须成功
+    got = patch_login(root)
+    assert got == reused
+    assert f"root:{reused}:" in (root / "etc/shadow").read_text()
+    assert hash_matches_password(TEST_SSH_PASSWORD, got)
+    # 第二遍沿用同一 hash（不像随机盐每次都变）。
+    assert patch_login(root) == reused
+    assert _reuse_root_hash() == reused
+
+
+def test_patch_login_rejects_bad_reuse_hash_file(tmp_path, monkeypatch):
+    # 复用文件不存在、内容不是合法 $6$ hash 时直接失败，不写 shadow。
+    root = copy_rootfs(tmp_path / "rootfs")
+    monkeypatch.setenv("PATCH_REUSE_ROOT_HASH_FILE",
+                       str(tmp_path / "nope.txt"))
+    with pytest.raises(PatchError):
+        patch_login(root)
+    bad = tmp_path / "bad-hash.txt"
+    bad.write_text("not-a-hash\n")
+    monkeypatch.setenv("PATCH_REUSE_ROOT_HASH_FILE", str(bad))
+    with pytest.raises(PatchError):
+        patch_login(root)
+    assert "$1$N0Iz0LLs$kZ5zG/Y2AUWHNE5I3ElWm1" in (root / "etc/shadow").read_text()
+    # $5$ hash 不是 $6$，同样拒绝（复用只接受 $6$）。
+    bad.write_text(sha512_crypt(TEST_SSH_PASSWORD, "salt1234salt1234")
+                   .replace("$6$", "$5$", 1) + "\n")
+    with pytest.raises(PatchError):
+        patch_login(root)
 
 
 def test_patch_login_rejects_short_password(tmp_path, monkeypatch):

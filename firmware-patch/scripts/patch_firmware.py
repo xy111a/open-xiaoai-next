@@ -371,6 +371,35 @@ def _password() -> str:
     return pw
 
 
+_REUSE_HASH_RE = re.compile(
+    r"^\$6\$(rounds=\d+\$)?[A-Za-z0-9./]{1,16}\$[A-Za-z0-9./]{86}$")
+
+# 三行控制台（F-2）：原厂 inittab 全文就是这三行；补丁后三行统一走 /bin/login。
+INITTAB_CONSOLES = ("tts/0", "ttyS0", "tty1")
+
+
+def _reuse_root_hash() -> str | None:
+    """重编时沿用旧镜像的 root hash（F-2 重编、F-4 移植步骤脚本化）。
+
+    环境变量 PATCH_REUSE_ROOT_HASH_FILE 指向一个文件，内容为一行完整的
+    $6$ hash（由重编前的旧镜像 shadow 里取，见 FLASH_RUNBOOK.md §1 的
+    重编流程；hash 只记在本地 gitignore 的 work/ 文件里，永不进仓库、
+    永不打印）。未设置该变量时返回 None，走正常流程（读密码、随机盐
+    生成新 hash）。文件不存在或内容不是合法 $6$ hash 时抛 PatchError。
+    """
+    path = os.environ.get("PATCH_REUSE_ROOT_HASH_FILE", "")
+    if not path:
+        return None
+    try:
+        text = Path(path).read_text().strip()
+    except OSError as exc:
+        raise PatchError(f"读 PATCH_REUSE_ROOT_HASH_FILE 失败：{path}：{exc}")
+    if not _REUSE_HASH_RE.match(text):
+        raise PatchError(
+            f"PATCH_REUSE_ROOT_HASH_FILE 内容不是合法的 $6$ hash：{path}")
+    return text
+
+
 # ---------------------------------------------------------------------------
 # 1. SSH：/etc/init.d/dropbear 改为始终启动
 #    （来源：01-ssh.patch 的效果；只做任务指定的三处门控拆除 + mkdir）
@@ -454,7 +483,16 @@ def check_login(rootfs: Path) -> None:
     if not re.search(r"^root:\$[156]\$[^:]+:", text, re.MULTILINE):
         raise PatchError(f"前置条件不满足：{shadow} 里 root 行不是 $1$/$5$/$6$ hash")
     inittab = _require(rootfs / "etc/inittab", "init 表")
-    _require_in(_read(inittab), "ttyS0::askfirst:/bin/login", inittab)
+    inittab_text = _read(inittab)
+    # F-2：三行控制台都必须存在，且是 /bin/login（已打补丁）或
+    # /bin/ash --login（原厂 / 旧版补丁态）；其他形态一律拒绝。
+    # ttyS0 原厂即 login；tts/0 与 tty1 原厂是免密 ash，patch_login 会改掉。
+    for dev in INITTAB_CONSOLES:
+        if not re.search(rf"^{re.escape(dev)}::askfirst:/bin/(login|ash --login)$",
+                         inittab_text, re.MULTILINE):
+            raise PatchError(
+                f"前置条件不满足：{inittab} 里找不到 {dev} 控制台行"
+                "（应为 /bin/login 或 /bin/ash --login）")
     pam = _require(rootfs / "etc/pam.d/common-auth", "PAM 配置")
     pam_text = _read(pam)
     # 接受两种状态：原厂（libmico 未注释、pam_unix 被注释）与已打过本补丁
@@ -472,16 +510,22 @@ def check_login(rootfs: Path) -> None:
 
 
 def patch_login(rootfs: Path) -> str:
-    """换 root 密码 hash；串口仍走 /bin/login（需 root 密码，P1-36：
-    原先改成 /bin/ash --login 是拆机串口即免密 root）；PAM 去 libmico、启用 pam_unix。
+    """换 root 密码 hash；三行控制台统一走 /bin/login（F-2：原先只有 ttyS0
+    是 login，tts/0 与 tty1 是免密 ash）；PAM 去 libmico、启用 pam_unix。
 
     密码只从 SSH_PASSWORD_FILE / 环境变量 SSH_PASSWORD 或交互式 getpass
-    读（见 _password），hash 为 sha512crypt（$6$）+ 每次随机盐。返回实际写入的 hash，
-    供测试校验；调用方（main）不得打印它。
+    读（见 _password），hash 为 sha512crypt（$6$）+ 每次随机盐。重编时若
+    设了 PATCH_REUSE_ROOT_HASH_FILE，则沿用文件里的旧 hash（不读密码、
+    不生成新盐，root 密码不变）。返回实际写入的 hash，供测试校验；
+    调用方（main）不得打印它。
     """
     check_login(rootfs)
-    password = _password()
-    new_hash = sha512_crypt(password)
+    reused = _reuse_root_hash()
+    if reused is not None:
+        new_hash = reused
+    else:
+        password = _password()
+        new_hash = sha512_crypt(password)
 
     shadow = rootfs / "etc/shadow"
     text = _read(shadow)
@@ -491,10 +535,17 @@ def patch_login(rootfs: Path) -> str:
         raise PatchError(f"root 密码行替换失败：{shadow}")
     _write(shadow, text)
 
-    # P1-36：inittab 不动——串口仍走 ttyS0::askfirst:/bin/login，登录要输
-    # root 密码（打补丁时设的强密码）。串口恢复仍可用（有密码就能进），
-    # 只是不再是拆机即免密 root。
+    # F-2：三行控制台统一走 /bin/login（需 root 密码）。tts/0 与 tty1 原厂
+    # 是 /bin/ash --login（拆机串口 / 虚拟终端即免密 root）。tts/0 在
+    # 4.9 内核 + devtmpfs 下是死项（meson-uart 只注册 ttyS 设备名，内核
+    # 里无 tts 设备名，/dev/tts/0 不会生成），tty1 是无键盘/显示的音箱
+    # 不可达的虚拟终端，但纵深防御：三行都改成密码登录，不留任何免密
+    # root shell。已是 /bin/login 的行不动（幂等）。
     inittab = rootfs / "etc/inittab"
+    text = _read(inittab)
+    text, _ = re.subn(r"^(tts/0|tty1)::askfirst:/bin/ash --login$",
+                      r"\1::askfirst:/bin/login", text, flags=re.MULTILINE)
+    _write(inittab, text)
 
     pam = rootfs / "etc/pam.d/common-auth"
     text = _read(pam)
@@ -517,8 +568,9 @@ def patch_login(rootfs: Path) -> str:
     after = _read(shadow)
     _require_in(after, f"root:{new_hash}:", shadow)
     after = _read(inittab)
-    _require_in(after, "ttyS0::askfirst:/bin/login", inittab)
-    _require_not_in(after, "ttyS0::askfirst:/bin/ash --login", inittab)
+    for dev in INITTAB_CONSOLES:
+        _require_in(after, f"{dev}::askfirst:/bin/login", inittab)
+    _require_not_in(after, "/bin/ash --login", inittab)
     after = _read(pam)
     _require_not_in(after, "\nauth sufficient libmico-pam.so", pam)
     _require_not_in(after, "\naccount sufficient libmico-pam.so", pam)
@@ -1076,11 +1128,12 @@ def _patch_all_apply(rootfs: Path, model: str,
     patch_ssh(rootfs)
     result["ssh"] = "dropbear 始终启动"
     patch_login(rootfs)
-    result["login"] = "root 密码已换 sha512crypt（$6$，随机盐）+ 串口仍走密码登录 + PAM pam_unix"
+    result["login"] = ("root 密码 sha512crypt（$6$）+ 三行控制台均走 /bin/login"
+                       "（F-2：tts/0、ttyS0、tty1 无免密 shell）+ PAM pam_unix")
     patch_disable_ota(rootfs)
     result["disable_ota"] = "bin/ota + flash.sh + wireless ota() 已禁"
     patch_start(rootfs)
-    result["start"] = "rc.local 已加包装器启动行 + etc/open-xiaoai/init.sh（P2-34：校验属主/权限/可选 SHA256 pin 后才执行 /data/init.sh）"
+    result["start"] = "rc.local 已加包装器启动行 + etc/open-xiaoai/init.sh（P2-34/F-3：校验属主/权限/必填 SHA256 pin 后才执行 /data/init.sh，缺 pin 即拒绝）"
     result["asound"] = patch_asound(rootfs)
     if model == "lx06":
         result["libxaudio_offset"] = patch_libxaudio(rootfs)

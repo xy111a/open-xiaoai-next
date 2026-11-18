@@ -217,10 +217,11 @@ def test_patch_sh_end_to_end(unpacked_work, tmp_path):
     dropbear = (verify / "etc/init.d/dropbear").read_text()
     assert "mkdir -p /data/etc/dropbear" in dropbear
     assert "micocfg_work_mode" not in dropbear
-    assert (verify / "etc/inittab").read_text().count(
-        "ttyS0::askfirst:/bin/login") == 1
-    assert "ttyS0::askfirst:/bin/ash --login" not in \
-        (verify / "etc/inittab").read_text()
+    inittab = (verify / "etc/inittab").read_text()
+    # F-2：三行控制台统一走 /bin/login，全表无免密 ash。
+    for dev in ("tts/0", "ttyS0", "tty1"):
+        assert inittab.count(f"{dev}::askfirst:/bin/login") == 1
+    assert "/bin/ash --login" not in inittab
     ota = (verify / "bin/ota").read_text()
     for func_re in (r"^download_upgrade\(\) \{$", r"^upgrade\(\) \{$"):
         m = re.search(func_re, ota, re.MULTILINE)
@@ -596,16 +597,18 @@ def _repack_patched_image(tmp_path, edit=None):
 def test_flash_check_strict_fails_on_repacked_image(tmp_path):
     """FW-P2-5：--strict 下 SHA 与记录值不同即 FAIL；默认模式只警告、不失败
     （内容标记都在，只是重编过）。
-    注意：重打包的底子是已交付镜像（inittab 还是旧的 /bin/ash），所以
-    _harmless_edit 顺带把 inittab 改成 /bin/login，否则 §4b 会先 FAIL，
-    就测不到 SHA 这一项。"""
+    注意：重打包的底子是已交付镜像；_harmless_edit 顺带把 inittab 三行
+    都改成 /bin/login（F-2：旧镜像的 tts/0 与 tty1 还是 /bin/ash，新镜像
+    已是三行 login、replace 即 no-op），否则 §4b 会先 FAIL，就测不到
+    SHA 这一项。"""
     def _harmless_edit(rootfs):
         p = rootfs / "etc/rc.local"
         p.write_text(p.read_text() + "\n# repack test\n")
+        # F-2：inittab 三行都改成 /bin/login（旧镜像只有 ttyS0 是 login，
+        # tts/0 与 tty1 是 ash；新镜像三行已是 login，replace 即 no-op）。
         inittab = rootfs / "etc/inittab"
         inittab.write_text(inittab.read_text().replace(
-            "ttyS0::askfirst:/bin/ash --login",
-            "ttyS0::askfirst:/bin/login"))
+            "::askfirst:/bin/ash --login", "::askfirst:/bin/login"))
 
     work = _repack_patched_image(tmp_path, edit=_harmless_edit)
     r = run(["bash", str(SCRIPTS / "flash-check.sh"), "--strict",
