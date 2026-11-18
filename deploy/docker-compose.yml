@@ -17,9 +17,23 @@
 #   - mosquitto 已删：Hub 代码里没有任何 MQTT 引用，它只是预留；匿名 broker 暴露 1883
 #     不如删掉，需要时再加带密码配置的版本；
 #   - 各服务加 TZ=Asia/Shanghai 与 deploy.resources 限额（起始值，NAS 上按实测再调）；
-#   - 镜像仍用 :latest、未钉 digest：本机到 registry-1.docker.io 的 manifest 接口
-#     超时（token 接口通），无法可信解析 digest；钉死前先在能访问 Docker Hub 的
-#     机器上取各镜像 latest 的 Docker-Content-Digest 再填。
+#   - P1-4：镜像已钉 digest（2026-11-18 从 Docker Hub manifest 接口取的 latest
+#     的 Docker-Content-Digest，见各 image 行；hub 的基础镜像见 Dockerfile.hub）。
+#     注意 whisper/piper/netease-api 的 digest 是 OCI index 的 digest（多架构），
+#     compose 按本机架构（amd64）拉取其中对应平台的 manifest，不用改成单架构 digest。
+#   - P1-4：host 网络保留——kws-sidecar 与 Hub 都走 host 网络、寻址用
+#     127.0.0.1:10400，snapserver/mpd host 网络是播放链要求；改桥接要动寻址，
+#     收益小于回归风险。MA 8095 已随融合 B 砍 MA 而失效，不用做。
+#   - P1-4：hub 与 kws-sidecar 以 user: "1000:1000" 运行（hub 镜像内建
+#     uid 1000 的 appuser，见 Dockerfile.hub；边车镜像内无该用户，用数字 uid，
+#     卷属主由 nas-install.sh §4 的 chown one-shot 负责）；其余 5 个服务
+#     不加 user——上游镜像的数据目录是 root-owned，改 user 需逐镜像验证，
+#     以 cap_drop: [ALL] 作补偿。
+#   - P1-4 / SC-P2-12：7 个服务都加 cap_drop: [ALL]（失败模式是响亮的
+#     启动失败，会被 nas-install.sh §5 的容器数检查捕获）。
+#     read_only: true 不设——Hub 的 config 保存用 os.CreateTemp 写 /app，
+#     做成需要 /app 的 tmpfs 编排且无法在无 NAS 时验证；暂缓。
+#   - SC-P2-12：kws-sidecar 已有限额（512M/1.0）与 user，加固完成。
 # 2026-11-18 音乐融合 B：Music Assistant 已砍（见 MUSIC_FUSION.md）——
 #   - music-assistant 服务与 ma-data 卷全部删除，8095 端口不再发布、不再占用；
 #   - 网易云主路改为 Hub 直连 netease-api（127.0.0.1:3000）→ MPD → Snapcast，
@@ -34,6 +48,10 @@ services:
     container_name: oxn-hub
     restart: unless-stopped
     network_mode: host
+    # P1-4：以 uid 1000 的 appuser 运行（镜像内已建，见 Dockerfile.hub）。
+    user: "1000:1000"
+    cap_drop:
+      - ALL
     environment:
       - TZ=Asia/Shanghai
       - HASS_TOKEN=${HASS_TOKEN}
@@ -63,9 +81,11 @@ services:
   # P1-4：Wyoming 协议无鉴权，只绑 127.0.0.1——Hub 走 host 网络，本机回环可达，
   # 局域网其他机器连不上。
   whisper:
-    image: rhasspy/wyoming-whisper:latest
+    image: rhasspy/wyoming-whisper:latest@sha256:3cc01f646c8b149fe47b2a5e8bfaf31866e1bc18faffadb26c9b8be58cbe5703
     container_name: oxn-whisper
     restart: unless-stopped
+    cap_drop:
+      - ALL
     command: --model small-int8 --language zh --beam-size 1
     ports:
       - "127.0.0.1:10300:10300"
@@ -82,9 +102,11 @@ services:
   # TTS：Piper，中文音色；流式合成
   # P1-4：同 whisper，只绑 127.0.0.1。
   piper:
-    image: rhasspy/wyoming-piper:latest
+    image: rhasspy/wyoming-piper:latest@sha256:333622ab9e4bcd00c80a37219b90a1a9d6aa3fd1ad34e0a6e3bddd36ee999efd
     container_name: oxn-piper
     restart: unless-stopped
+    cap_drop:
+      - ALL
     command: --voice zh_CN-huayan-medium
     ports:
       - "127.0.0.1:10200:10200"
@@ -114,6 +136,12 @@ services:
     container_name: oxn-kws-sidecar
     restart: unless-stopped
     network_mode: host
+    # SC-P2-12 / P1-4：以 uid 1000 运行（镜像内无该用户，用数字 uid；
+    # 模型卷属主由 nas-install.sh §4 的 chown one-shot 负责，否则
+    # entrypoint 首次下载模型时写不进 /data/kws/models）。
+    user: "1000:1000"
+    cap_drop:
+      - ALL
     environment:
       - TZ=Asia/Shanghai
       - KWS_HOST=127.0.0.1
@@ -145,10 +173,12 @@ services:
   # P1-4：host 网络保留——Snapcast 客户端（音箱）在局域网连 1704/1705，
   # MPD 经 fifo 出流；改 bridge 会断播放链。只加 TZ 与限额。
   snapserver:
-    image: ivdata/snapserver:latest
+    image: ivdata/snapserver:latest@sha256:20840a2b507b13e167d7e817d9f310fce7271f3abb0b4457c12804cd367509df
     container_name: oxn-snapserver
     restart: unless-stopped
     network_mode: host
+    cap_drop:
+      - ALL
     environment:
       - TZ=Asia/Shanghai
     deploy:
@@ -163,10 +193,12 @@ services:
       - mpd
 
   mpd:
-    image: vimagick/mpd:latest
+    image: vimagick/mpd:latest@sha256:6f8dbbb84cd6fe55d6a6eb8e6da65932f6a93000e56c230f09b15a507e127e7c
     container_name: oxn-mpd
     restart: unless-stopped
     network_mode: host
+    cap_drop:
+      - ALL
     environment:
       - TZ=Asia/Shanghai
     deploy:
@@ -185,9 +217,11 @@ services:
   # Music Assistant 已砍（2026-11-18 融合 B）：Hub 直连本 API，
   # 登录由 Hub Web 面板扫码完成，Cookie 存 hub-data 卷；API 本身不保存登录态。
   netease-api:
-    image: binaryify/netease_cloud_music_api:latest
+    image: binaryify/netease_cloud_music_api:latest@sha256:ed9fc80e16a4813acac61f57399726a533cec402d4eb230c3adb9e023850bb03
     container_name: oxn-netease-api
     restart: unless-stopped
+    cap_drop:
+      - ALL
     ports:
       - "127.0.0.1:3000:3000"
     environment:
