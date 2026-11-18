@@ -243,6 +243,7 @@ def test_patch_sh_end_to_end(unpacked_work, tmp_path):
     wrapper = (verify / "etc/open-xiaoai/init.sh").read_text()
     assert "sha256sum" in wrapper and "ls -ln" in wrapper
     assert "init.sh.sha256" in wrapper
+    assert "sha256 pin missing" in wrapper  # F-3：pin 必填，缺 pin 即拒绝
     # P2-33：asound 原厂备份在镜像里（.bak 是原厂内容，不含补丁）。
     for rel in ("etc/asound.conf", "etc/asound.conf.dts"):
         bak = verify / (rel + ".bak")
@@ -501,8 +502,8 @@ def test_patch_rejects_multiple_orig_sqfs(unpacked_work, tmp_path):
 # --- P0-6：flash-check.sh 干跑检查 ---
 
 def test_flash_check_passes_on_shipped_image():
-    """FW-P2-5：仓库 work/ 里的已交付补丁镜像（2026-11-18 重编，
-    SHA 7dafb950…/fe2bab99…）含全部现版补丁——§4b 内容验证必须通过，
+    """FW-P2-5：仓库 work/ 里的已交付补丁镜像（2026-11-18 P1 修复轮重编，
+    SHA 1a5c2760…/8db02670…）含全部现版补丁——§4b 内容验证必须通过，
     默认与 --strict 两路都 exit 0，无过期 FAIL/WARN。
     （前身是 test_flash_check_reports_stale_shipped_image：2026-11-17 的
     旧镜像（7266aba9…/139de363…）缺 P1-36/P2-33/P2-34，§4b 报 FAIL；

@@ -244,6 +244,10 @@ grep -q 'sha256sum' "$VERIFY_DIR/rootfs/etc/open-xiaoai/init.sh" \
     || fail "验证失败：init 包装器里没有 sha256sum 校验"
 grep -q 'init.sh.sha256' "$VERIFY_DIR/rootfs/etc/open-xiaoai/init.sh" \
     || fail "验证失败：init 包装器里没有 SHA256 pin 检查"
+# F-3：pin 必填——包装器里必须有“缺 pin 文件即拒绝”的分支（不只是“有 pin
+# 时才校验”）；旧的可选 pin 写法没有 'sha256 pin missing' 这一行。
+grep -q 'sha256 pin missing' "$VERIFY_DIR/rootfs/etc/open-xiaoai/init.sh" \
+    || fail "验证失败：init 包装器里 pin 不是必填（缺 pin 文件时必须拒绝执行）"
 [ "$(stat -c %a "$VERIFY_DIR/rootfs/etc/open-xiaoai/init.sh")" = "755" ] \
     || fail "验证失败：init 包装器权限不是 0755"
 # .bak 必须是原厂原文——与原始 root.squashfs 里的同名文件逐字节比对。

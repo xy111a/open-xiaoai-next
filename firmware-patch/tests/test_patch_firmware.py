@@ -368,8 +368,78 @@ def test_patch_start(patched_rootfs):
     assert "ls -ln" in wrapper  # 设备上没有 stat，用 ls -ln 判断属主/权限
     assert "sha256sum" in wrapper
     assert "init.sh.sha256" in wrapper
+    # F-3：pin 必填——缺 pin 文件即拒绝，不只是“有 pin 时才校验”。
+    assert 'if [ ! -f "$PIN" ]' in wrapper
+    assert "sha256 pin missing" in wrapper
     assert 'exec sh "$INIT"' in wrapper
     assert (patched_rootfs / "etc/open-xiaoai/init.sh").stat().st_mode & 0o777 == 0o755
+
+
+def _sandbox_wrapper(patched_rootfs, tmp_path):
+    """把包装器拷到临时目录并把 /data 路径改写为临时路径，返回
+    (wrapper, init, pin, log, marker)。只改三行路径定义，不改校验逻辑。"""
+    d = tmp_path / "data"
+    d.mkdir()
+    wrapper = d / "init-wrapper.sh"
+    text = (patched_rootfs / "etc/open-xiaoai/init.sh").read_text()
+    text = text.replace('INIT="/data/init.sh"', f'INIT="{d}/init.sh"')
+    text = text.replace('PIN="/data/init.sh.sha256"', f'PIN="{d}/init.sh.sha256"')
+    text = text.replace('LOG="/data/open-xiaoai-init.log"', f'LOG="{d}/init.log"')
+    wrapper.write_text(text)
+    return (wrapper, d / "init.sh", d / "init.sh.sha256", d / "init.log",
+            d / "marker")
+
+
+def _run_wrapper(wrapper):
+    return subprocess.run(["sh", str(wrapper)], capture_output=True, text=True)
+
+
+@pytest.mark.skipif(os.geteuid() != 0,
+                    reason="包装器要求 init.sh 属主 uid 0，非 root 跑必被属主检查拒绝")
+def test_init_wrapper_requires_pin(patched_rootfs, tmp_path):
+    # F-3 回归：/data/init.sh 在、无 pin 文件时包装器必须拒绝执行（旧的
+    # 可选 pin 写法会直接放行）。分四种场景跑真实包装器脚本。
+    wrapper, init, pin, log, marker = _sandbox_wrapper(patched_rootfs, tmp_path)
+    hook = '#!/bin/sh\necho RAN > "' + str(marker) + '"\n'
+    # 1. 无 init.sh：直接退出 0，不执行、不写日志。
+    r = _run_wrapper(wrapper)
+    assert r.returncode == 0
+    assert not marker.exists()
+    assert not log.exists()
+    # 2. 有 init.sh、无 pin：拒绝执行，日志记 pin missing。
+    init.write_text(hook)
+    init.chmod(0o644)
+    r = _run_wrapper(wrapper)
+    assert r.returncode == 0
+    assert not marker.exists()
+    assert "refuse" in log.read_text() and "pin missing" in log.read_text()
+    # 3. pin 内容不对：拒绝执行，日志记 mismatch。
+    pin.write_text("0" * 64 + "  init.sh\n")
+    r = _run_wrapper(wrapper)
+    assert r.returncode == 0
+    assert not marker.exists()
+    assert "sha256 mismatch" in log.read_text()
+    # 4. pin 正确：执行钩子。
+    pin.write_text(hashlib.sha256(hook.encode()).hexdigest() + "  init.sh\n")
+    r = _run_wrapper(wrapper)
+    assert r.returncode == 0
+    assert marker.exists()
+    assert marker.read_text().strip() == "RAN"
+
+
+@pytest.mark.skipif(os.geteuid() != 0,
+                    reason="包装器要求 init.sh 属主 uid 0，非 root 跑必被属主检查拒绝")
+def test_init_wrapper_refuses_group_writable(patched_rootfs, tmp_path):
+    # 包装器原有检查不受 F-3 影响：组可写的 init.sh 即使 pin 正确也拒绝。
+    wrapper, init, pin, log, marker = _sandbox_wrapper(patched_rootfs, tmp_path)
+    hook = '#!/bin/sh\necho RAN > "' + str(marker) + '"\n'
+    init.write_text(hook)
+    init.chmod(0o664)
+    pin.write_text(hashlib.sha256(hook.encode()).hexdigest() + "  init.sh\n")
+    r = _run_wrapper(wrapper)
+    assert r.returncode == 0
+    assert not marker.exists()
+    assert "group/world-writable" in log.read_text()
 
 
 def test_patch_start_idempotent(tmp_path):

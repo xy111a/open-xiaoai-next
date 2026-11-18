@@ -51,11 +51,11 @@ ok()   { echo "  PASS $*"; }
 bad()  { echo "  FAIL $*"; FAIL=1; }
 warn() { echo "  WARN $*"; }
 
-# 2026-11-18 重编的补丁镜像 SHA256（见 FLASH_RUNBOOK.md §1）。
+# 2026-11-18 第三轮审计 P1 修复轮重编的补丁镜像 SHA256（见 FLASH_RUNBOOK.md §1）。
 # 仅作“与记录值一致”的提示；不一致时警告、不失败（镜像重编后值会变）。
 case "$MODEL:$VERSION" in
-    lx06:1.94.13) KNOWN_PATCHED_SHA256="7dafb9507bdc4894715f2978ffaf5fd6a11af18ad61ed268f48c6309f0a05e21" ;;
-    oh2p:1.58.6)  KNOWN_PATCHED_SHA256="fe2bab99eb15e423b689c24bace6fec1b665b1073dc12ec1c9fa2e4433b5c926" ;;
+    lx06:1.94.13) KNOWN_PATCHED_SHA256="1a5c27603d7ab8064841f3e970258ef39ae754c2847a46fc0529168c250d0281" ;;
+    oh2p:1.58.6)  KNOWN_PATCHED_SHA256="8db02670f0c81bda5059e5a0fe2cad5b6045f4afe252a310353c7ac3acf9d197" ;;
     *) KNOWN_PATCHED_SHA256="" ;;
 esac
 

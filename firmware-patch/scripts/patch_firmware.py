@@ -62,8 +62,9 @@ INIT_WRAPPER_SCRIPT = """#!/bin/sh
 #   1. /data/init.sh 存在；
 #   2. 属主 uid 为 0（root），且组/全局均不可写（ls -ln 的权限串里
 #      第 6 位与第 9 位都不是 w；设备上没有 stat 命令，见下）；
-#   3. 若 /data/init.sh.sha256 存在，文件 SHA256 必须与其中第一字段一致
-#      （客户端安装流程写该文件来钉死钩子内容；没有该文件时只做 1+2）。
+#   3. /data/init.sh.sha256 必须存在，且其中第一字段与 /data/init.sh 的
+#      SHA256 一致（F-3：pin 必填——缺 pin 文件即拒绝执行；安装流程写
+#      pin，见 firmware-patch/README.md“/data/init.sh 安装流程”）。
 # 任一条件不满足都拒绝执行，并把原因记到 /data/open-xiaoai-init.log。
 # 本文件烤进 squashfs（只读），改它要重打补丁重刷机。
 # 只用 busybox 自带命令（ls/sha256sum/cut/date 均在原厂 rootfs 里实测存在；
@@ -84,13 +85,15 @@ case "$1" in
         exit 0
         ;;
 esac
-if [ -f "$PIN" ]; then
-    want="$(cut -d' ' -f1 "$PIN" 2>/dev/null)"
-    got="$(sha256sum "$INIT" 2>/dev/null | cut -d' ' -f1)"
-    if [ -z "$want" ] || [ "$want" != "$got" ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') refuse: $INIT sha256 mismatch" >> "$LOG" 2>/dev/null
-        exit 0
-    fi
+if [ ! -f "$PIN" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') refuse: $INIT sha256 pin missing ($PIN not found)" >> "$LOG" 2>/dev/null
+    exit 0
+fi
+want="$(cut -d' ' -f1 "$PIN" 2>/dev/null)"
+got="$(sha256sum "$INIT" 2>/dev/null | cut -d' ' -f1)"
+if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') refuse: $INIT sha256 mismatch" >> "$LOG" 2>/dev/null
+    exit 0
 fi
 exec sh "$INIT"
 """

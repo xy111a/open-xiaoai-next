@@ -53,6 +53,59 @@ patch.sh lx06 1.94.13          # 补丁 + 重新打包 → work/lx06_1.94.13/roo
 调用和断言；`patch_all()` 先对全部步骤做 preflight（只读），任一前置
 条件不满足就立即失败且不写任何文件。
 
+## /data/init.sh 安装流程（客户端开机钩子）
+
+`/data/init.sh` 是客户端的开机钩子：刷机后 `/data` 是可写分区（不在
+squashfs 镜像里），开机时 `etc/rc.local` 调包装器
+`etc/open-xiaoai/init.sh`，包装器校验通过后才 `exec sh /data/init.sh`。
+镜像里只有包装器，没有 `/data/init.sh` 本身——钩子是刷机后另行安装的。
+
+### 钩子内容
+
+`/data/init.sh` 只做一件事：启动 `/data/open-xiaoai/client`（路径与
+部署约定见 `client/README.md`“部署到音箱”一节）。模板：
+
+```sh
+#!/bin/sh
+# 开机启动客户端（二进制、server.txt、client.toml 事先已拷到 /data/open-xiaoai/）
+exec /data/open-xiaoai/client >/data/open-xiaoai/client.log 2>&1
+```
+
+### 安装步骤（刷机后首次 SSH 登录成功后，root 身份执行）
+
+1. 把钩子拷进音箱（与客户端二进制同一批操作）：
+   ```bash
+   scp init.sh root@<音箱IP>:/data/init.sh
+   ```
+2. 写 pin 文件（F-3：pin 必填——缺 pin 文件时包装器拒绝执行钩子）：
+   ```bash
+   ssh root@<音箱IP> 'sha256sum /data/init.sh | cut -d" " -f1 > /data/init.sh.sha256'
+   ```
+   或在刷机电脑上算好再一起拷：`sha256sum init.sh | cut -d' ' -f1 > init.sh.sha256`，然后 scp 两个文件。
+3. 属主与权限（包装器强制要求，见下）：
+   ```bash
+   ssh root@<音箱IP> 'chown root:root /data/init.sh /data/init.sh.sha256 && chmod 644 /data/init.sh /data/init.sh.sha256'
+   ```
+4. 安装时先语法检查再重启验证：`sh -n /data/init.sh` 通过后重启音箱，
+   检查 `/data/open-xiaoai-init.log` 里没有 `refuse` 行，且客户端进程
+   在跑（`ps | grep open-xiaoai/client`）。
+
+### 包装器校验规则（缺一不可，否则拒绝执行并记日志）
+
+1. `/data/init.sh` 存在（不存在时直接退出 0，不报错、不执行）；
+2. 属主 uid 为 0（root），且组/全局均不可写；
+3. `/data/init.sh.sha256` 必须存在，第一字段等于 `/data/init.sh` 的 SHA256。
+
+### 更新与排障
+
+- 改 `/data/init.sh` 后必须同步重写 pin 文件（第 2 步），否则下次开机
+  包装器因 SHA 不一致拒绝执行——这是 fail-closed 的设计，不是故障。
+  恢复办法：SSH 进去重写 pin 文件（第 2 步），不用重刷机。
+- 客户端二进制经 Hub OTA 升级时 init.sh 本身不变，pin 不用重写。
+- 排障先看 `/data/open-xiaoai-init.log`：`refuse: ... pin missing` =
+  没写 pin；`sha256 mismatch` = init.sh 与 pin 对不上；`owner uid=` =
+  属主不是 root；`group/world-writable` = 权限太松。
+
 ## 工具链注意（实测踩过的坑）
 
 - `unpack.sh` 调 unblob 用的是 `-e/--extract-dir`，unblob 26.6.4 没有
