@@ -23,7 +23,9 @@
 #   输出：work/lx06_1.94.13/root-patched.squashfs
 #   环境：PATCH_WORK_DIR 可覆盖 work 目录（测试用）；OTA_BIN 可直接指定 .bin
 #         路径（白名单校验用它；不指定则用 work/<型号>_<版本>.bin，找不到
-#         则退而校验原始 root.squashfs）；SSH_PASSWORD 改 root 密码
+#         则退而校验原始 root.squashfs）；SSH_PASSWORD 改 root 密码；
+#         CERT_DIR 可覆盖 mTLS 证书目录（默认 $HERE/work/certs，gen-certs.sh
+#         的输出）；PATCH_NO_CERTS=1 跳过证书装入（仅测试用）。
 set -euo pipefail
 
 MODEL_RAW="${1:?用法: patch.sh lx06 1.94.13}"
@@ -61,6 +63,21 @@ fail() {
 }
 # 未经 fail() 的意外失败（set -e 触发）同样清理半成品镜像与工作副本。
 trap 'rm -f "$OUT"; [ -n "$VERIFY_DIR" ] && rm -rf "$VERIFY_DIR"; [ -n "$SQFS_ROOT" ] && rm -rf "$SQFS_ROOT"' ERR
+
+# mTLS 客户端证书必须打进镜像（否则音箱连不上 Hub 的 mTLS 4399）：
+# 默认用 $HERE/work/certs（gen-certs.sh 的输出）；CERT_DIR 可覆盖。
+# 目录不存在时直接失败——静默产出无证书镜像是发布事故（2026-11-17 的
+# 首版镜像是绕过 patch.sh、直接调 patch_firmware.py --cert-dir 打的，
+# patch.sh 本身从未传过证书）。仅测试可设 PATCH_NO_CERTS=1 跳过。
+CERT_DIR="${CERT_DIR:-$HERE/work/certs}"
+CERT_ARGS=()
+if [ -d "$CERT_DIR" ]; then
+    CERT_ARGS=(--cert-dir "$CERT_DIR")
+elif [ -n "${PATCH_NO_CERTS:-}" ]; then
+    echo "警告：PATCH_NO_CERTS=1，跳过证书装入（仅测试）" >&2
+else
+    fail "证书目录不存在：$CERT_DIR（先跑 scripts/gen-certs.sh，或设 CERT_DIR / PATCH_NO_CERTS=1）"
+fi
 
 # P1-8：find 必须恰好命中一个；多个即失败（任选其一是任意的），
 # 零个也失败。只打印命中的唯一路径（与 unpack.sh 同款辅助函数）。
@@ -112,6 +129,7 @@ cp -a "$SRC_ROOTFS" "$SQFS_ROOT"
 # --- 2. 打补丁（纯 Python，见 scripts/patch_firmware.py） ---
 echo "打补丁（$MODEL）..."
 python3 "$HERE/scripts/patch_firmware.py" --model "$MODEL" --rootfs "$SQFS_ROOT" \
+    "${CERT_ARGS[@]}" \
     || fail "patch_firmware.py 失败"
 
 # --- 3. 用 file 读原始 root.squashfs 的压缩方式与 blocksize ---
@@ -240,15 +258,16 @@ grep -q 'init.sh.sha256' "$VERIFY_DIR/rootfs/etc/open-xiaoai/init.sh" \
     || fail "验证失败：init 包装器里没有 SHA256 pin 检查"
 [ "$(stat -c %a "$VERIFY_DIR/rootfs/etc/open-xiaoai/init.sh")" = "755" ] \
     || fail "验证失败：init 包装器权限不是 0755"
-# .bak 里是原厂内容（不含补丁标记），否则备份无意义。
-# 注意：这里必须用 if 而不用 `grep … && fail`——grep 找不到时返回 1，
-# set -e 会直接退出，连 fail() 的报错都出不来（P2-31 同款坑）。
-if grep -q 'slave.pcm Capture' "$VERIFY_DIR/rootfs/etc/asound.conf.bak"; then
-    fail "验证失败：asound.conf.bak 里有补丁内容（备份应是原厂原文）"
-fi
-if grep -q 'slave.pcm Capture' "$VERIFY_DIR/rootfs/etc/asound.conf.dts.bak"; then
-    fail "验证失败：asound.conf.dts.bak 里有补丁内容（备份应是原厂原文）"
-fi
+# .bak 必须是原厂原文——与原始 root.squashfs 里的同名文件逐字节比对。
+# 不能只查 "slave.pcm Capture"：OH2P 原厂 asound.conf 里就有该行
+# （mico_record/noop 出厂即走 Capture），标记法会误杀 OH2P（2026-11-18
+# 重编 OH2P 时实测触发）。逐字节比对是“备份即原厂”的本来定义，与型号无关。
+for rel in etc/asound.conf etc/asound.conf.dts; do
+    unsquashfs -d "$VERIFY_DIR/orig" -f -no-exit-code "$ORIG_SQFS" "$rel" >/dev/null 2>&1 \
+        || fail "验证失败：解不出原厂 $rel（无法比对 .bak）"
+    cmp -s "$VERIFY_DIR/rootfs/$rel.bak" "$VERIFY_DIR/orig/$rel" \
+        || fail "验证失败：$rel.bak 与原厂内容不一致（备份应是原厂原文）"
+done
 if [ "$MODEL" = "lx06" ]; then
     if grep -q 'hw:0,3' "$VERIFY_DIR/rootfs/usr/lib/libxaudio_engine.so" 2>/dev/null; then
         fail "验证失败：libxaudio_engine.so 里仍有 hw:0,3"

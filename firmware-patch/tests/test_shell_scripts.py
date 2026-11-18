@@ -142,11 +142,65 @@ def test_unpack_with_ota_bin_env(tmp_path):
 
 # --- patch.sh：端到端 ---
 
+def test_patch_sh_requires_cert_dir(tmp_path):
+    """patch.sh 无证书目录且未设 PATCH_NO_CERTS 时直接失败（fail-closed，
+    不静默产出无证书镜像）。证书检查在 rootfs 检查之前，不需要固件夹具。"""
+    work = tmp_path / "work"
+    work.mkdir()
+    env = {"PATCH_WORK_DIR": str(work), "SSH_PASSWORD": "test-password-0123456789",
+           "CERT_DIR": str(tmp_path / "no-such-certs")}
+    r = run(["bash", str(SCRIPTS / "patch.sh"), "lx06", "1.94.13"],
+            env_extra=env, timeout=120)
+    assert r.returncode != 0
+    assert "证书目录不存在" in (r.stdout + r.stderr)
+    # 反向：PATCH_NO_CERTS=1 时跳过证书检查（走到下一步 rootfs 检查才失败，
+    # 因为临时 work 里没有 rootfs——证明跳过的只是证书检查）。
+    env2 = {"PATCH_WORK_DIR": str(work), "SSH_PASSWORD": "test-password-0123456789",
+            "CERT_DIR": str(tmp_path / "no-such-certs"), "PATCH_NO_CERTS": "1"}
+    r2 = run(["bash", str(SCRIPTS / "patch.sh"), "lx06", "1.94.13"],
+             env_extra=env2, timeout=120)
+    assert r2.returncode != 0
+    assert "证书目录不存在" not in (r2.stdout + r2.stderr)
+    assert "找不到" in (r2.stdout + r2.stderr)  # rootfs 缺失
+
+
+def test_oh2p_factory_asound_has_capture_marker_and_bak_matches(tmp_path):
+    """OH2P 原厂 asound.conf 里就有 "slave.pcm Capture"（mico_record/noop
+    出厂即走 Capture），所以 patch.sh §6 验 .bak 不能用标记法，必须逐字节
+    比对原厂文件。本测试钉死这个型号差异，并验重编后 OH2P 镜像的 .bak
+    与原厂逐字节一致。缺本地 work/ 材料时跳过（CI 干净 checkout 无此材料）。"""
+    orig_sqfs = FIRMWARE_PATCH / "work" / "oh2p_1.58.6" / "root.squashfs"
+    patched = FIRMWARE_PATCH / "work" / "oh2p_1.58.6" / "root-patched.squashfs"
+    if not orig_sqfs.is_file() or not patched.is_file():
+        pytest.skip("缺 OH2P 原厂 root.squashfs 或已交付补丁镜像（work/ 是本地构建产物）："
+                    f"{orig_sqfs} / {patched}")
+    orig_dir = tmp_path / "orig"
+    r = run(["unsquashfs", "-d", str(orig_dir), "-f", "-no-exit-code",
+             str(orig_sqfs), "etc/asound.conf", "etc/asound.conf.dts"],
+            timeout=300)
+    assert r.returncode == 0, r.stderr
+    # 型号差异本身：OH2P 原厂 asound.conf 就含该行（LX06 原厂没有）。
+    factory = (orig_dir / "etc/asound.conf").read_text()
+    assert "slave.pcm Capture" in factory
+    # 重编后镜像的 .bak 与原厂逐字节一致。
+    patched_dir = tmp_path / "patched"
+    r2 = run(["unsquashfs", "-d", str(patched_dir), "-f", "-no-exit-code",
+              str(patched), "etc/asound.conf.bak", "etc/asound.conf.dts.bak"],
+             timeout=300)
+    assert r2.returncode == 0, r2.stderr
+    for rel in ("etc/asound.conf", "etc/asound.conf.dts"):
+        assert (patched_dir / (rel + ".bak")).read_bytes() == \
+            (orig_dir / rel).read_bytes(), rel
+
+
 def test_patch_sh_end_to_end(unpacked_work, tmp_path):
     work = unpacked_work
     # P0-2：patch.sh → patch_firmware.py 不再有默认密码，必须显式给强密码。
+    # PATCH_NO_CERTS=1：本测试只验打补丁，不验证书装入（证书装入由
+    # patch.sh 的 fail-closed 检查 + flash-check §4b 覆盖）。
     test_pw = "test-password-0123456789"
-    env = {"PATCH_WORK_DIR": str(work), "SSH_PASSWORD": test_pw}
+    env = {"PATCH_WORK_DIR": str(work), "SSH_PASSWORD": test_pw,
+           "PATCH_NO_CERTS": "1"}
     r = run(["bash", str(SCRIPTS / "patch.sh"), "lx06", "1.94.13"],
             env_extra=env, timeout=1200)
     assert r.returncode == 0, f"patch.sh 失败：\n{r.stdout}\n{r.stderr}"
@@ -445,21 +499,22 @@ def test_patch_rejects_multiple_orig_sqfs(unpacked_work, tmp_path):
 
 # --- P0-6：flash-check.sh 干跑检查 ---
 
-def test_flash_check_reports_stale_shipped_image():
-    """FW-P2-5：仓库 work/ 里的已交付补丁镜像（SHA 7266aba9…/139de363…）
-    是 2026-11-17 打的，早于 P1-36（inittab 串口 /bin/login）、P2-33
-    （asound .bak）、P2-34（init 包装器）——§4b 内容验证必须报出来，
-    不能让它静默通过。两个型号都一样：inittab FAIL，rc.local/.bak/
-    包装器 WARN。下一轮重编镜像后，这两个 FAIL/WARN 应消失，届时把
-    本测试改回“通过”期望并同步更新 KNOWN_PATCHED_SHA256。"""
+def test_flash_check_passes_on_shipped_image():
+    """FW-P2-5：仓库 work/ 里的已交付补丁镜像（2026-11-18 重编，
+    SHA 7dafb950…/fe2bab99…）含全部现版补丁——§4b 内容验证必须通过，
+    默认与 --strict 两路都 exit 0，无过期 FAIL/WARN。
+    （前身是 test_flash_check_reports_stale_shipped_image：2026-11-17 的
+    旧镜像（7266aba9…/139de363…）缺 P1-36/P2-33/P2-34，§4b 报 FAIL；
+    2026-11-18 重编后按该测试 docstring 的预定改回“通过”期望。）"""
     require_patched_work()  # work/ 是 gitignore 的本地构建产物：CI 里跳过
     for model, version in (("lx06", "1.94.13"), ("oh2p", "1.58.6")):
-        r = run(["bash", str(SCRIPTS / "flash-check.sh"), model, version])
-        assert r.returncode != 0, f"flash-check.sh {model} 应报出镜像过期：\n{r.stdout}"
-        assert "inittab 串口不是 /bin/login" in r.stdout
-        assert "旧直行" in r.stdout
-        assert "asound.conf.bak" in r.stdout
-        assert "open-xiaoai/init.sh" in r.stdout
+        for args in ([model, version], ["--strict", model, version]):
+            r = run(["bash", str(SCRIPTS / "flash-check.sh")] + args)
+            assert r.returncode == 0, f"flash-check.sh {args} 失败：\n{r.stdout}\n{r.stderr}"
+            assert "干跑检查通过" in r.stdout
+            assert "SHA256 与记录值一致" in r.stdout
+            assert "inittab 串口不是 /bin/login" not in r.stdout
+            assert "旧直行" not in r.stdout
 
 
 def test_flash_check_ok_on_fresh_build(unpacked_work, tmp_path):

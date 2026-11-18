@@ -460,15 +460,6 @@ func (c *Client) recordDrops(deviceID string, n uint64) {
 	}
 }
 
-func (c *Client) streamFor(deviceID string) *stream {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return nil
-	}
-	return c.streamForLocked(deviceID)
-}
-
 // streamForLocked 取或新建某设备的流（调用方须已持 c.mu；
 // Close 后不再新建，见 N-P2-2）。
 func (c *Client) streamForLocked(deviceID string) *stream {
@@ -664,6 +655,22 @@ func (s *stream) dial() (*websocket.Conn, error) {
 // serve 在一条已建立的连接上跑收发：发 hello，写泵发 PCM、定时 ping，
 // 读泵收 wake/ready/error；任一泵出错即返回（run 负责重连）。
 func (s *stream) serve(conn *websocket.Conn) error {
+	// N-P2-3：重连时先排空断线期积压的陈旧 PCM（约 1 秒旧音频）——
+	// 旧代码直接排空同一队列，断线前/断线中的旧音频被当实时音频发给
+	// 边车，检出关键词即幽灵唤醒。排空的帧计入丢帧数。
+	// 注意：只在重连时排空——首次连接时队列里是拨号期间刚到的
+	// 实时音频，丢掉就等于丢一整句的开头。
+	// 顺序关键：排空必须在发 hello 之前。hello 是对端可观测到的
+	// “已重连”信号，调用方（如测试）收到 hello 后发的实时帧若落在
+	// hello 之后、排空之前，就会被误当陈旧帧丢掉（-race 下偶发，
+	// TestReconnectAfterDrop 2026-11-18 复现）。先排空再发 hello，
+	// 此后入队的一律是实时帧，不再被排空。
+	if s.everConnected {
+		if n := s.drainQueue(); n > 0 {
+			s.client.opts.Logger.Printf("kws: 边车重连，丢弃设备 %s 断线期积压的 %d 帧陈旧音频", s.deviceID, n)
+			s.client.recordDrops(s.deviceID, uint64(n))
+		}
+	}
 	hello := map[string]any{
 		"type": "hello", "device_id": s.deviceID, "sample_rate": s.client.opts.SampleRate,
 		// SC-P1-3 对接：边车要求 hello 带 token（hmac 常数时间比较），
@@ -678,17 +685,6 @@ func (s *stream) serve(conn *websocket.Conn) error {
 	conn.SetReadLimit(maxInboundBytes)
 	s.connected.Store(true)
 	s.client.opts.Logger.Printf("kws: 边车已连接（设备 %s，%s）", s.deviceID, s.client.url)
-	// N-P2-3：重连成功先排空断线期积压的陈旧 PCM（约 1 秒旧音频）——
-	// 旧代码直接排空同一队列，断线前/断线中的旧音频被当实时音频发给
-	// 边车，检出关键词即幽灵唤醒。排空的帧计入丢帧数。
-	// 注意：只在重连时排空——首次连接时队列里是拨号期间刚到的
-	// 实时音频，丢掉就等于丢一整句的开头。
-	if s.everConnected {
-		if n := s.drainQueue(); n > 0 {
-			s.client.opts.Logger.Printf("kws: 边车重连，丢弃设备 %s 断线期积压的 %d 帧陈旧音频", s.deviceID, n)
-			s.client.recordDrops(s.deviceID, uint64(n))
-		}
-	}
 	s.everConnected = true
 	// N-P2-5：连上即触发一次健康检查，kws_status 不等下一个 tick。
 	s.client.triggerHealthCheck()

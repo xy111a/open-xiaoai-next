@@ -17,7 +17,7 @@
 #   4b. 解开补丁镜像核对补丁标记（FW-P2-5）：dropbear / inittab / shadow /
 #       PAM / asound / OTA 三处 / rc.local / libxaudio；缺失即 FAIL
 #       （.bak 与 init 包装器是 P2-33/P2-34 新加的，旧版镜像里没有，缺失只警告）
-#   5. 打印补丁镜像 SHA256：与 FLASH_RUNBOOK.md 记录的 2026-11-17 实测值
+#   5. 打印补丁镜像 SHA256：与 FLASH_RUNBOOK.md 记录的实测值
 #      一致则提示一致；不一致默认只警告（镜像可能已重编），--strict 则失败
 # 设备侧检查（读 boot_part、/proc/mtd、刷后校验）无法在 VM 上跑，
 # 统一列在最后的 BLOCKED 清单里，按 FLASH_RUNBOOK.md 在真机上执行。
@@ -50,11 +50,11 @@ ok()   { echo "  PASS $*"; }
 bad()  { echo "  FAIL $*"; FAIL=1; }
 warn() { echo "  WARN $*"; }
 
-# 2026-11-17 实测的补丁镜像 SHA256（见 FLASH_RUNBOOK.md §1）。
+# 2026-11-18 重编的补丁镜像 SHA256（见 FLASH_RUNBOOK.md §1）。
 # 仅作“与记录值一致”的提示；不一致时警告、不失败（镜像重编后值会变）。
 case "$MODEL:$VERSION" in
-    lx06:1.94.13) KNOWN_PATCHED_SHA256="7266aba99b769947bd3ce937c23f0dc0443ad52883f04e4992eed45c0d7d97b3" ;;
-    oh2p:1.58.6)  KNOWN_PATCHED_SHA256="139de363d39d0a5472bf9b00c015effd9a24c379ca5fa2436cc21c43e8706415" ;;
+    lx06:1.94.13) KNOWN_PATCHED_SHA256="7dafb9507bdc4894715f2978ffaf5fd6a11af18ad61ed268f48c6309f0a05e21" ;;
+    oh2p:1.58.6)  KNOWN_PATCHED_SHA256="fe2bab99eb15e423b689c24bace6fec1b665b1073dc12ec1c9fa2e4433b5c926" ;;
     *) KNOWN_PATCHED_SHA256="" ;;
 esac
 
@@ -144,7 +144,7 @@ else
     echo "  补丁镜像 SHA256：$PSHA"
     if [ -n "$KNOWN_PATCHED_SHA256" ]; then
         if [ "$PSHA" = "$KNOWN_PATCHED_SHA256" ]; then
-            ok "补丁镜像 SHA256 与 2026-11-17 实测值一致"
+            ok "补丁镜像 SHA256 与记录值一致"
         elif [ "$STRICT" -eq 1 ]; then
             bad "补丁镜像 SHA256 与记录值不同（--strict：拒绝继续，请核对重编来源）"
         else
@@ -167,6 +167,14 @@ else
             || bad "镜像内补丁缺失：shadow 的 root 密码不是 \$6\$"
         grep -q '^# auth sufficient libmico-pam.so' "$RF/etc/pam.d/common-auth" \
             || bad "镜像内补丁缺失：PAM 的 libmico 行未被注释"
+        # mTLS 客户端证书必须在镜像里（patch.sh 无证书目录会直接失败）。
+        for f in etc/open-xiaoai/tls/ca.crt etc/open-xiaoai/tls/client.crt; do
+            [ -f "$RF/$f" ] || bad "镜像内补丁缺失：缺 $f（mTLS 客户端证书）"
+        done
+        [ -f "$RF/etc/open-xiaoai/tls/client.key" ] \
+            || bad "镜像内补丁缺失：缺 etc/open-xiaoai/tls/client.key（mTLS 客户端私钥）"
+        [ "$(stat -c %a "$RF/etc/open-xiaoai/tls/client.key")" = "600" ] \
+            || bad "镜像内补丁缺失：client.key 权限不是 0600"
         grep -q 'slave.pcm Capture' "$RF/etc/asound.conf" \
             || bad "镜像内补丁缺失：asound.conf 未打补丁"
         for func in download_upgrade upgrade; do
