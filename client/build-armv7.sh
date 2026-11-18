@@ -133,17 +133,33 @@ if [ -f "$VENDOR_LIB" ]; then
     fi
   done
   echo "ASSERT OK: $VENDOR_LIB exports all 10 required KWS symbols"
-  # 4) 兼容性提醒（只警告，不致命）：官方 .so 要求 GLIBC 最高 2.34 /
-  #    GLIBCXX_3.4.29，音箱只有 2.25 / 3.4.22（见 kws/vendor-arm/SOURCE.md）。
+  # 4) 兼容性：官方 .so 要求 GLIBC 最高 2.34 / GLIBCXX_3.4.29，音箱只有
+  #    2.25 / 3.4.22（见 kws/vendor-arm/SOURCE.md）。
   #    模式覆盖 GLIBC_2.29 及以上——实测 .so 最高 2.34，只匹配 2.29 会漏报。
+  #    2026-11-18 bai 定（gnueabihf，同 gnueabihf 脚本第 7 节）：全局仍只
+  #    警告；但本次构建开了 sherpa-kws feature 时不兼容即硬失败。
+  #    服务端模式（--no-sherpa-kws）不加载它，只警告。
   READELF_TXT="$TMPDIR/libsherpa-onnx-c-api.readelf.txt"
   readelf -V "$VENDOR_LIB" > "$READELF_TXT" 2>/dev/null || true
+  VENDOR_INCOMPAT_REASONS=""
   if grep -Eq "GLIBC_2\.(29|[3-9][0-9])" "$READELF_TXT"; then
     MAX_GLIBC=$(grep -o "GLIBC_2\.[0-9.]*" "$READELF_TXT" | sort -Vu | tail -n 1)
-    echo "WARNING: $VENDOR_LIB requires ${MAX_GLIBC:-GLIBC_2.29+}, speaker has glibc 2.25 — will NOT load on-device as-is (see kws/vendor-arm/SOURCE.md)"
+    VENDOR_INCOMPAT_REASONS="requires ${MAX_GLIBC:-GLIBC_2.29+}, speaker has glibc 2.25"
   fi
   if grep -q "GLIBCXX_3.4.29" "$READELF_TXT"; then
-    echo "WARNING: $VENDOR_LIB requires GLIBCXX_3.4.29, speaker has libstdc++ 3.4.22 — will NOT load on-device as-is (see kws/vendor-arm/SOURCE.md)"
+    if [ -n "$VENDOR_INCOMPAT_REASONS" ]; then
+      VENDOR_INCOMPAT_REASONS="$VENDOR_INCOMPAT_REASONS; requires GLIBCXX_3.4.29, speaker has libstdc++ 3.4.22"
+    else
+      VENDOR_INCOMPAT_REASONS="requires GLIBCXX_3.4.29, speaker has libstdc++ 3.4.22"
+    fi
+  fi
+  if [ -n "$VENDOR_INCOMPAT_REASONS" ]; then
+    if [ "${#SHERPA_FEATURE_ARGS[@]}" -gt 0 ]; then
+      echo "ASSERT FAIL: $VENDOR_LIB $VENDOR_INCOMPAT_REASONS — will NOT load on-device as-is (see kws/vendor-arm/SOURCE.md)" >&2
+      echo "  (built with --features sherpa-kws, so this .so would be dlopen'd on-device and fail; rebuild the .so from source (path A) or build with --no-sherpa-kws for server mode)" >&2
+      exit 1
+    fi
+    echo "WARNING: $VENDOR_LIB $VENDOR_INCOMPAT_REASONS — will NOT load on-device as-is (see kws/vendor-arm/SOURCE.md)"
   fi
 else
   echo "WARNING: ARM libsherpa not found at $VENDOR_LIB — run ./scripts/download-kws-lib.sh first (build itself does not link it; on-device KWS still BLOCKED, see kws/vendor-arm/SOURCE.md)"

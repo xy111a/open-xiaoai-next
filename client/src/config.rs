@@ -1,4 +1,6 @@
-//! 配置：只读 `/data/open-xiaoai/client.toml`，不存在则用默认值。
+//! 配置：只读 `/data/open-xiaoai/client.toml`；文件不存在即报错退出，
+//! 不静默回退默认配置。`hub_url` 必填（无默认值，缺了启动即报错）；
+//! 其余字段缺失走默认值，旧 client.toml 兼容。
 //! 唤醒词、Hub 地址、Token 都在这里改，不用重刷机；改完由 Hub OTA 推送。
 //!
 //! Phase 1 新增：`tls`（默认 true；false = 纯 ws，仅本地测试，需显式
@@ -9,9 +11,6 @@
 use anyhow::Result;
 use serde::Deserialize;
 
-fn default_hub_url() -> String {
-    "wss://192.168.1.10:4399".to_string()
-}
 fn default_token() -> String {
     // P0-3：默认 Token 为空（fail closed）。空值/弱值在建连前就被
     // transport.rs 的 connect_once（validate_token）拒绝，Client
@@ -47,8 +46,11 @@ fn default_tls() -> bool {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// Hub 地址，例如 wss://192.168.1.10:4399
-    #[serde(default = "default_hub_url")]
+    /// Hub 地址，例如 wss://192.168.1.10:4399。必填，无默认值
+    /// （C-15 / P2-42，2026-11-18 bai 定）：缺失或空串时 `validate()`
+    /// 拒绝启动；写死的内网 IP 默认值已删，换网络/NAS 换 IP 时不再
+    /// 静默连错地方。
+    #[serde(default)]
     pub hub_url: String,
     /// 与 Hub 约定的 Token（与服务端 OPEN_XIAOAI_TOKEN 一致，否则拒绝连接）
     #[serde(default = "default_token")]
@@ -104,7 +106,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            hub_url: default_hub_url(),
+            hub_url: String::new(),
             token: default_token(),
             wake_word: default_wake_word(),
             kws_mode: default_kws_mode(),
@@ -174,9 +176,11 @@ impl Config {
     ///   = true`），否则拒绝启动；且 `tls=false` 时 `hub_url` 必须是
     ///   `ws://`——`wss://` 会悄悄走系统根证书 TLS、不走指纹校验，与
     ///   “tls=false = 纯 ws”自述矛盾（P2-N3，挡着 P1-10 的路顺带修掉）。
-    /// - `hub_url` 必须带 `ws://` / `wss://` scheme；`model` 只支持
-    ///   `lx06` / `oh2p`；`ram_mb` 必须 >0（P2-42 的一部分：以前
-    ///   `model`/`ram_mb`/`hub_url` 无任何校验）。
+    /// - `hub_url` 必填（C-15 / P2-42，2026-11-18 bai 定）：缺失或空串
+    ///   即拒绝启动（与空 Token 的 fail-closed 一个风格）；非空时必须带
+    ///   `ws://` / `wss://` scheme；`model` 只支持 `lx06` / `oh2p`；
+    ///   `ram_mb` 必须 >0（P2-42 的一部分：以前 `model`/`ram_mb`/
+    ///   `hub_url` 无任何校验）。
     ///
     /// 注意：`FingerprintVerifier` 同时校验有效期与 SAN 是 P2-1 的范围，
     /// 不在本项（见 AUDIT_ROUND2.md §6）。
@@ -185,6 +189,11 @@ impl Config {
             anyhow::bail!(
                 "invalid kws_mode {:?}: expected \"server\" (default, wake detection on the NAS sidecar) or \"local\" (on-device sherpa KWS)",
                 self.kws_mode
+            )
+        }
+        if self.hub_url.trim().is_empty() {
+            anyhow::bail!(
+                "hub_url is required in client.toml (no default): set it to the Hub WebSocket address, e.g. wss://192.168.1.10:4399"
             )
         }
         if !(self.hub_url.starts_with("ws://") || self.hub_url.starts_with("wss://")) {
@@ -253,12 +262,12 @@ pub fn load() -> Result<Config> {
 
 pub fn load_from_path(path: &str) -> Result<Config> {
     // P2-42：配置文件缺失或不可读时明确报错退出，不再静默回退默认配置——
-    // 默认配置的 hub_url 是写死的 192.168.1.10、token 为空，静默回退只会
+    // 旧默认配置的 hub_url 是写死的 192.168.1.10、token 为空，静默回退只会
     // 让一次部署失误（忘写 client.toml、路径写错、权限不足）变成“无限
     // 重连一个不存在的 Hub + 一条容易误读的指纹缺失报错”。client.toml
     // 是部署时手写的（见 client/README.md 部署清单），缺失就是部署未完成。
-    // 注意：文件存在但字段缺失时仍走字段默认值（旧 client.toml 兼容），
-    // 随后 `validate()` 会拦住无指纹/弱配置——那是另一层防线。
+    // 注意：文件存在但字段缺失时其余字段仍走默认值（旧 client.toml 兼容），
+    // 唯独 hub_url 无默认值——缺失即空串，随后 `validate()` 拒绝启动。
     let text = std::fs::read_to_string(path).map_err(|e| {
         let hint = if e.kind() == std::io::ErrorKind::NotFound {
             format!(
@@ -285,7 +294,8 @@ mod tests {
     #[test]
     fn default_config() {
         let cfg = Config::default();
-        assert_eq!(cfg.hub_url, "wss://192.168.1.10:4399");
+        // C-15 / P2-42：hub_url 无默认值（空串），缺了启动即报错。
+        assert_eq!(cfg.hub_url, "");
         assert_eq!(cfg.wake_word, "你好小李");
         assert_eq!(cfg.model, "lx06");
         assert_eq!(cfg.ram_mb, 256);
@@ -299,29 +309,78 @@ mod tests {
         assert_eq!(cfg.kws_mode, "server");
         assert!(cfg.is_server_kws_mode());
         assert!(!cfg.is_local_kws_mode());
-        // P1-10：默认配置无指纹 + tls=true，validate 必须拒绝启动
-        // （以前只 warn 走系统根证书）。配上合法指纹后才通过。
+        // 空 hub_url → validate 先报 hub_url 必填（在指纹校验之前）。
         let err = cfg
             .validate()
-            .expect_err("default config without fingerprint must fail validation");
+            .expect_err("default config without hub_url must fail validation");
+        assert!(
+            err.to_string().contains("hub_url is required"),
+            "unexpected error: {err}"
+        );
+        // 补上 hub_url 后，P1-10：无指纹 + tls=true 仍拒绝启动
+        // （以前只 warn 走系统根证书）。配上合法指纹后才通过。
+        let mut with_url = cfg.clone();
+        with_url.hub_url = "wss://192.168.1.10:4399".to_string();
+        let err = with_url
+            .validate()
+            .expect_err("config without fingerprint must fail validation");
         assert!(
             err.to_string().contains("hub_ca_fingerprint is required"),
             "unexpected error: {err}"
         );
-        let mut with_fp = cfg.clone();
+        let mut with_fp = with_url.clone();
         with_fp.hub_ca_fingerprint = Some("aa".repeat(32));
         assert!(with_fp.validate().is_ok());
     }
 
     #[test]
+    fn missing_or_empty_hub_url_fails_startup_with_clear_error() {
+        // C-15 / P2-42：hub_url 必填——TOML 里缺字段与显式空串都拒绝启动，
+        // 报错点名 hub_url（不只报 scheme 非法）。
+        let fp_line = "hub_ca_fingerprint = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"";
+        let err = load_from_str(fp_line).expect_err("missing hub_url must fail");
+        assert!(
+            err.to_string().contains("hub_url is required"),
+            "unexpected error: {err}"
+        );
+        let err = load_from_str(&format!("hub_url = \"\"\n{fp_line}\n"))
+            .expect_err("empty hub_url must fail");
+        assert!(
+            err.to_string().contains("hub_url is required"),
+            "unexpected error: {err}"
+        );
+        // 只有空白字符同样拒绝。
+        let err = load_from_str(&format!("hub_url = \"   \"\n{fp_line}\n"))
+            .expect_err("blank hub_url must fail");
+        assert!(
+            err.to_string().contains("hub_url is required"),
+            "unexpected error: {err}"
+        );
+        // 构造出来的非法 Config 直接调 validate 也必须报错（不只走解析路径）。
+        let cfg = Config {
+            hub_url: String::new(),
+            ..Config::default()
+        };
+        let err = cfg.validate().expect_err("empty hub_url must fail");
+        assert!(
+            err.to_string().contains("hub_url is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn kws_mode_local_parses_and_server_explicit_parses() {
         // P1-10：load_from_str 走 validate，tls=true 时须带合法指纹。
+        // C-15：hub_url 必填，TOML 里必须显式写。
         let fp_line = format!("hub_ca_fingerprint = \"{}\"", "aa".repeat(32));
-        let local = load_from_str(&format!("kws_mode = \"local\"\n{fp_line}\n")).unwrap();
+        let hub_line = "hub_url = \"wss://192.168.1.10:4399\"";
+        let local =
+            load_from_str(&format!("kws_mode = \"local\"\n{hub_line}\n{fp_line}\n")).unwrap();
         assert_eq!(local.kws_mode, "local");
         assert!(local.is_local_kws_mode());
         assert!(!local.is_server_kws_mode());
-        let server = load_from_str(&format!("kws_mode = \"server\"\n{fp_line}\n")).unwrap();
+        let server =
+            load_from_str(&format!("kws_mode = \"server\"\n{hub_line}\n{fp_line}\n")).unwrap();
         assert!(server.is_server_kws_mode());
     }
 
@@ -420,7 +479,9 @@ mod tests {
     // --- P1-10 收紧 + P2-N3 / model / ram_mb 校验 ---
     #[test]
     fn validate_requires_fingerprint_when_tls() {
+        // C-15：hub_url 必填，构造测试配置时必须显式给。
         let mut cfg = Config {
+            hub_url: "wss://192.168.1.10:4399".to_string(),
             hub_ca_fingerprint: Some("aa".repeat(32)),
             ..Config::default()
         };

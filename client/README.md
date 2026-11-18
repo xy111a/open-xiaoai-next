@@ -16,7 +16,7 @@
 | `src/audio.rs` | ✅ Opus 编解码真实实现（`opus-rs` 纯 Rust，16kHz/单声道/20ms/VOIP/16kbps）；ALSA 采集/播放已接线（任务 E，2026-11-17：`AudioDevice` trait + 真实 `AlsaAudioDevice` + Fake/NoDevice；无硬件时返回明确错误；真机实测仍 BLOCKED） |
 | `src/transport.rs` | ✅ wss + Token 鉴权 + 指纹校验 + 指数退避重连（100ms 起步，上限 1s）；支持 `tls: false` 纯 ws 测试模式 |
 | `src/kws.rs` | ✅ RMS 计算与帧处理结构真实；sherpa-onnx 后端已接（任务 F，2026-11-17：feature `sherpa-kws`，见 `kws/README.md`；默认不开，无模型时恒不谎报唤醒） |
-| `src/config.rs` | ✅ `tls`、`hub_ca_fingerprint`、`room` 字段；缺字段走默认值，旧 client.toml 兼容；`kws_mode`（`"server"` 默认 / `"local"`，非法值启动报错，见下） |
+| `src/config.rs` | ✅ `tls`、`hub_ca_fingerprint`、`room` 字段；缺字段走默认值（`hub_url` 除外：必填，缺了启动即报错，见 `validate()`），旧 client.toml 兼容；`kws_mode`（`"server"` 默认 / `"local"`，非法值启动报错，见下） |
 | `src/main.rs` | ✅ Session 状态机：KWS 命中 → 发 wake → 等 wake_win/wake_lose → 赢了才推 audio_start + 音频帧；收到 interrupt 立即停播；rpc 白名单执行（`run_shell` 不在白名单，拒绝）；server 模式：会话一建立即发 audio_start、持续推流，wake_lose/interrupt 不停流 |
 
 ## 构建

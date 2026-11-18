@@ -2,6 +2,29 @@
 
 按时间倒序。每个决策写清“定了什么、为什么、谁定的”，改了就追加一条，不改旧条。
 
+## 2026-11-18：六项决定——S-3 / HA / P1-40 / P2-12 / C-15 / gnueabihf（bai 定）
+
+- S-3：接受回环 + token，不给边车加 TLS。`kws-sidecar/server.py` 启动期守门
+  （`_is_loopback_host`）：非回环 `--host` / `KWS_HOST` 即拒绝启动；局域网
+  暴露须先给边车加 TLS（另起一项做）。
+- HA：`hub/config.yaml` 的 `home_assistant.url` 从 `wss://192.168.1.10:8123`
+  改回 `ws://192.168.1.10:8123`（bai 的 HA 未配 TLS；此前误写成 wss，握手
+  直接失败）。HA 套上带 TLS 的反向代理后再改回 wss。
+- P1-40：服务端 KWS 是长期路线（Hub → kws-sidecar，当前唯一能工作的唤醒
+  路径）；path A（从源码重编 ORT + sherpa 跑本地 KWS）只留文档，不投入。
+  理由：没有 Hub 音箱本来就什么都干不了，本地 KWS 只能解决“Hub 挂了还能
+  唤醒”，收益几乎为零；真正的风险是 Hub 单点故障，解法是把 Hub 跑稳。
+- P2-12：急救二次确认方案通过，Phase 4 再实现（不挡刷机）。首次触发先问
+  “确认要呼叫急救吗？请说'确认呼叫'”，60 秒窗口；说确认/是的/确认呼叫
+  或再次触发 = 确认，取消 = 取消，超时 = 不呼叫。触发词须选不易被电视和
+  日常对话误触的短语；每次触发与结果记日志，方便以后调阈值。
+- C-15 / P2-42：`hub_url` 必填，无默认值（`client/src/config.rs`，与空
+  Token 的 fail-closed 一个风格）。写死的 `wss://192.168.1.10:4399` 默认值已删。
+- gnueabihf：vendor `.so` 不兼容全局仍只警告；但构建开了 sherpa-kws
+  feature（本地 KWS 路径，运行时真的会 dlopen 它）时硬失败。服务端模式
+  不加载它，只警告。见 `client/build-armv7-gnueabihf.sh` 第 7 节与
+  `client/build-armv7.sh` 第 4 节。
+
 ## 2026-11-18：音乐融合 B——砍 Music Assistant，Hub 直连网易云（bai 定）
 
 - 砍掉 Music Assistant 容器（`ghcr.io/music-assistant/server`、`ma-data` 卷、8095 端口全部删除）；

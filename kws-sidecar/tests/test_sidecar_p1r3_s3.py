@@ -11,6 +11,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -36,8 +37,10 @@ def test_p1r3_s3_host_default_is_loopback(monkeypatch):
 
 
 def test_p1r3_s3_host_env_and_cli_override_still_work(monkeypatch):
-    """S-3(1)：显式配置仍有效——KWS_HOST 环境变量与 --host 命令行
-    都能覆盖默认（需局域网暴露时显式改，不静默改不回去）。"""
+    """S-3(1)：显式配置在解析层仍有效——KWS_HOST 环境变量与 --host
+    命令行都能覆盖默认。注意：解析通过不等于能启动，2026-11-18 bai
+    定之后非回环地址在 amain() 里启动即拒绝（见本文件末尾的守门
+    测试）；本测试只钉解析行为。"""
     monkeypatch.setenv("KWS_HOST", "0.0.0.0")
     args = sidecar_server.build_arg_parser().parse_args([])
     assert args.host == "0.0.0.0"
@@ -55,16 +58,20 @@ def test_p1r3_s3_dockerfile_default_is_loopback():
 
 
 def test_p1r3_s3_no_tls_in_server_and_assumption_documented():
-    """S-3(2)：server.py 全文仍无 TLS/证书逻辑（TLS 实现未做，等
-    bai 定夺），且“边车不启用 TLS、依赖 127.0.0.1 绑定”已写为正式
-    安全假设进 README（含风险边界与失效条件）。"""
+    """S-3(2)：server.py 全文仍无 TLS/证书逻辑（2026-11-18 bai 定接受
+    回环 + token、不加 TLS），且“边车不启用 TLS、依赖 127.0.0.1 绑定”
+    已写为正式安全假设进 README（含风险边界与失效条件），状态已决，
+    非回环地址启动即拒绝。"""
     text = (SIDECAR_DIR / "server.py").read_text(encoding="utf-8")
     assert not re.search(r"(?i)\bssl\b", text), \
-        "server.py must contain no TLS logic yet (S-3 decision pending)"
+        "server.py must contain no TLS logic yet (S-3 decided: loopback + token, no TLS)"
     readme = README.read_text(encoding="utf-8")
     assert "不启用 TLS" in readme
     assert "127.0.0.1" in readme
-    assert "待 bai 定夺" in readme or "待定决定" in readme
+    assert "已决" in readme, \
+        "README security assumption must record the 2026-11-18 decision"
+    assert "待 bai 定夺" not in readme and "待定决定" not in readme, \
+        "README must no longer say the S-3 decision is pending"
     assert "本机进程" in readme, \
         "assumption must state the risk boundary (any local process)"
     assert "| `KWS_HOST` | `127.0.0.1` |" in readme
@@ -118,3 +125,58 @@ def test_p1r3_s3_server_binds_loopback_only(tmp_path):
         proc.terminate()
         proc.wait(timeout=10)
         log_file.close()
+
+# ---------------- S-3 已决（2026-11-18）：非回环启动即拒绝 ----------------
+
+def test_decisions6_s3_loopback_guard_accepts_loopback():
+    """S-3 已决：回环地址放行——127.0.0.0/8、::1 与 localhost。"""
+    is_loopback = sidecar_server._is_loopback_host
+    assert is_loopback("127.0.0.1")
+    assert is_loopback("127.0.0.2")
+    assert is_loopback("127.255.255.255")
+    assert is_loopback("::1")
+    assert is_loopback("localhost")
+
+
+def test_decisions6_s3_loopback_guard_refuses_non_loopback():
+    """S-3 已决：非回环拒绝——0.0.0.0、局域网 IP、未指定地址、空串、
+    解析失败的主机名。"""
+    is_loopback = sidecar_server._is_loopback_host
+    assert not is_loopback("0.0.0.0")
+    assert not is_loopback("192.168.1.10")
+    assert not is_loopback("10.0.0.2")
+    assert not is_loopback("::")
+    assert not is_loopback("")
+    assert not is_loopback("nonexistent.invalid")
+
+
+def _run_server_with_host(host, port):
+    """以给定 --host 起 server 子进程（不加载模型：守门在 Token/
+    模型加载之前，配错地址应秒退）。返回 CompletedProcess。"""
+    env = dict(os.environ)
+    env.pop("KWS_HOST", None)
+    return subprocess.run(
+        [sys.executable, str(SIDECAR_DIR / "server.py"),
+         "--host", host, "--port", str(port)],
+        capture_output=True, text=True, timeout=60, env=env)
+
+
+def test_decisions6_s3_non_loopback_host_refuses_startup():
+    """S-3 已决：--host 0.0.0.0 启动即非零退出，stderr 点名回环要求；
+    且守门在 Token 校验之前（不配 Token 也应先报回环错，不是 Token 错）。"""
+    proc = _run_server_with_host("0.0.0.0", 10499)
+    assert proc.returncode == 1, \
+        f"non-loopback host must exit 1, got {proc.returncode}: {proc.stderr}"
+    assert "FATAL" in proc.stderr
+    assert "loopback" in proc.stderr
+    assert "0.0.0.0" in proc.stderr
+
+
+def test_decisions6_s3_loopback_host_passes_guard_to_token_check():
+    """S-3 已决：--host 127.0.0.1 能过守门，接着才报 Token 未配
+    （证明守门放行后流程继续走到下一道校验，不是笼统拒绝一切）。"""
+    proc = _run_server_with_host("127.0.0.1", 10499)
+    assert proc.returncode == 1
+    assert "KWS token" in proc.stderr, \
+        f"loopback host must pass the guard and fail on token: {proc.stderr}"
+    assert "loopback" not in proc.stderr

@@ -40,22 +40,25 @@ sherpa-onnx-kws-zipformer-wenetspeech-3.3M，关键词“你好小李”），
 流状态（stream），互不干扰；连接断开即丢弃该设备流状态，重连从零开始；
 同一 device_id 重连时旧连接被主动关闭、旧流丢弃（不再出 wake）。
 
-安全假设（S-3，2026-11-18 第三轮审计 P1，未决 TLS 前的正式假设，
-详见 README.md“安全假设”）：本服务不启用 TLS，只监听明文 ws，
-默认只绑 127.0.0.1 回环（--host / KWS_HOST 默认值），流量不出回环；
-hello 的 token 以明文 JSON 传输，隔离只靠回环绑定 + token 本身。
-任何 NAS 本机进程都可直连 127.0.0.1:10400。bai 在“接受回环假设”
-与“给边车加 TLS”之间定夺后，本假设即失效（选 TLS 则 Hub 的指纹
-pin 才真正跑通；wss:// 一配就连不上，是 fail-closed，不是 bug）。
+安全假设（S-3，2026-11-18 第三轮审计 P1，2026-11-18 bai 定：接受
+回环 + token，不加 TLS，详见 README.md“安全假设”）：本服务不启用
+TLS，只监听明文 ws，默认只绑 127.0.0.1 回环（--host / KWS_HOST
+默认值），流量不出回环；hello 的 token 以明文 JSON 传输，隔离只靠
+回环绑定 + token 本身。任何 NAS 本机进程都可直连 127.0.0.1:10400。
+非回环 --host / KWS_HOST 启动即拒绝（见 _is_loopback_host）；
+局域网暴露须先给边车加 TLS（另起一项做；wss:// 一配就连不上，
+是 fail-closed，不是 bug）。
 """
 import argparse
 import asyncio
 import hmac
+import ipaddress
 import json
 import logging
 import math
 import os
 import re
+import socket
 import sys
 import time
 from collections import deque
@@ -646,15 +649,47 @@ def _env_int(name, default):
         sys.exit(1)
 
 
+def _is_loopback_host(host):
+    """--host / KWS_HOST 是不是回环地址（127.0.0.0/8 或 ::1）。
+
+    S-3（2026-11-18 bai 定：接受回环 + token，不加 TLS）：边车不启用
+    TLS，回环绑定是唯一的隔离；非回环监听会把无 TLS 的 KWS 流量暴露
+    到局域网，启动即拒绝。IP 字面量直接判；主机名（常见的是
+    "localhost"）解析后逐个判——任一解析结果非回环即拒绝；解析失败
+    或空串同样拒绝（无法证明是回环就不放行）。
+    """
+    if not host:
+        return False
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, OSError):
+        return False
+    if not infos:
+        return False
+    try:
+        return all(
+            ipaddress.ip_address(info[4][0]).is_loopback
+            for info in infos
+        )
+    except ValueError:
+        return False
+
+
 def build_arg_parser():
     p = argparse.ArgumentParser(description="KWS sidecar for open-xiaoai-next")
     # S-3：默认只绑回环（127.0.0.1）。边车不启用 TLS（见 README
-    # “安全假设”），回环绑定是唯一的隔离；需局域网暴露时再显式改
-    # --host / KWS_HOST。serve() 只绑 args.host 一个地址，无其他监听。
+    # “安全假设”，2026-11-18 bai 定接受回环 + token），回环绑定是唯一
+    # 的隔离；非回环 --host / KWS_HOST 启动即拒绝（amain 里的
+    # _is_loopback_host 守门），局域网暴露须先给边车加 TLS。
+    # serve() 只绑 args.host 一个地址，无其他监听。
     p.add_argument("--host", default=os.environ.get("KWS_HOST", "127.0.0.1"),
                    help="listen address (default 127.0.0.1, loopback only; "
-                        "the sidecar has no TLS, see README security "
-                        "assumption)")
+                        "non-loopback is refused at startup — the sidecar "
+                        "has no TLS, see README security assumption)")
     p.add_argument("--port", type=int,
                    default=_env_int("KWS_PORT", 10400))
     p.add_argument("--model-dir",
@@ -709,6 +744,16 @@ async def amain():
     if not 1 <= args.port <= 65535:
         LOG.error("FATAL: --port / KWS_PORT must be in [1, 65535]; got %s",
                   args.port)
+        sys.exit(1)
+    # S-3（2026-11-18 bai 定）：边车不启用 TLS，回环绑定是唯一的隔离；
+    # 非回环 --host / KWS_HOST 启动即拒绝，不静默监听局域网。放在
+    # Token/模型加载之前——配错地址时秒退，不浪费模型加载时间。
+    if not _is_loopback_host(args.host):
+        LOG.error("FATAL: --host / KWS_HOST must be a loopback address "
+                  "(127.0.0.0/8 or ::1); got %r — the sidecar has no TLS, "
+                  "binding a non-loopback address would expose KWS traffic "
+                  "to the LAN (to expose it, add TLS to the sidecar first)",
+                  args.host)
         sys.exit(1)
     if (args.threshold, args.score) != (DEFAULT_THRESHOLD, DEFAULT_SCORE):
         LOG.warning("KWS threshold/score differ from the experimentally "
