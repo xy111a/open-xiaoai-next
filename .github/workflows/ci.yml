@@ -65,8 +65,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # P2-N7：client/rust-toolchain.toml 把工具链钉在 1.100.0；CI 必须装
+      # 同一版本 + rustfmt/clippy 组件——只装 stable 时，进 client/ 目录后
+      # rustup 会按 rust-toolchain.toml 切到 1.100.0，而该版本没装组件，
+      # cargo fmt/clippy 会报 "not installed for the toolchain '1.100.0-...'"
+      # （PR #4 首跑实测，Rust job 因此红）。换版本时这里与 rust-toolchain.toml 同步改。
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.100.0
           components: rustfmt, clippy
       # client 链 ALSA（alsa-sys）与 Opus。
       - name: 安装系统依赖
