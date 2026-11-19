@@ -506,6 +506,19 @@ async fn main() -> Result<()> {
     // 回声消除（Opus 级回声接线）：播放参考由 run_session 的 play_frame
     // 解码产物经 ref 通道喂给录音任务的 Aec（见 aec.rs 模块头：为什么
     // 接在客户端、而不是 Hub 侧）。
+    // 打断（barge-in）不变量：录音任务与放音是两条独立的路——录音任务
+    // 只开采集设备（Audio::open_capture_only，hw:0,0），会话只开播放
+    // 设备（Audio::open_playback_only，hw:0,2），两路永不互相静音。
+    // 本任务不读 Session.playing、不因放音停采：server 模式下推流
+    // 标志恒为 true，TTS 播着的同时麦克风照样采、照样推给 Hub，
+    // Hub 的 KWS 才能在放音中检出唤醒词并发 interrupt 打断；local
+    // 模式下推流门（pushing_audio）只决定编不编码/发不发 Opus，
+    // KWS 喂帧（k.feed）在推流门之前，同样不停。不要在这里加
+    // “放音时停采”的优化——那会直接杀死打断（单测见
+    // playback_does_not_stop_push_gate_in_server_mode，端到端见
+    // server_mode_mic_stays_live_during_tts_playback）。
+    // 注意：放音声仍会被麦克风采到，AEC 消回声的效果（打断成功率）
+    // 只能真机验证，见本任务最终报告的硬件验证清单。
     let (wake_tx, mut wake_rx) = mpsc::channel::<kws::WakeEvent>(8);
     let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(32);
     let (ref_tx, ref_rx) = mpsc::channel::<[i16; audio::FRAME_SAMPLES]>(16);
@@ -1479,6 +1492,37 @@ mod tests {
     }
 
     #[test]
+    fn playback_does_not_stop_push_gate_in_server_mode() {
+        // 打断（barge-in）不变量的 Session 层：server 模式下放音
+        // （play_text / 首帧播出）绝不能停推流——麦克风必须在 TTS
+        // 播着的同时继续往 Hub 推音频，Hub 的 KWS 才能在放音中检出
+        // 唤醒词。放音只改 playing，不碰 streaming。
+        let mut s = Session::new_server();
+        assert!(s.pushing_audio());
+        s.on_hub_msg(&HubMsg::Rpc {
+            id: "p1".to_string(),
+            method: "play_text".to_string(),
+            params: serde_json::json!({"text": "你好"}),
+        });
+        assert!(s.playing, "play_text must mark playing");
+        assert!(s.streaming, "playback must not stop streaming");
+        assert!(
+            s.pushing_audio(),
+            "mic push gate must stay open while playing"
+        );
+        // 首帧播出后同样不断流。
+        s.note_played_frame();
+        assert!(s.playing);
+        assert!(s.pushing_audio());
+        // 打断（interrupt）停播后，server 模式的持续推流仍在。
+        let actions = s.on_hub_msg(&HubMsg::Interrupt);
+        assert!(!s.playing);
+        assert!(s.streaming);
+        assert!(s.pushing_audio());
+        assert_eq!(actions, vec![SessionAction::StopPlayback]);
+    }
+
+    #[test]
     fn local_mode_session_is_unchanged() {
         // Session::new() 仍是 local 语义：wake_win 发 audio_start、
         // wake_lose 停流、interrupt 停播又停流（与 server 模式对照）。
@@ -2076,6 +2120,159 @@ mod tests {
             one_round(true).await,
             3,
             "audio frames after start_play must be played"
+        );
+    }
+
+    /// 打断（barge-in）端到端：server 模式下 Hub 发 TTS 音频帧（放音）
+    /// 的同时，客户端持续推来的 Opus 帧必须照样到达 Hub——麦克风在
+    /// 放音中保持 live。音频是合成正弦波（非真人语音），只验证
+    /// “放音不断推流”这一层；AEC 消回声与真人唤醒检出需真机验证。
+    #[tokio::test]
+    async fn server_mode_mic_stays_live_during_tts_playback() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::tungstenite::Message;
+
+        const TEST_TOKEN: &str = "test-token-0123456789abcdef";
+        const PUSHED_FRAMES: usize = 6;
+        const PLAYBACK_FRAMES: usize = 3;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Hub 侧按到达顺序记事件：麦克风帧到记 "audio"，TTS 播出记 "play"。
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_hub = events.clone();
+        let packets = sine_opus_packets(PLAYBACK_FRAMES);
+        let hub = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let first = ws.next().await.unwrap().unwrap();
+            assert!(matches!(first, Message::Text(_)));
+            ws.send(Message::Text(
+                serde_json::json!({"type": "hello_ok", "device_id": "e2e-device", "room": "客厅"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            // 2.5s 窗口：一边收客户端推来的帧，一边在 300ms 时发 3 帧 TTS。
+            let start = std::time::Instant::now();
+            let mut playback_sent = false;
+            loop {
+                if start.elapsed() > Duration::from_millis(2500) {
+                    break;
+                }
+                if !playback_sent && start.elapsed() > Duration::from_millis(300) {
+                    for pkt in &packets {
+                        let mut framed = vec![crate::audio::AUDIO_FRAME_TYPE];
+                        framed.extend_from_slice(pkt);
+                        ws.send(Message::Binary(framed.into())).await.unwrap();
+                        events_hub.lock().unwrap().push("play".to_string());
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                    }
+                    playback_sent = true;
+                }
+                match tokio::time::timeout(Duration::from_millis(100), ws.next()).await {
+                    Ok(Some(Ok(Message::Binary(_)))) => {
+                        events_hub.lock().unwrap().push("audio".to_string());
+                    }
+                    Ok(Some(Ok(Message::Text(_)))) => {}
+                    Ok(Some(Ok(Message::Ping(p)))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => break,
+                    Ok(Some(Ok(_))) => {}
+                    Err(_) => {} // 100ms 内无帧：继续循环（等放音时刻/截止）
+                }
+            }
+            let _ = ws.close(None).await;
+        });
+
+        let cfg = config::Config {
+            hub_url: format!("ws://{addr}"),
+            token: TEST_TOKEN.to_string(),
+            tls: false,
+            allow_insecure_ws: false,
+            kws_mode: "server".to_string(),
+            kws_model: "/tmp/no-such-model.onnx".to_string(),
+            kws_model_dir: "/tmp/no-such-kws-models".to_string(),
+            kws_lib: String::new(),
+            ..config::Config::default()
+        };
+        let mut transport = transport::connect_once(&cfg)
+            .await
+            .expect("fake hub connect must pass");
+        let mut session = Session::new_server();
+        let (wake_tx, mut wake_rx) = mpsc::channel::<crate::kws::WakeEvent>(8);
+        let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<u8>>(32);
+        let mut status_tick = tokio::time::interval(transport::STATUS_INTERVAL);
+        let played = Arc::new(Mutex::new(0usize));
+        let last_volume = Arc::new(Mutex::new(None));
+        let stop_calls = Arc::new(Mutex::new(0usize));
+        let mut audio: Option<Audio> = Some(
+            Audio::with_device(Box::new(TestAudioDevice {
+                played_frames: played.clone(),
+                last_volume: last_volume.clone(),
+                stop_calls: stop_calls.clone(),
+            }))
+            .unwrap(),
+        );
+        // 推帧任务：100ms 后开始，每 100ms 推一帧、共 6 帧——
+        // 第 4~6 帧（约 400~600ms）落在 TTS 放音窗口（300ms 起）内。
+        let push_packets = sine_opus_packets(PUSHED_FRAMES);
+        let sender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            for pkt in push_packets {
+                if audio_tx.send(pkt).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(wake_tx);
+        });
+        let pushing = std::sync::atomic::AtomicBool::new(false);
+        let (ref_tx, _ref_rx) = mpsc::channel::<[i16; crate::audio::FRAME_SAMPLES]>(16);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_session(
+                &mut transport,
+                &mut session,
+                &mut wake_rx,
+                &mut audio_rx,
+                &mut status_tick,
+                &mut audio,
+                &pushing,
+                &ref_tx,
+            ),
+        )
+        .await;
+        assert!(result.is_ok(), "session must end when the fake hub closes");
+        sender.abort();
+        hub.abort();
+        let recorded = events.lock().unwrap().clone();
+        let audio_count = recorded.iter().filter(|e| *e == "audio").count();
+        assert_eq!(
+            audio_count, PUSHED_FRAMES,
+            "hub must receive all {PUSHED_FRAMES} mic frames during TTS; got: {recorded:?}"
+        );
+        assert_eq!(
+            *played.lock().unwrap(),
+            PLAYBACK_FRAMES,
+            "client must play all {PLAYBACK_FRAMES} TTS frames; got: {recorded:?}"
+        );
+        // 重叠证明：至少一帧麦克风音频在第一帧 TTS 发出之后才到达 Hub
+        // （放音开始后推流仍在继续，不是放音前推完、放音时停）。
+        let first_play = recorded
+            .iter()
+            .position(|e| e == "play")
+            .expect("hub must send TTS frames");
+        let audio_after_play = recorded.iter().skip(first_play + 1).any(|e| e == "audio");
+        assert!(
+            audio_after_play,
+            "at least one mic frame must arrive after TTS playback starts; got: {recorded:?}"
         );
     }
 

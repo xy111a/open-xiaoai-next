@@ -1275,6 +1275,36 @@ mod tests {
     }
 
     #[test]
+    fn capture_stays_live_while_playing() {
+        // 打断（barge-in）不变量的 Audio 层：同一 Audio 实例上
+        // play_frame 绝不关采集——播一帧之后 capture_frame 仍能
+        // 从队列里取帧、编码。真实部署里采集与播放还是两个独立
+        // 实例（capture-only / playback-only，P0-N1），这里断言的
+        // 是更弱但必要的事实：放音本身不消耗、不关闭采集路。
+        // （Fake 设备无硬件；真机上两路分属 hw:0,0 与 hw:0,2。）
+        let frame = sine_frame(1000.0, 12000);
+        let frames = vec![frame; 3];
+        let mut audio = Audio::with_device(Box::new(FakeAudioDevice::with_frames(frames))).unwrap();
+        // 采一帧 → 播一帧 → 再采一帧 → 再播一帧：采集全程不断。
+        let packet = audio.capture_frame().unwrap();
+        assert!(!packet.is_empty());
+        let played = audio.play_frame(&packet).unwrap();
+        assert_eq!(played.len(), FRAME_SAMPLES);
+        let packet = audio.capture_frame().unwrap();
+        assert!(!packet.is_empty());
+        let played = audio.play_frame(&packet).unwrap();
+        assert_eq!(played.len(), FRAME_SAMPLES);
+        let packet = audio.capture_frame().unwrap();
+        assert!(!packet.is_empty());
+        // 队列已空：第四次采集必须明确报错（不是静默假帧）。
+        let err = audio.capture_frame().unwrap_err();
+        assert!(
+            err.to_string().contains("queue empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn fake_device_capture_empty_queue_is_clear_error() {
         let mut audio = Audio::with_device(Box::new(FakeAudioDevice::with_frames(vec![]))).unwrap();
         let err = audio.capture_frame().unwrap_err();

@@ -43,6 +43,28 @@ import (
 	"github.com/huajun/open-xiaoai-next/hub/internal/wyoming"
 )
 
+// DeviceState 是 Hub 侧的设备语音状态（打断 / barge-in 的状态机）。
+// 只有三个态，转移全部收敛在 hubHandler 的 markSpeaking /
+// clearSpeaking / handleWake / openSession 里，不另起第二台状态机：
+//
+//	Idle：无会话、无播报（states 里没有的设备即 Idle）；
+//	Listening：刚唤醒、正在听（20s 连续对话会话期内）；
+//	Speaking：正在给该设备放 TTS/对讲音频。
+//
+// 转移：Idle → Listening（唤醒）→ Speaking（起播回答）→ Listening
+// （播完且会话还活着）或 Idle（播完且会话已过期）；
+// 打断转移 Speaking → Listening（放音中检出唤醒词，见 handleWake）。
+type DeviceState string
+
+const (
+	// DeviceStateIdle 是无会话、无播报的静默态。
+	DeviceStateIdle DeviceState = "idle"
+	// DeviceStateListening 是唤醒后正在听的态。
+	DeviceStateListening DeviceState = "listening"
+	// DeviceStateSpeaking 是正在放 TTS/对讲音频的态。
+	DeviceStateSpeaking DeviceState = "speaking"
+)
+
 // hubHandler 把 transport 的事件接到语音管线、仲裁、对讲、认领上。
 type hubHandler struct {
 	cfg       *config.Config
@@ -67,9 +89,14 @@ type hubHandler struct {
 	// 连续对话会话：deviceID → 截止时间（唤醒后 20s 内不用再喊唤醒词）。
 	sessions map[string]time.Time
 	sessMu   sync.Mutex
-	// playing 是正在放 TTS 的设备（打断用）；playGen 是每设备的播报
-	// 代际计数（P1-16：旧播放的定时清除不得清除新播放）。
-	playing map[string]bool
+	// 设备语音状态机（DeviceState，打断 / barge-in 用）：states 里没有
+	// 的设备即 Idle。states 与 playGen 都由 playMu 保护（播报与唤醒
+	// 两路都会改）；sessions 由 sessMu 保护——改态时若需同时看会话
+	// （clearSpeaking、onArbitrationResult），先查会话、再改态，
+	// 两把锁从不同时持有，不与 sweepSessions 的顺序撞车。
+	// playGen 是每设备的播报代际计数（P1-16：旧播放的定时清除不得
+	// 清除新播放；打断时也加代，见 handleWake）。
+	states  map[string]DeviceState
 	playGen map[string]uint64
 	playMu  sync.Mutex
 	// playLocks 是每设备的播报串行锁（N-P1-3）：speakText 与 onReply
@@ -94,8 +121,107 @@ func (h *hubHandler) playLock(deviceID string) *sync.Mutex {
 	return mu
 }
 
+// deviceState 取某设备的当前语音态；states 里没有即 Idle。
+func (h *hubHandler) deviceState(deviceID string) DeviceState {
+	h.playMu.Lock()
+	defer h.playMu.Unlock()
+	if s, ok := h.states[deviceID]; ok {
+		return s
+	}
+	return DeviceStateIdle
+}
+
+// setDeviceState 置某设备的语音态（map 懒初始化；转移点只在
+// markSpeaking / clearSpeaking / handleWake / openSession /
+// sweepSessions / onArbitrationResult / OnDisconnect）。
+func (h *hubHandler) setDeviceState(deviceID string, s DeviceState) {
+	h.playMu.Lock()
+	defer h.playMu.Unlock()
+	if h.states == nil {
+		h.states = map[string]DeviceState{}
+	}
+	h.states[deviceID] = s
+}
+
+// hasLiveSession 查某设备是否有未过期的连续对话会话（只持 sessMu）。
+func (h *hubHandler) hasLiveSession(deviceID string) bool {
+	h.sessMu.Lock()
+	defer h.sessMu.Unlock()
+	until, ok := h.sessions[deviceID]
+	return ok && time.Now().Before(until)
+}
+
+// markSpeaking 把设备置为 Speaking 并加一播报代际，返回本代号
+// （playFrames 起播时调；打断转移会再加代，使旧播放的定时清除失效）。
+func (h *hubHandler) markSpeaking(deviceID string) uint64 {
+	h.playMu.Lock()
+	defer h.playMu.Unlock()
+	if h.playGen == nil {
+		h.playGen = map[string]uint64{}
+	}
+	if h.states == nil {
+		h.states = map[string]DeviceState{}
+	}
+	h.playGen[deviceID]++
+	h.states[deviceID] = DeviceStateSpeaking
+	return h.playGen[deviceID]
+}
+
+// clearSpeaking 只在“仍是本代播报且仍在 Speaking”时结算播报态：
+// 会话还活着（20s 连聊期内）回 Listening——用户不用再喊唤醒词就能
+// 接话；会话已过期才回 Idle。旧代定时器（播完后才触发）与打断后的
+// 定时器（handleWake 已加代）到这里都因代号对不上而失效，不会把新
+// 的 Listening 误清。会话先查（只持 sessMu）、再改态（只持 playMu），
+// 两把锁从不同时持有。
+func (h *hubHandler) clearSpeaking(deviceID string, gen uint64) {
+	live := h.hasLiveSession(deviceID)
+	h.playMu.Lock()
+	defer h.playMu.Unlock()
+	if h.playGen[deviceID] != gen {
+		return
+	}
+	if h.states[deviceID] != DeviceStateSpeaking {
+		return
+	}
+	if live {
+		h.states[deviceID] = DeviceStateListening
+		return
+	}
+	h.states[deviceID] = DeviceStateIdle
+}
+
+// handleWake 是唤醒词到达时的状态转移（打断 / barge-in 的核心），
+// 返回值表示调用方是否必须给该设备发“停播”命令（interrupt）：
+//
+//   - Speaking → Listening，返回 true：放音中被唤醒词打断——先停播
+//     再开新一轮听；同时加一播报代际，让旧播放的播完定时器失效，
+//     不让它稍后把新的 Listening 误清回 Idle；
+//   - Idle / Listening → Listening，返回 false：本来就没在放，不发
+//     多余的停播命令（不惊动别的设备，也不重复停本设备）。
+//
+// 只改本设备的态，不碰其他设备（跨设备隔离见 barge_in_test.go）。
+// 仲裁（谁赢、谁进 20s 会话）仍走 OnWake 后面的 Arbiter，与旧行为一致。
+func (h *hubHandler) handleWake(deviceID string) (stopPlayback bool) {
+	h.playMu.Lock()
+	defer h.playMu.Unlock()
+	if h.states == nil {
+		h.states = map[string]DeviceState{}
+	}
+	if h.playGen == nil {
+		h.playGen = map[string]uint64{}
+	}
+	if h.states[deviceID] == DeviceStateSpeaking {
+		// 打断：旧播放作废（代际 +1 使其播完定时器失效），进 Listening。
+		h.playGen[deviceID]++
+		h.states[deviceID] = DeviceStateListening
+		return true
+	}
+	h.states[deviceID] = DeviceStateListening
+	return false
+}
+
 // playFrames 统一播放协议（P1-16）：start_play → 帧 → stop_play，
-// 按帧数×20ms 估算时长维护 playing；空帧列表不发 start_play；
+// 按帧数×20ms 估算时长维护 Speaking；空帧列表不发 start_play；
 // 同设备播报经 playLock 串行化（N-P1-3）。
 func (h *hubHandler) playFrames(deviceID string, frames [][]byte) {
 	if len(frames) == 0 {
@@ -108,22 +234,11 @@ func (h *hubHandler) playFrames(deviceID string, frames [][]byte) {
 	if !ok {
 		return
 	}
-	h.playMu.Lock()
-	if h.playGen == nil {
-		h.playGen = map[string]uint64{}
-	}
-	h.playGen[deviceID]++
-	gen := h.playGen[deviceID]
-	h.playing[deviceID] = true
-	h.playMu.Unlock()
+	gen := h.markSpeaking(deviceID)
 	clearPlaying := func() {
-		h.playMu.Lock()
-		if h.playGen[deviceID] == gen {
-			delete(h.playing, deviceID)
-		}
-		h.playMu.Unlock()
+		h.clearSpeaking(deviceID, gen)
 	}
-	// 按音频时长定时清除 playing（只清本代）。
+	// 按音频时长定时清除 Speaking（只清本代）。
 	dur := time.Duration(len(frames)) * 20 * time.Millisecond
 	time.AfterFunc(dur, clearPlaying)
 	if err := c.SendRPC("play-"+time.Now().Format("150405.000"), "start_play", nil); err != nil {
@@ -157,17 +272,23 @@ func (h *hubHandler) decoderFor(deviceID string) (*opus.Decoder, error) {
 }
 
 func (h *hubHandler) OnWake(deviceID string, w transport.Wake) {
-	// 播放中收到唤醒 = 打断：停播，重新听。
-	h.playMu.Lock()
-	playing := h.playing[deviceID]
-	h.playMu.Unlock()
-	if playing {
+	// 打断后续（决定 6）：新唤醒到达时先取消该设备在途的回答
+	// （STT→Router→TTS 半路，旧答案不再播出）。只取消本设备，
+	// 不碰其他设备；无在途回答时是空操作。pipeline 为 nil 只在
+	// 单测里出现（生产路径恒非 nil）。
+	if h.pipeline != nil {
+		h.pipeline.Cancel(deviceID)
+	}
+	// 打断（barge-in）：放音中收到唤醒 = SPEAKING → LISTENING，
+	// 先停播再开新一轮听。interrupt 在仲裁（250ms 窗口）之前就发——
+	// TTS 必须立刻停，不能等仲裁结果；只停被唤醒的这一台，
+	// 不碰其他设备（handleWake 只改本设备态）。
+	// server 为 nil 只在单测里出现（生产路径 server 恒非 nil），
+	// 此时只改态、不发命令，不 panic。
+	if h.handleWake(deviceID) && h.server != nil {
 		if c, ok := h.server.Conn(deviceID); ok {
 			_ = c.SendInterrupt()
 		}
-		h.playMu.Lock()
-		h.playing[deviceID] = false
-		h.playMu.Unlock()
 	}
 	// P1-38：记下本次唤醒词，供 Router 按唤醒词选 Agent。
 	if h.router != nil {
@@ -393,7 +514,7 @@ func (h *hubHandler) OnDisconnect(deviceID string) {
 		h.otaMgr.MarkRebooted(deviceID)
 	}
 	h.playMu.Lock()
-	delete(h.playing, deviceID)
+	delete(h.states, deviceID)
 	h.playMu.Unlock()
 	// 单设备断开即清理其 KWS 流状态（不断流的连接与队列不残留）。
 	if h.kws != nil {
@@ -402,10 +523,59 @@ func (h *hubHandler) OnDisconnect(deviceID string) {
 }
 
 // openSession 仲裁赢了之后开 20s 连续对话会话。
+// 赢家进会话即 Listening（OnWake 时已置过一次，这里是同一转移的
+// 幂等确认；sessions 懒初始化，单测里裸建 hubHandler 也能调）。
 func (h *hubHandler) openSession(deviceID string) {
 	h.sessMu.Lock()
+	if h.sessions == nil {
+		h.sessions = map[string]time.Time{}
+	}
 	h.sessions[deviceID] = time.Now().Add(20 * time.Second)
 	h.sessMu.Unlock()
+	h.setDeviceState(deviceID, DeviceStateListening)
+}
+
+// onArbitrationResult 是仲裁窗口关闭后的裁决处理（原 main() 里的内联
+// 闭包，抽成方法只为让 barge_in 集成测试能直接调同一条生产路径）：
+// 赢家开会话 + 发 wake_win；赢家已断线时按 RMS 降序试 losers，取第一
+// 个仍在线的补位；其余设备发 wake_lose，并把“还在 Listening、且没有
+// 未过期会话”的输家置回 Idle（本轮没轮到它听，不让它一直占着
+// Listening）。有未过期会话的输家不动——它上一轮赢来的会话还活着，
+// 对话还在继续，置 Idle 会与 sessions 表脱节。
+func (h *hubHandler) onArbitrationResult(winner string, losers []string) {
+	if winner == "" {
+		return
+	}
+	chosen := winner
+	if _, ok := h.server.Conn(winner); !ok {
+		chosen = ""
+		for _, l := range losers {
+			if _, ok := h.server.Conn(l); ok {
+				chosen = l
+				break
+			}
+		}
+		if chosen == "" {
+			log.Printf("仲裁赢家 %s 已断线，输家也都不在线，本轮无人回", winner)
+			return
+		}
+		log.Printf("仲裁赢家 %s 已断线，补位 %s", winner, chosen)
+	}
+	h.openSession(chosen)
+	if c, ok := h.server.Conn(chosen); ok {
+		_ = c.SendJSON(map[string]string{"type": "wake_win"})
+	}
+	for _, id := range append([]string{winner}, losers...) {
+		if id == chosen {
+			continue
+		}
+		if c, ok := h.server.Conn(id); ok {
+			_ = c.SendJSON(map[string]string{"type": "wake_lose"})
+		}
+		if h.deviceState(id) == DeviceStateListening && !h.hasLiveSession(id) {
+			h.setDeviceState(id, DeviceStateIdle)
+		}
+	}
 }
 
 // sweepSessions 清理过期会话（每秒一次）。
@@ -421,12 +591,22 @@ func (h *hubHandler) sweepSessions(done <-chan struct{}) {
 		case <-ticker.C:
 			now := time.Now()
 			h.sessMu.Lock()
+			expired := []string{}
 			for id, until := range h.sessions {
 				if now.After(until) {
 					delete(h.sessions, id)
+					expired = append(expired, id)
 				}
 			}
 			h.sessMu.Unlock()
+			// 会话过期：还在 Listening 的设备回 Idle（Speaking 的不碰——
+			// 播报有自己的播完定时器管，不由会话清扫越权改态；
+			// clearSpeaking 播完时也会按会话死活再定一次）。
+			for _, id := range expired {
+				if h.deviceState(id) == DeviceStateListening {
+					h.setDeviceState(id, DeviceStateIdle)
+				}
+			}
 		}
 	}
 }
@@ -580,7 +760,7 @@ func main() {
 		decoders: map[string]*opus.Decoder{},
 		otaMgr:   otaMgr, reminders: remStore,
 		sessions: map[string]time.Time{},
-		playing:  map[string]bool{},
+		states:   map[string]DeviceState{},
 		playGen:  map[string]uint64{},
 		latency:  latencyRec,
 	}
@@ -760,7 +940,7 @@ func main() {
 
 	// Pipeline 的 onReply：把回答的 Opus 帧发给对应设备播放
 	//（P1-16/N-P1-3：统一走 playFrames——start_play → 帧 → stop_play，
-	// 按时长维护 playing，同设备播报串行化）。
+	// 按时长维护 Speaking，同设备播报串行化）。
 	h.pipeline = voice.New(stt, tts, rt, cfg.Hub.TTSVoice, func(deviceID string, frames [][]byte) {
 		h.playFrames(deviceID, frames)
 	})
@@ -870,41 +1050,10 @@ func main() {
 		h.playFrames(deviceID, frames)
 	}
 
-	// 仲裁：窗口关闭后，赢家开会话 + 发 wake_win，输家发 wake_lose。
-	// P1-13：赢家失败补位——赢家已断线时按 RMS 降序试 losers，
-	// 取第一个仍在线的当赢家；都掉线则本轮无人回。
-	h.arbiter = arbitration.New(arbitration.Window, func(winner string, losers []string) {
-		if winner == "" {
-			return
-		}
-		chosen := winner
-		if _, ok := server.Conn(winner); !ok {
-			chosen = ""
-			for _, l := range losers {
-				if _, ok := server.Conn(l); ok {
-					chosen = l
-					break
-				}
-			}
-			if chosen == "" {
-				log.Printf("仲裁赢家 %s 已断线，输家也都不在线，本轮无人回", winner)
-				return
-			}
-			log.Printf("仲裁赢家 %s 已断线，补位 %s", winner, chosen)
-		}
-		h.openSession(chosen)
-		if c, ok := server.Conn(chosen); ok {
-			_ = c.SendJSON(map[string]string{"type": "wake_win"})
-		}
-		for _, id := range append([]string{winner}, losers...) {
-			if id == chosen {
-				continue
-			}
-			if c, ok := server.Conn(id); ok {
-				_ = c.SendJSON(map[string]string{"type": "wake_lose"})
-			}
-		}
-	})
+	// 仲裁：窗口关闭后走 h.onArbitrationResult——赢家开会话 + 发
+	// wake_win，输家发 wake_lose（P1-13：赢家已断线时按 RMS 降序试
+	// losers 补位；都掉线则本轮无人回；无会话的输家回 Idle）。
+	h.arbiter = arbitration.New(arbitration.Window, h.onArbitrationResult)
 	go h.sweepSessions(done)
 
 	// P1-9/P1-15：每 10s 扫一次——OTA 超时任务标失败（pushing 超 10 分钟

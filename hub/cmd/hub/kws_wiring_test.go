@@ -241,7 +241,7 @@ func newKWSHarness(t *testing.T, sidecarURL string) *kwsHarness {
 		decoders: map[string]*opus.Decoder{},
 		intercom: intercom.New(func(deviceID string, opusFrame []byte) error { return fmt.Errorf("not online") }),
 		sessions: map[string]time.Time{},
-		playing:  map[string]bool{},
+		states:   map[string]DeviceState{},
 		pipeline: pipeline,
 	}
 	handler.arbiter = arbitration.New(arbitration.Window, func(winner string, losers []string) {
