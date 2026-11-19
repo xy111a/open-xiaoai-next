@@ -214,7 +214,7 @@ func TestIndexRendersSystemPage(t *testing.T) {
 	for _, want := range []string{
 		"系统健康", "语音延迟", "最近交互",
 		"/api/health", "/api/latency", "/api/status", "/api/devices",
-		"width=device-width", "tablewrap", "oxn-web-token",
+		"width=device-width", "tablewrap", "oxn_token",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("首页应含 %q，实际缺失", want)
