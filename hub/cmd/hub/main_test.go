@@ -57,7 +57,8 @@ func checkTimeouts(t *testing.T, srv *http.Server) {
 
 // TestShippedConfigRegistrationDefaults：随仓库发的 config.yaml 默认
 // 走注册制（P1-44）：不自动扫描，指纹白名单默认空（注册一律拒绝，
-// fail closed），且 Web 面板绑回环地址（只验 host 是回环，不断言端口）。
+// fail closed），且 Web 面板绑回环或明确内网 IP（2026-11-19 bai 定局域网
+// 直开；只验 host，不断言端口）。
 func TestShippedConfigRegistrationDefaults(t *testing.T) {
 	cfg, err := config.Load("../../config.yaml")
 	if err != nil {
@@ -73,7 +74,7 @@ func TestShippedConfigRegistrationDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WebListen 不是合法 host:port：%q: %v", cfg.Hub.WebListen, err)
 	}
-	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
-		t.Fatalf("WebListen 应绑回环地址，实际是 %q", cfg.Hub.WebListen)
+	if ip := net.ParseIP(host); ip == nil || (!ip.IsLoopback() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast()) {
+		t.Fatalf("WebListen 应绑回环或明确内网 IP，实际是 %q", cfg.Hub.WebListen)
 	}
 }

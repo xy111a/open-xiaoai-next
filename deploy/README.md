@@ -163,13 +163,12 @@ TLS 证书与网易云 Cookie 随 `hub-data` 卷一起备份（manifest 里单�
 
 **在 Hub Web 面板里扫码**：
 
-1. 电脑上建 SSH 隧道：`ssh -L 8081:127.0.0.1:8081 huajun@NAS_IP`（保持该终端不退出）。
-   面板只绑回环（`hub/config.yaml` 里 `web_listen: 127.0.0.1:8081`），浏览器不能直连 `NAS_IP:8081`。
-2. 浏览器开 `http://127.0.0.1:8081`，进 Hub Web 面板 → **网易云登录**页。
+1. 浏览器直接开 `http://192.168.88.247:8081`，进 Hub Web 面板 → **网易云登录**页。
+   面板绑 NAS 内网 IP（`hub/config.yaml` 里 `web_listen: 192.168.88.247:8081`，2026-11-19 bai 定局域网直开），局域网内任何设备都能开，不用建 SSH 隧道。
    要输 Web Token 时用 `deploy/.env` 里的 `OPEN_XIAOAI_WEB_TOKEN`（不要把 Token 发给别人或贴进群聊）。
-3. 点**生成二维码**（调 `POST /api/netease/login/qr`），页面显示二维码。
-4. 手机打开**网易云音乐 App**扫这个二维码，App 内点确认登录。
-5. 面板状态变**已登录**（后台轮询 `GET /api/netease/login/qr/check?key=K` 的结果；
+2. 点**生成二维码**（调 `POST /api/netease/login/qr`），页面显示二维码。
+3. 手机打开**网易云音乐 App**扫这个二维码，App 内点确认登录。
+4. 面板状态变**已登录**（后台轮询 `GET /api/netease/login/qr/check?key=K` 的结果；
    可再调 `GET /api/netease/status` 核对，见 `NAS_CHECKLIST.md` §3）。
 
 底层原理（不用手工操作，了解即可）：Hub 点生成二维码后，后台调 NeteaseCloudMusicApi
@@ -186,8 +185,8 @@ API 也自带一个演示页 `public/qrlogin.html`，但本部署的标准路径
 - **NeteaseCloudMusicApi 容器本身不保存登录态**：它是无状态转发，重启容器不丢登录，
   但 `hub-data` 卷丢了就要重扫。
 - 验证登录态：面板里看状态为已登录，或
-  `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env | cut -d= -f2-); curl -s -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8081/api/netease/status`
-  返回 `logged_in:true`（在 NAS 上跑，或走 SSH 隧道）。
+  `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env | cut -d= -f2-); curl -s -H "Authorization: Bearer $WEB_TOKEN" http://192.168.88.247:8081/api/netease/status`
+  返回 `logged_in:true`（在 NAS 上跑，或局域网内任何设备上跑）。
 
 ### Cookie 过期与重登
 

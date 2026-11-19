@@ -295,10 +295,12 @@ sleep 15   # 等 Whisper 首次加载模型、Hub 启动
 # 传进去；token 在 NAS 端从已传过去的 deploy/.env 里读（与
 # NAS_CHECKLIST.md §3 的写法一致）。本机只收到响应体 + HTTP 码，不
 # 打印 token、不把 token 写进日志。
+# 2026-11-19：面板改绑 NAS 内网 IP，健康检查改调 192.168.88.247:8081
+#（此前 127.0.0.1:8081 已不监听）。
 remote_curl_api() { # $1=API 路径，如 /api/status
   $SSH "bash -s -- $NAS_DIR $1" <<'REMOTE_EOF'
 tok="$(grep -E '^OPEN_XIAOAI_WEB_TOKEN=' "$1/deploy/.env" | cut -d= -f2-)"
-curl -s -m 5 -w ' %{http_code}' -H "Authorization: Bearer $tok" "http://127.0.0.1:8081$2"
+curl -s -m 5 -w ' %{http_code}' -H "Authorization: Bearer $tok" "http://192.168.88.247:8081$2"
 REMOTE_EOF
 }
 
