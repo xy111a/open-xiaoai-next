@@ -416,6 +416,9 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	//    Hub 回来。唤醒词不支持热修改，重启是必须的（bai 接受）。
 	//  - 排版：粘性顶栏（标题+总状态）；主网格用 auto-fit/minmax 自适应，
 	//    任意缩放都不挤压（窄屏自动单栏）；表格横向滚动；body 禁横向溢出。
+	//    min 里包一层 min(360px,100%) / min(240px,100%)：视口窄于
+	//    360px（小屏手机）时卡片仍能缩到 100% 宽，不会被最小宽顶出
+	//    屏（之前 360px 硬下限在 375px 以下手机上会右切 17~32px）。
 	//    表单字段用 .form-grid（auto-fit/minmax(240px,1fr)），每栏至少
 	//    240px 宽——之前 .row + .field{flex:1;min-width:150px} 把 7 个
 	//    配置项压成 6 窄 + 1 宽，URL 输入框尤其挤。
@@ -434,7 +437,7 @@ body{font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-se
 .pill.off{background:var(--bad-bg);color:var(--bad)}
 .pill.warn{background:var(--warn-bg);color:var(--warn)}
 .pill.grey{background:#f2f4f7;color:var(--muted)}
-main{max-width:1080px;margin:0 auto;padding:18px 16px 0;display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px}
+main{max-width:1080px;margin:0 auto;padding:18px 16px 0;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(360px,100%),1fr));gap:16px}
 .span2{grid-column:1 / -1}
 .tablewrap{overflow-x:auto}
 .card{min-width:0}
@@ -443,7 +446,7 @@ main{max-width:1080px;margin:0 auto;padding:18px 16px 0;display:grid;grid-templa
 .card h2::before{content:"";width:4px;height:18px;border-radius:2px;background:var(--accent)}
 .card .desc{color:var(--muted);font-size:13px;margin:0 0 14px}
 .row{display:flex;gap:10px;flex-wrap:wrap}
-.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-bottom:12px}
+.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:12px;margin-bottom:12px}
 .form-grid .field{margin-bottom:0;min-width:0}
 .stat{flex:1;min-width:110px;background:#f9fafb;border:1px solid var(--line);border-radius:10px;padding:12px 14px}
 .stat .k{font-size:13px;color:var(--muted)}
