@@ -9,6 +9,11 @@
 // 连续对话（Phase 3）：唤醒一次连聊 20s；说话中喊唤醒词可打断；
 //
 //	打断走 OwnDing 的子带 AEC 思路（播放时采回音抵消），目标打断成功率 ≥90%。
+//
+// 打断的状态机在 cmd/hub/main.go 的 DeviceState：放音中（Speaking）
+// 检出唤醒词 → Hub 发 interrupt 停播 → 设备进 Listening 开新一轮听；
+// 本管线只负责回答的合成与 onReply 播报，不参与打断判决。
+// AEC 消回声本身仍是真机验证项（见打断任务的硬件验证清单）。
 package voice
 
 import (

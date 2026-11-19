@@ -68,7 +68,7 @@ func TestOnWakeDedupAndWakeWord(t *testing.T) {
 		decoders: map[string]*opus.Decoder{},
 		intercom: intercom.New(nil),
 		sessions: map[string]time.Time{},
-		playing:  map[string]bool{},
+		states:   map[string]DeviceState{},
 		playGen:  map[string]uint64{},
 		router:   rt,
 	}
@@ -126,7 +126,7 @@ func startPlayServer(t *testing.T) (*hubHandler, *websocket.Conn, string) {
 		decoders: map[string]*opus.Decoder{},
 		intercom: intercom.New(nil),
 		sessions: map[string]time.Time{},
-		playing:  map[string]bool{},
+		states:   map[string]DeviceState{},
 		playGen:  map[string]uint64{},
 	}
 	server := transport.New("test-token-1234567890", reg, stubTransportHandler{})
@@ -164,13 +164,10 @@ func TestPlayFramesStartStop(t *testing.T) {
 	h, c, deviceID := startPlayServer(t)
 	frames := [][]byte{{0x01, 0x02}, {0x03, 0x04}, {0x05}}
 	h.playFrames(deviceID, frames)
-	// playing 在播报时长内应为 true（3 帧 = 60ms）。
-	h.playMu.Lock()
-	if !h.playing[deviceID] {
-		h.playMu.Unlock()
-		t.Fatal("播报期间 playing 应为 true")
+	// 播报期间应为 Speaking（3 帧 = 60ms）。
+	if got := h.deviceState(deviceID); got != DeviceStateSpeaking {
+		t.Fatalf("播报期间应为 Speaking，实际 %q", got)
 	}
-	h.playMu.Unlock()
 	// 客户端应收到 start_play → 3 帧二进制 → stop_play。
 	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
 	readRPC := func() map[string]any {
@@ -208,14 +205,11 @@ func TestPlayFramesStartStop(t *testing.T) {
 	if m["type"] != "rpc" || m["method"] != "stop_play" {
 		t.Fatalf("最后一条应为 stop_play RPC，实际 %v", m)
 	}
-	// 60ms 播放时长过后 playing 应清除。
+	// 60ms 播放时长过后应回 Idle（本测试无会话）。
 	time.Sleep(200 * time.Millisecond)
-	h.playMu.Lock()
-	if h.playing[deviceID] {
-		h.playMu.Unlock()
-		t.Fatal("播放时长过后 playing 应清除")
+	if got := h.deviceState(deviceID); got != DeviceStateIdle {
+		t.Fatalf("播放时长过后应回 Idle，实际 %q", got)
 	}
-	h.playMu.Unlock()
 	// 空帧列表：什么都不发。
 	h.playFrames(deviceID, nil)
 	_ = c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
@@ -284,7 +278,7 @@ func TestOnDisconnectCleansUp(t *testing.T) {
 		intercom: intercom.New(func(deviceID string, opusFrame []byte) error { return fmt.Errorf("not online") }),
 		otaMgr:   otaMgr,
 		sessions: map[string]time.Time{},
-		playing:  map[string]bool{},
+		states:   map[string]DeviceState{},
 		playGen:  map[string]uint64{},
 		pipeline: pipeline,
 	}
