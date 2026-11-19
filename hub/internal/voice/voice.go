@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/huajun/open-xiaoai-next/hub/internal/observability"
 	"github.com/huajun/open-xiaoai-next/hub/internal/opus"
 )
 
@@ -76,6 +77,13 @@ type Pipeline struct {
 	// sem 是 answer 的总并发上限（P1-2）：满了直接报“繁忙”，不排队阻塞
 	// transport 读循环。
 	sem chan struct{}
+
+	// Latency 是可选的分段延迟记录器（可观测性）：main 注入
+	// observability.Recorder；为 nil 时不记录，不影响管线。
+	// answer 入口 Begin 一条 voice 交互（消费 main 经 NoteWake 记下的
+	// KWS 延迟），STT/TTS 各记一段；LLM 与点歌由 Router 在 Route 里
+	// 经 RecordStageForDevice/RecordMusic 写进同一条交互。
+	Latency *observability.Recorder
 }
 
 // answerTimeout 是单次回答的总超时（P1-29）：STT→Router→TTS→编码全程
@@ -242,7 +250,13 @@ func (p *Pipeline) answer(ctx context.Context, deviceID string, pcm []int16) (er
 	for _, v := range pcm {
 		pcmBytes = append(pcmBytes, byte(v), byte(v>>8))
 	}
+	// 可观测性：本句问答开始记延迟；STT/TTS 各记一段，
+	// 失败也 Finish（ok=false），不在半路丢记录。
+	inter := p.Latency.Begin(deviceID, "voice")
+	defer func() { p.Latency.Finish(inter, err) }()
+	sttStart := time.Now()
 	text, err := p.stt.Transcribe(pcmBytes, "zh")
+	p.Latency.RecordStage(inter, observability.StageSTT, time.Since(sttStart))
 	if err != nil {
 		return err
 	}
@@ -259,7 +273,9 @@ func (p *Pipeline) answer(ctx context.Context, deviceID string, pcm []int16) (er
 	if reply == "" {
 		return nil
 	}
+	ttsStart := time.Now()
 	audio, err := p.tts.Synthesize(reply, p.voice)
+	p.Latency.RecordStage(inter, observability.StageTTS, time.Since(ttsStart))
 	if err != nil {
 		return err
 	}

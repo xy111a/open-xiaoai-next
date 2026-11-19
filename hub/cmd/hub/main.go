@@ -29,6 +29,7 @@ import (
 	"github.com/huajun/open-xiaoai-next/hub/internal/intercom"
 	"github.com/huajun/open-xiaoai-next/hub/internal/kws"
 	"github.com/huajun/open-xiaoai-next/hub/internal/music"
+	"github.com/huajun/open-xiaoai-next/hub/internal/observability"
 	"github.com/huajun/open-xiaoai-next/hub/internal/opus"
 	"github.com/huajun/open-xiaoai-next/hub/internal/ota"
 	"github.com/huajun/open-xiaoai-next/hub/internal/registry"
@@ -57,6 +58,10 @@ type hubHandler struct {
 	otaMgr    *ota.Manager
 	reminders *reminders.Store
 	kws       *kws.Client // 服务端 KWS 边车客户端；nil 表示 KWS 未启用
+
+	// latency 是分段延迟记录器（可观测性）：语音管线与 Router 共用，
+	// Web 面板 /api/latency 读它。由 main 建好后分发给各处。
+	latency *observability.Recorder
 
 	// 连续对话会话：deviceID → 截止时间（唤醒后 20s 内不用再喊唤醒词）。
 	sessions map[string]time.Time
@@ -272,6 +277,9 @@ func (h *hubHandler) OnKWSWake(ev kws.WakeEvent) {
 	if ev.TimestampMs > 0 {
 		if lag := time.Now().UnixMilli() - ev.TimestampMs; lag >= 0 && lag < 60000 {
 			log.Printf("kws: 设备 %s 唤醒 %q（边车上报延迟约 %dms）", ev.DeviceID, ev.Keyword, lag)
+			// 可观测性：把这次唤醒的边车延迟暂存给延迟记录器，
+			// 同设备下一次语音问答 Begin 时消费为 kws_ms。
+			h.latency.NoteWake(ev.DeviceID, lag)
 		}
 	}
 	h.OnWake(ev.DeviceID, transport.Wake{WakeWord: ev.Keyword, RMSdB: rmsdB, TsMs: ev.TimestampMs})
@@ -558,6 +566,11 @@ func main() {
 	// 对讲与 OTA。
 	otaMgr := ota.New()
 
+	// 可观测性：分段延迟记录器（最近 20 次交互），main 建一份，
+	// 分给 hubHandler（记 KWS 唤醒延迟）、语音管线与 Router
+	// （记 STT/LLM/TTS/点歌）、Web 面板（/api/latency 读）。
+	latencyRec := observability.NewRecorder(observability.DefaultCapacity)
+
 	// Handler 与 Server 先建（Pipeline 的 onReply 需要 server 引用，用闭包晚绑定）。
 	// cfgMu 是 Web PUT 与房间认领共用的配置锁（P1-22），建好后传给两边。
 	cfgMu := &sync.Mutex{}
@@ -568,6 +581,7 @@ func main() {
 		sessions: map[string]time.Time{},
 		playing:  map[string]bool{},
 		playGen:  map[string]uint64{},
+		latency:  latencyRec,
 	}
 	server := transport.New(token, reg, h)
 	h.server = server
@@ -653,6 +667,8 @@ func main() {
 	}, cfg.HAEntities)
 	// P1-38：OnWake 在 hubHandler 里记唤醒词，供 Router 选 Agent。
 	h.router = rt
+	// 可观测性：Router 记 LLM 对话耗时（llm_ms）与点歌耗时（music_ms）。
+	rt.Latency = latencyRec
 
 	// P1-27 看门狗：每 30s 探活下游，断线重连并热更新到 Router，
 	// 不再需要重启 Hub；接管原有的 MPD/Snap 启动重试 goroutine。
@@ -740,6 +756,8 @@ func main() {
 	h.pipeline = voice.New(stt, tts, rt, cfg.Hub.TTSVoice, func(deviceID string, frames [][]byte) {
 		h.playFrames(deviceID, frames)
 	})
+	// 可观测性：语音管线记 KWS/STT/TTS 分段耗时（见 voice.Pipeline.Latency）。
+	h.pipeline.Latency = latencyRec
 	// 提醒到点：KindAction 是定时动作（走 Route 执行命令），其余是播报。
 	remStore.SetOnFire(func(r reminders.Reminder) {
 		if r.Kind == reminders.KindAction {
@@ -998,6 +1016,16 @@ func main() {
 	webServer.Music = rt
 	webServer.Netease = netease
 	webServer.NeteaseAuth = neteaseAuth
+	// 可观测性：/api/latency 读延迟记录器；/api/health 用下面的
+	// Checker 对 7 个容器做协议级探活（地址全取自 config.yaml
+	// 已有字段，不新增配置项）。
+	webServer.Latency = latencyRec
+	webServer.Health = observability.NewChecker(observability.DefaultServices(observability.HealthAddrs{
+		STT: cfg.Hub.STT, TTS: cfg.Hub.TTS,
+		KWSWSURL: cfg.KWS.URL, KWSEnabled: cfg.KWS.Enabled,
+		Snapcast: cfg.Hub.Snapcast, MPD: cfg.Hub.MPD,
+		NeteaseAPI: cfg.Netease.API,
+	}), observability.DefaultHealthTimeout)
 	webServer.PushOTA = func(deviceID, version, url, sha256 string) error {
 		c, ok := server.Conn(deviceID)
 		if !ok {
