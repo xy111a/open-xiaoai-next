@@ -5,6 +5,8 @@
 //     可语音“取消呼叫”撤销；60s 无人取消则自动清理（待确认窗口）；
 //     同一设备重复触发不重复 Notify（不同设备各自独立）。
 //  2. 对讲（P1-15）：“呼叫卧室”“全屋广播” → 触发 intercom 会话；
+//     留言式对讲：“叫一下客厅，吃饭了” → TTS 后播到目标房间
+//     （见 intercom_message.go；未知房间/同房间时在发起方明说）；
 //     房间认领（P1-39）：“我在客厅” → 记房间；“我在这里” → 确认当前房间。
 //  3. 提醒（FR-14）：“每天 8 点提醒我吃药”“每 30 分钟提醒我喝水”“2 小时后提醒我关灯”“取消吃药提醒”
 //  4. 场景/记忆（FR-09）：“记住空调 26 度”“我回来了”（跑 HA 场景）；“你还记得什么”读记忆
@@ -70,6 +72,18 @@ type Deps struct {
 	Intercom IntercomStarter
 	// DeviceByRoom 按房间名找在线设备 ID（P1-15 呼叫目标解析用）。
 	DeviceByRoom func(room string) (deviceID string, ok bool)
+	// DevicesByRoom 按房间名找全部在线设备 ID（留言式对讲用：
+	// 目标房间多台设备时全部播报，与提醒的 P2-27 同款）。
+	DevicesByRoom func(room string) []string
+	// KnownRooms 是 Hub 已知的房间名（注册表里出现过的房间）：
+	// 留言式对讲无分隔符时按它切分房间与消息、区分“已知但离线”
+	// 与“未知房间”两种报错。为 nil 时当作没有已知房间。
+	KnownRooms func() []string
+	// Speak 把一段文本 TTS 后播到指定设备（留言式对讲用）：
+	// 生产由 main.go 接 h.speakText（经 playFrames 走统一播放协议
+	// start_play → Opus 帧 → stop_play）；为 nil 时留言式对讲分支
+	// 认领命令但明说播报未配置。
+	Speak func(deviceID, text string)
 	// RoomClaim 是语音房间认领回调（P1-39）：“我在客厅”由此写注册表；
 	// 为 nil 时认领分支不生效。
 	RoomClaim func(deviceID, room string)
@@ -312,6 +326,9 @@ func (r *Router) Route(ctx context.Context, deviceID, text string) (string, erro
 		return "", nil
 	}
 	if reply, done := r.emergency(ctx, deviceID, text); done {
+		return reply, nil
+	}
+	if reply, done := r.intercomMessage(ctx, deviceID, text); done {
 		return reply, nil
 	}
 	if reply, done := r.intercomCall(ctx, deviceID, text); done {
