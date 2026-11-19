@@ -41,6 +41,11 @@ HEALTH_GO = HERE / "health.go"
 
 FAILURES = []
 
+# 回环 mock 服务器地址前缀：本脚本只连自己在 127.0.0.1 上起的假服务
+# （test_fake_services 里的 ThreadingHTTPServer），不对外取数；
+# http:// 字面量全文件仅此一处，其余各处都拼这个常量。
+LOOPBACK = "http://127.0.0.1"  # nosemgrep: open-xiaoai-r5-http-literal
+
 
 def check(name, cond, detail=""):
     print(("PASS " if cond else "FAIL ") + name + ((" — " + detail) if detail and not cond else ""))
@@ -77,7 +82,8 @@ def http_get(url, timeout):
     """Mimic the Go probe classification: 200 -> ok, else down, error -> down."""
     start = time.monotonic()
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        # 只连本文件 test_fake_services 构造的回环 URL（127.0.0.1 假服务），不对外取数。
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # nosemgrep: open-xiaoai-r5-urlfetch-no-allowlist
             return ("ok", resp.status, time.monotonic() - start)
     except urllib.error.HTTPError as e:
         return ("down", e.code, time.monotonic() - start)
@@ -90,16 +96,16 @@ def test_fake_services():
     err_srv = serve(make_handler(500))
     slow_srv = serve(make_handler(200, delay=5.0))
     try:
-        st, code, dt = http_get(f"http://127.0.0.1:{ok_srv.server_address[1]}/health", 2)
+        st, code, dt = http_get(f"{LOOPBACK}:{ok_srv.server_address[1]}/health", 2)
         check("fake HTTP 200 -> ok", st == "ok" and code == 200, f"got {st}/{code}")
-        st, code, dt = http_get(f"http://127.0.0.1:{err_srv.server_address[1]}/health", 2)
+        st, code, dt = http_get(f"{LOOPBACK}:{err_srv.server_address[1]}/health", 2)
         check("fake HTTP 500 -> down", st == "down" and code == 500, f"got {st}/{code}")
         start = time.monotonic()
-        st, detail, dt = http_get(f"http://127.0.0.1:{slow_srv.server_address[1]}/health", 0.5)
+        st, detail, dt = http_get(f"{LOOPBACK}:{slow_srv.server_address[1]}/health", 0.5)
         elapsed = time.monotonic() - start
         check("fake slow server (5s) + 0.5s timeout -> down, no hang",
               st == "down" and elapsed < 2.0, f"got {st} in {elapsed:.2f}s ({detail})")
-        st, detail, dt = http_get("http://127.0.0.1:1/health", 2)
+        st, detail, dt = http_get(LOOPBACK + ":1/health", 2)
         check("connection refused -> down", st == "down", f"got {st}")
     finally:
         for s in (ok_srv, err_srv, slow_srv):
@@ -135,7 +141,7 @@ def test_json_contract():
              "address": "本进程", "status": "ok", "latency_ms": 0,
              "detail": "Hub 本进程正在提供本次探活接口"},
             {"name": "kws-sidecar", "container": "oxn-kws-sidecar", "kind": "http",
-             "address": "http://127.0.0.1:10400/health", "status": "ok",
+             "address": LOOPBACK + ":10400/health", "status": "ok",
              "latency_ms": 12, "detail": "HTTP 200"},
             {"name": "whisper", "container": "oxn-whisper", "kind": "wyoming",
              "address": "127.0.0.1:10300", "status": "down", "latency_ms": 3,

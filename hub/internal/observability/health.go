@@ -140,7 +140,10 @@ func KWSHealthURL(wsURL string) string {
 	httpURL := wsURL
 	switch {
 	case strings.HasPrefix(httpURL, "ws://"):
-		httpURL = "http://" + strings.TrimPrefix(httpURL, "ws://")
+		// ws:// → http:// 只是回环 KWS 边车地址的协议换算：输入只来自
+		// config 的 kws.url（固定是 127.0.0.1 边车 ws 地址），换算出的
+		// http 地址只用于本地 /health 探活，不对外取数。
+		httpURL = "http://" + strings.TrimPrefix(httpURL, "ws://") // nosemgrep: open-xiaoai-r5-http-literal
 	case strings.HasPrefix(httpURL, "wss://"):
 		httpURL = "https://" + strings.TrimPrefix(httpURL, "wss://")
 	default:
@@ -265,7 +268,16 @@ func (c *Checker) probe(ctx context.Context, svc Service) (string, error) {
 func (c *Checker) probeHTTP(ctx context.Context, svc Service) (string, error) {
 	client := c.HTTPClient
 	if client == nil {
-		client = &http.Client{}
+		// 默认客户端的超时取 Checker.Timeout（<=0 时用
+		// DefaultHealthTimeout 3s），与 Checker 注释“为 nil 时用默认
+		// （超时=Timeout）”一致；之前这里是裸 &http.Client{}（无超时），
+		// 代码与注释自相矛盾，且规则 3 要求客户端本身设 Timeout。
+		// （单次请求另有 ctx 超时兜底，这里是把承诺落到客户端上。）
+		timeout := c.Timeout
+		if timeout <= 0 {
+			timeout = DefaultHealthTimeout
+		}
+		client = &http.Client{Timeout: timeout}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, svc.Address, nil)
 	if err != nil {

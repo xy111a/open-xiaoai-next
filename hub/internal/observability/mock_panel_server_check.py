@@ -76,7 +76,8 @@ class H(BaseHTTPRequestHandler):
 def main():
     srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    # 只连本文件刚起的回环 mock 服务器，不对外取数。
+    base = f"http://127.0.0.1:{srv.server_address[1]}"  # nosemgrep: open-xiaoai-r5-http-literal
     fails = []
 
     def check(name, cond, detail=""):
@@ -85,7 +86,8 @@ def main():
             fails.append(name)
 
     def get(path):
-        with urllib.request.urlopen(base + path, timeout=5) as r:
+        # 只取上面 base 拼出的回环 mock URL，不对外取数。
+        with urllib.request.urlopen(base + path, timeout=5) as r:  # nosemgrep: open-xiaoai-r5-urlfetch-no-allowlist
             return r.status, r.headers.get("Content-Type", ""), r.read().decode()
 
     try:

@@ -24,6 +24,13 @@ const maxReplyBody = 64 << 10
 // defaultTimeout 是没配 timeout_seconds 时的调用超时。
 const defaultTimeout = 10 * time.Second
 
+// maxClientTimeout 是共享 HTTP 客户端的安全上限：config.Validate 允许
+// 单个技能配 timeout_seconds 到 120s（见 config/config.go），客户端
+// 超时必须不小于它，否则会截断合法调用；单次调用的主约束仍是
+// Call 里的 context.WithTimeout（s.timeout()），客户端超时只是
+// 防止连接挂住无上限的兜底。
+const maxClientTimeout = 12 * defaultTimeout // 120s = timeout_seconds 上限
+
 // Skill 是一个技能插件的配置（与 config.Skill 同源，main.go 做转换）。
 type Skill struct {
 	// Name 是技能名，全局唯一，例如 "news"。
@@ -52,7 +59,7 @@ type Registry struct {
 
 // New 新建技能表（skills 为空时 Match 恒返回 nil，Router 直接走 Agent）。
 func New(skills []Skill) *Registry {
-	return &Registry{skills: skills, http: &http.Client{}}
+	return &Registry{skills: skills, http: &http.Client{Timeout: maxClientTimeout}}
 }
 
 // Skills 返回已注册的技能名（Web /api/status 之类展示用，

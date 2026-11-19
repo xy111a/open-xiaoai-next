@@ -147,6 +147,13 @@ func ProbeSTT(addr string, timeout time.Duration) ProbeResult {
 	if err != nil {
 		return r
 	}
+	// probeDial 在 err==nil 时必返回非 nil 的 c（所有返回 nil c 的
+	// 路径都带非 nil err）；此处仍显式守卫，满足 lint 规则 2
+	// （同一函数内 Transcribe 的接收者须有 ==nil/!=nil 检查）。
+	if c == nil {
+		r.Checks = append(r.Checks, probeCheck("dial", false, "探针客户端为空"))
+		return r
+	}
 	defer c.Close()
 	silence := make([]byte, 16000) // 0.5 秒 16kHz 单声道 PCM，全零
 	text, err := c.Transcribe(silence, "zh")
@@ -171,6 +178,13 @@ func ProbeTTS(addr string, timeout time.Duration) ProbeResult {
 	r.Checks = checks
 	r.Info = info
 	if err != nil {
+		return r
+	}
+	// 同 ProbeSTT：probeDial 在 err==nil 时必返回非 nil 的 c，
+	// 此处仍显式守卫，满足 lint 规则 2（Synthesize 的接收者须有
+	// 同一函数内 ==nil/!=nil 检查）。
+	if c == nil {
+		r.Checks = append(r.Checks, probeCheck("dial", false, "探针客户端为空"))
 		return r
 	}
 	defer c.Close()

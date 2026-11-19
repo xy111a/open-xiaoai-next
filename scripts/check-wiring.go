@@ -69,7 +69,7 @@ var table = []entry{
 	{"registry.New", `registry\.New\s*\(`, "", `registry\.New\s*\(`, `New\s*\(`, "internal/registry", "设备注册表接线"},
 	{"ha.Dial", `ha\.Dial\s*\(`, "", `Dial\s*\(`, `Dial\s*\(`, "internal/ha", "HA 连接"},
 	{"wyoming.NewDialer (STT/TTS 懒拨号)", `wyoming\.NewDialer\s*\(`, "", `NewDialer\s*\(`, `NewDialer\s*\(`, "internal/wyoming", "AUDIT P1-2/P1-27：STT/TTS 懒拨号接线（旧 wyoming.Dial 已随 P1-27 改为 NewDialer）"},
-	{"agent.New", `agent\.New\s*\(`, "", `agent\.New\s*\(`, `New\s*\(`, "internal/agent", "Agent 客户端"},
+	{"agent.New", `agent\.New(Full)?\s*\(`, "", `agent\.New\s*\(`, `New\s*\(`, "internal/agent", "Agent 客户端（插件分支改用 agent.NewFull 创建，仍是同一接线）"},
 	{"music.NewNetease", `music\.NewNetease\s*\(`, "", `NewNetease\s*\(`, `NewNetease\s*\(`, "internal/music", "网易云客户端"},
 	{"DialSnap 调用 (Snapcast)", `DialSnap\s*\(`, "internal/music", `DialSnap\s*\(`, `DialSnap\s*\(`, "internal/music", "AUDIT P1-1/P1-26：Snapcast 必须在 main/router 里拨号，不只是定义"},
 	{"DialMPD 调用 (MPD)", `DialMPD\s*\(`, "internal/music", `DialMPD\s*\(`, `DialMPD\s*\(`, "internal/music", "AUDIT P1-26：MPD 必须在 main/router 里拨号，不只是定义"},
