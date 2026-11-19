@@ -122,7 +122,14 @@ if [ -f deploy/.env ]; then
   ok ".env 存在"
   for k in HASS_TOKEN LLM_API_KEY OPEN_XIAOAI_TOKEN OPEN_XIAOAI_WEB_TOKEN; do
     v="$(grep -E "^${k}=" deploy/.env | cut -d= -f2- || true)"
-    [ -n "$v" ] && ok ".env 里 $k 已填" || bad ".env 里 $k 为空"
+    # 2026-11-19 bai 定：现在不配大模型做对话。LLM_API_KEY 为空是
+    # 有意的（只影响对话：没接大脑；音乐/家电/提醒照常），不算 FAIL，
+    # 只提示一声；其它三个 Token 为空才是真缺失。
+    if [ "$k" = "LLM_API_KEY" ] && [ -z "$v" ]; then
+      echo "WARN: .env 里 LLM_API_KEY 为空（有意不配大模型；对话不可用，音乐/家电/提醒照常。以后想加对话时填上再重启 Hub 即可，无需重刷）"
+    else
+      [ -n "$v" ] && ok ".env 里 $k 已填" || bad ".env 里 $k 为空"
+    fi
   done
   # 环境变量优先于 .env（部署时以环境变量为准时）。
   _tok_client="${OPEN_XIAOAI_TOKEN:-$(grep -E '^OPEN_XIAOAI_TOKEN=' deploy/.env | cut -d= -f2- || true)}"
