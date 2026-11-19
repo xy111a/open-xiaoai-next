@@ -139,8 +139,9 @@ fi
 #    在产物里——否则构建悄悄编出了无 ALSA 版。显式透传
 #    --no-default-features 的构建跳过本条并打 WARNING（与 musl 脚本
 #    的 --allow-no-alsa 语义对齐：应急版无此标记是预期的）。
-#    注意：不要碰下面第 6 节 vendor .so 的警告/失败逻辑（那是等 bai
-#    拍板的另一件事）。
+#    注意：第 6/7 节 vendor .so 的逻辑（2026-11-18 bai 定，gnueabihf）：
+#    符号缺失一律硬失败；.so 不兼容时全局只警告，但本次构建开了
+#    sherpa-kws feature 时硬失败（本地 KWS 路径真的会 dlopen 它）。
 ALSA_ASSERT_SKIP=0
 for arg in "${CARGO_ARGS[@]}"; do
   case "$arg" in
@@ -215,18 +216,35 @@ if [ -f "$VENDOR_LIB" ]; then
     fi
   done
   echo "ASSERT OK: $VENDOR_LIB exports all 10 required KWS symbols"
-  # 7) 兼容性提醒（只警告，不致命）：官方 .so 要求 GLIBC 最高 2.34 /
-  #    GLIBCXX_3.4.29，音箱只有 2.25 / 3.4.22——该 .so 仍不能直接用，
-  #    待 P1-40 的 .so 从源码重编落定（见 kws/vendor-arm/SOURCE.md）。
+  # 7) 兼容性：官方 .so 要求 GLIBC 最高 2.34 / GLIBCXX_3.4.29，
+  #    音箱只有 2.25 / 3.4.22——该 .so 仍不能直接用，待 P1-40 的 .so
+  #    从源码重编落定（见 kws/vendor-arm/SOURCE.md）。
   #    模式覆盖 GLIBC_2.29 及以上——实测 .so 最高 2.34，只匹配 2.29 会漏报。
+  #    2026-11-18 bai 定（gnueabihf）：全局仍只警告；但本次构建开了
+  #    sherpa-kws feature（本地 KWS 路径，运行时真的会 dlopen 这个
+  #    .so）时不兼容即硬失败——否则会产出一个“含 KWS 但永远唤醒不了”
+  #    的二进制。服务端模式（--no-sherpa-kws）不加载它，只警告。
   READELF_TXT="$TMPDIR/libsherpa-onnx-c-api.readelf.txt"
   readelf -V "$VENDOR_LIB" > "$READELF_TXT" 2>/dev/null || true
+  VENDOR_INCOMPAT_REASONS=""
   if grep -Eq "GLIBC_2\.(29|[3-9][0-9])" "$READELF_TXT"; then
     MAX_GLIBC=$(grep -o "GLIBC_2\.[0-9.]*" "$READELF_TXT" | sort -Vu | tail -n 1)
-    echo "WARNING: $VENDOR_LIB requires ${MAX_GLIBC:-GLIBC_2.29+}, speaker has glibc 2.25 — will NOT load on-device as-is (see kws/vendor-arm/SOURCE.md)"
+    VENDOR_INCOMPAT_REASONS="requires ${MAX_GLIBC:-GLIBC_2.29+}, speaker has glibc 2.25"
   fi
   if grep -q "GLIBCXX_3.4.29" "$READELF_TXT"; then
-    echo "WARNING: $VENDOR_LIB requires GLIBCXX_3.4.29, speaker has libstdc++ 3.4.22 — will NOT load on-device as-is (see kws/vendor-arm/SOURCE.md)"
+    if [ -n "$VENDOR_INCOMPAT_REASONS" ]; then
+      VENDOR_INCOMPAT_REASONS="$VENDOR_INCOMPAT_REASONS; requires GLIBCXX_3.4.29, speaker has libstdc++ 3.4.22"
+    else
+      VENDOR_INCOMPAT_REASONS="requires GLIBCXX_3.4.29, speaker has libstdc++ 3.4.22"
+    fi
+  fi
+  if [ -n "$VENDOR_INCOMPAT_REASONS" ]; then
+    if [ "${#SHERPA_FEATURE_ARGS[@]}" -gt 0 ]; then
+      echo "ASSERT FAIL: $VENDOR_LIB $VENDOR_INCOMPAT_REASONS — will NOT load on-device as-is (see kws/vendor-arm/SOURCE.md)" >&2
+      echo "  (built with --features sherpa-kws, so this .so would be dlopen'd on-device and fail; rebuild the .so from source (path A) or build with --no-sherpa-kws for server mode)" >&2
+      exit 1
+    fi
+    echo "WARNING: $VENDOR_LIB $VENDOR_INCOMPAT_REASONS — will NOT load on-device as-is (see kws/vendor-arm/SOURCE.md)"
   fi
 else
   echo "WARNING: ARM libsherpa not found at $VENDOR_LIB — run ./scripts/download-kws-lib.sh first (build itself does not link it; on-device KWS still BLOCKED, see kws/vendor-arm/SOURCE.md)"

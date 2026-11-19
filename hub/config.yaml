@@ -35,9 +35,9 @@ devices: {}
 music_folder: /volume1/music
 
 # Home Assistant：Token 走环境变量 HASS_TOKEN，不要写进文件。
-# P1-5：用 wss（HA 须配 TLS）；若 bai 的 HA 未配 TLS，需改回 ws（见汇报）。
+# 2026-11-18 bai 定：HA 未配 TLS，用 ws（此前误写成 wss，握手直接失败）。
 home_assistant:
-  url: "wss://192.168.1.10:8123"
+  url: "ws://192.168.1.10:8123"
 
 # Agent（OpenAI 兼容 /v1/chat/completions）。密钥走环境变量，不要写进文件。
 agents:
