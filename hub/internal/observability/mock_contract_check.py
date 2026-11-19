@@ -311,10 +311,13 @@ def test_go_balance():
     # Only files this feature touched + the new package.
     # (NB: match on path *parts* — the worktree dir itself is named
     # feat-observability, so a substring match would select every file.)
+    # main.go 只认 Hub 的 cmd/hub/main.go：ha-fusion 加了
+    # cmd/wyoming-probe/main.go，不是本功能碰的文件，不能按名字计入。
     hub_rel = HERE.parent.parent
     touched = [p for p in go_files
                if "observability" in p.relative_to(hub_rel).parts
-               or p.name in ("web.go", "voice.go", "router.go", "main.go")]
+               or p.name in ("web.go", "voice.go", "router.go")
+               or p.relative_to(hub_rel).as_posix() == "cmd/hub/main.go"]
     check("touched Go files found", len(touched) == 9, f"found {len(touched)}")
     for p in touched:
         code = strip_go(p.read_text())
