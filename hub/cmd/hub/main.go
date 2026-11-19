@@ -34,6 +34,7 @@ import (
 	"github.com/huajun/open-xiaoai-next/hub/internal/registry"
 	"github.com/huajun/open-xiaoai-next/hub/internal/reminders"
 	"github.com/huajun/open-xiaoai-next/hub/internal/router"
+	"github.com/huajun/open-xiaoai-next/hub/internal/skill"
 	"github.com/huajun/open-xiaoai-next/hub/internal/tlscert"
 	"github.com/huajun/open-xiaoai-next/hub/internal/transport"
 	"github.com/huajun/open-xiaoai-next/hub/internal/voice"
@@ -437,6 +438,19 @@ func tightenFilePerm(path string, perm os.FileMode) {
 	}
 }
 
+// musicOrder 把 config music.primary/fallback 转成 Router 要的顺序表：
+// primary 在前，fallback 在后；fallback 为空（不兜底）时只留 primary。
+func musicOrder(primary, fallback string) []string {
+	if primary == "" {
+		primary = "netease"
+	}
+	order := []string{primary}
+	if fallback != "" && fallback != primary {
+		order = append(order, fallback)
+	}
+	return order
+}
+
 func main() {
 	cfgPath := flag.String("config", "config.yaml", "path to config.yaml")
 	flag.Parse()
@@ -520,9 +534,11 @@ func main() {
 	// Agent：全量建表供 Router 按唤醒词路由（P1-38）；默认大脑取
 	// 唤醒词路由指向的 Agent，未配时按 Agent 名排序取首个（确定性，
 	// 旧代码 Go map 随机迭代 break 是假路由）。
+	// 插件式：每个 Agent 各自的 api_key_env + system_prompt 都在
+	// config.yaml 里配，密钥只从环境变量读，不进配置文件。
 	agentClients := map[string]*agent.Client{}
 	for name, a := range cfg.Agents {
-		agentClients[name] = agent.New(a.BaseURL, a.Model, config.LLMAPIKey())
+		agentClients[name] = agent.NewFull(a.BaseURL, a.Model, a.ResolveAPIKey(), a.SystemPrompt)
 	}
 	var agentClient *agent.Client
 	if name, ok := cfg.WakeWordRoutes[cfg.WakeWord]; ok {
@@ -613,13 +629,32 @@ func main() {
 			snapClient = c
 		}
 	}
+	// 技能插件：config.yaml 的 skills 表转成 skill.Registry；
+	// 没配技能时传 nil，Router 直接走 Agent。
+	var skillRegistry *skill.Registry
+	if len(cfg.Skills) > 0 {
+		skills := make([]skill.Skill, 0, len(cfg.Skills))
+		for _, s := range cfg.Skills {
+			skills = append(skills, skill.Skill{
+				Name: s.Name, Triggers: s.Triggers,
+				Endpoint: s.Endpoint, TimeoutSeconds: s.TimeoutSeconds,
+			})
+		}
+		skillRegistry = skill.New(skills)
+		log.Printf("技能插件：已注册 %d 个技能（%v）", len(skills), skillRegistry.Skills())
+	}
+
 	// Router 的 Notify 闭包要读看门狗热换后的最新 HA（P1-27），
 	// 而 rt 在下面才赋值：先声明变量，闭包调用时再读。
 	var rt *router.Router
 	rt = router.New(router.Deps{
 		HA: haClient, Netease: netease, Agent: agentClient,
 		Agents: agentClients, WakeWordRoutes: cfg.WakeWordRoutes,
-		Reminders: remStore, Memory: memory,
+		Skills: skillRegistry,
+		// 音源链顺序（config music.primary/fallback，默认 netease → local）；
+		// MusicOrder 为空时 Router 用默认顺序。
+		MusicOrder: musicOrder(cfg.Music.Primary, cfg.Music.Fallback),
+		Reminders:  remStore, Memory: memory,
 		MusicFolder: cfg.MusicFolder,
 		MPD:         mpdClient, Snap: snapClient,
 		SnapLatencies: cfg.Hub.SnapcastLatencies,

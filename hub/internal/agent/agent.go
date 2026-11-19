@@ -68,21 +68,42 @@ func truncateErrorBody(s string, n int) string {
 	return s
 }
 
+// DefaultSystemPrompt 是没配 system_prompt 时的内置提示词
+// （与旧代码 Router 里写死的同一句，行为不变）。
+const DefaultSystemPrompt = "你是家里的语音管家，回答简短口语化，一两句话。"
+
 type Client struct {
 	BaseURL string
 	Model   string
 	APIKey  string
-	HTTP    *http.Client
+	// SystemPrompt 是该 Agent 的 system 提示词（config agents[].system_prompt）；
+	// 为空时 Prompt() 返回 DefaultSystemPrompt。
+	SystemPrompt string
+	HTTP         *http.Client
 }
 
-// New 新建 Client。
+// New 新建 Client（system_prompt 为空，走默认提示词）。
 func New(baseURL, model, apiKey string) *Client {
+	return NewFull(baseURL, model, apiKey, "")
+}
+
+// NewFull 新建 Client 并指定 system_prompt（插件式 Agent 用）。
+func NewFull(baseURL, model, apiKey, systemPrompt string) *Client {
 	return &Client{
-		BaseURL: strings.TrimSuffix(baseURL, "/"),
-		Model:   model,
-		APIKey:  apiKey,
-		HTTP:    &http.Client{Timeout: 120 * time.Second},
+		BaseURL:      strings.TrimSuffix(baseURL, "/"),
+		Model:        model,
+		APIKey:       apiKey,
+		SystemPrompt: systemPrompt,
+		HTTP:         &http.Client{Timeout: 120 * time.Second},
 	}
+}
+
+// Prompt 返回生效的 system 提示词：配了用配的，没配用默认。
+func (c *Client) Prompt() string {
+	if c.SystemPrompt != "" {
+		return c.SystemPrompt
+	}
+	return DefaultSystemPrompt
 }
 
 // Chat 一次问答（非流式），返回完整回答。

@@ -513,14 +513,6 @@ func TestSetHAHotSwap(t *testing.T) {
 
 // ---- P2-50 顺带：歌手/歌名拆分 ----
 
-func TestSplitArtistTrack(t *testing.T) {
-	if a, tr := splitArtistTrack("周杰伦的青花瓷"); a != "周杰伦" || tr != "青花瓷" {
-		t.Fatalf("应拆成 周杰伦/青花瓷，实际 %q/%q", a, tr)
-	}
-	if a, tr := splitArtistTrack("青花瓷"); a != "" || tr != "青花瓷" {
-		t.Fatalf("无“的”时整句当歌名，实际 %q/%q", a, tr)
-	}
-	if a, tr := splitArtistTrack("的青花瓷"); a != "" || tr != "的青花瓷" {
-		t.Fatalf("歌手为空时整句当歌名，实际 %q/%q", a, tr)
-	}
-}
+// splitArtistTrack 已随本地音源搬到 music 包
+// （LocalSource 搜歌用），测试见 music/source_test.go 的
+// TestSplitArtistTrack。

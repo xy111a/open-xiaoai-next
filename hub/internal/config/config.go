@@ -37,7 +37,19 @@ type Config struct {
 	HomeAssistant HomeAssistant `yaml:"home_assistant" json:"home_assistant"`
 
 	// Agents 可用的 Agent（OpenAI 兼容 /v1/chat/completions）。
+	// 插件式：加一个新 LLM（DeepSeek / Claude / 云端 Qwen……）只需在
+	// 这里加一条，不改 Hub 代码；base_url 走 https 时允许公网地址
+	// （云端 LLM 本来就是公网服务），http 只许内网（见 Validate）。
 	Agents map[string]Agent `yaml:"agents" json:"agents"`
+
+	// Music 是音源插件的顺序：primary 先找，找不到/出错再找 fallback。
+	// 取值只能是 netease（网易云直连）或 local（MPD 本地曲库），
+	// fallback 为空表示不兜底。缺省 primary=netease、fallback=local。
+	Music Music `yaml:"music" json:"music"`
+
+	// Skills 是技能插件表：名字 + 触发词 + HTTP 端点，纯配置接入，
+	// 不改 Hub 代码。匹配到触发词的语音先走技能，失败时落回 Agent。
+	Skills []Skill `yaml:"skills" json:"skills"`
 
 	// Netease 网易云：NeteaseCloudMusicApi 地址（Hub 直连，不再经
 	// Music Assistant；扫码登录走 Web 面板 /api/netease/*）。
@@ -83,10 +95,53 @@ type HomeAssistant struct {
 	URL string `yaml:"url" json:"url"`
 }
 
-// Agent 是一个 OpenAI 兼容的 Agent/LLM。
+// Agent 是一个 OpenAI 兼容的 Agent/LLM（插件式大脑）。
+// 加新 LLM 只需在 config.yaml 的 agents 里加一条：base_url + model，
+// 再按需配 system_prompt 与 api_key_env，不改 Hub 代码。
 type Agent struct {
 	BaseURL string `yaml:"base_url" json:"base_url"` // 例如 http://hermes:8642/v1
 	Model   string `yaml:"model" json:"model"`       // 例如 deepseek-chat
+	// APIKeyEnv 是读密钥的环境变量名（例如 DEEPSEEK_API_KEY）：
+	// 密钥本身不写进配置文件，只写变量名；为空时用全局 LLM_API_KEY。
+	// 面板 GET 会脱敏含 key 的字段，但 *_env 只是变量名、不是密钥，
+	// 不在脱敏之列（见 web.sensitiveKey）。
+	APIKeyEnv string `yaml:"api_key_env" json:"api_key_env"`
+	// SystemPrompt 是该 Agent 的 system 提示词；为空时用内置默认
+	// （agent.DefaultSystemPrompt：“你是家里的语音管家……”）。
+	SystemPrompt string `yaml:"system_prompt" json:"system_prompt"`
+}
+
+// ResolveAPIKey 按 APIKeyEnv 取密钥：配了变量名就读它，没配读全局
+// LLM_API_KEY；都没配返回 ""（该 Agent 发请求时不带 Authorization）。
+func (a Agent) ResolveAPIKey() string {
+	if a.APIKeyEnv != "" {
+		return os.Getenv(a.APIKeyEnv)
+	}
+	return LLMAPIKey()
+}
+
+// Music 是音源插件的顺序配置。
+type Music struct {
+	// Primary 是第一音源：netease（网易云直连）或 local（MPD 本地曲库）。
+	Primary string `yaml:"primary" json:"primary"`
+	// Fallback 是第一音源找不到/出错时的第二音源；为空表示不兜底。
+	Fallback string `yaml:"fallback" json:"fallback"`
+}
+
+// Skill 是一个技能插件：名字 + 触发词 + HTTP 端点。
+// 语音文本含任一触发词即路由到该技能（在 Agent 之前、音乐/家电之后）。
+type Skill struct {
+	// Name 是技能名，全局唯一，例如 "news"。
+	Name string `yaml:"name" json:"name"`
+	// Triggers 是触发词表，例如 ["新闻", "今日头条"]：STT 文本含任一
+	// 词（子串匹配）即命中；多个技能都命中时按配置顺序取第一个。
+	Triggers []string `yaml:"triggers" json:"triggers"`
+	// Endpoint 是技能 HTTP 端点（POST {"text": "...", "device_id": "..."}，
+	// 期望 {"reply": "..."} 或纯文本回复）。只许内网地址：
+	// 技能是家里的本地服务，不许指向公网。
+	Endpoint string `yaml:"endpoint" json:"endpoint"`
+	// TimeoutSeconds 是调用超时（秒）；0 或不写时默认 10。
+	TimeoutSeconds int `yaml:"timeout_seconds" json:"timeout_seconds"`
 }
 
 // Netease 是网易云接入参数。
@@ -158,6 +213,8 @@ func (c *Config) TLSEnabled() bool {
 //   - 下游 URL 只许 http(s)（HA 另许 ws(s)），且 host 必须是内网地址
 //     （私有/回环/链路本地 IP、localhost、*.local 等内网后缀、或无点的
 //     单标签主机名如 Docker 服务名）；拒绝公网 IP/域名与 file:// 等 scheme。
+//     例外：Agent 的 base_url 走 https 时允许公网（云端 LLM 的 API
+//     本来就在公网，Bearer 密钥走 TLS；http 明文仍只许内网）。
 //   - hub.stt/tts/snapcast（host:port 形式）同样只许内网 host。
 //   - scan_cidr 非空时必须是可解析的内网网段。
 //
@@ -205,8 +262,54 @@ func (c *Config) Validate() error {
 		return err
 	}
 	for name, a := range c.Agents {
-		if err := validateDownstreamURL("agents["+name+"].base_url", a.BaseURL, "http", "https"); err != nil {
+		// 插件式 Agent：云端 LLM（DeepSeek / Claude / 云端 Qwen）是
+		// 公网服务，https 到公网是合法的；http 明文只许内网，
+		// 否则 Bearer 密钥会裸奔。本地 Agent（hermes/openclaw/OVMS）
+		// 本来就是内网地址，不受影响。
+		if err := validateAgentURL("agents["+name+"].base_url", a.BaseURL); err != nil {
 			return err
+		}
+		if a.APIKeyEnv != "" && !envVarNameRe.MatchString(a.APIKeyEnv) {
+			return fmt.Errorf("agents[%s].api_key_env 不是合法环境变量名：%q", name, a.APIKeyEnv)
+		}
+		if len([]rune(a.SystemPrompt)) > 4000 {
+			return fmt.Errorf("agents[%s].system_prompt 超过 4000 字符", name)
+		}
+	}
+	// 音源顺序：取值只能是 netease / local（fallback 可空），
+	// primary 与 fallback 不能是同一个。
+	if c.Music.Primary != "" && c.Music.Primary != "netease" && c.Music.Primary != "local" {
+		return fmt.Errorf("music.primary 只能是 netease 或 local，实际是 %q", c.Music.Primary)
+	}
+	if c.Music.Fallback != "" && c.Music.Fallback != "netease" && c.Music.Fallback != "local" {
+		return fmt.Errorf("music.fallback 只能是 netease、local 或空，实际是 %q", c.Music.Fallback)
+	}
+	if c.Music.Primary != "" && c.Music.Fallback != "" && c.Music.Primary == c.Music.Fallback {
+		return fmt.Errorf("music.primary 与 music.fallback 不能是同一个音源 %q", c.Music.Primary)
+	}
+	// 技能插件：名字唯一、触发词非空、端点只许内网 http(s)。
+	seenSkills := map[string]bool{}
+	for i, s := range c.Skills {
+		if strings.TrimSpace(s.Name) == "" {
+			return fmt.Errorf("skills[%d].name 为空", i)
+		}
+		if seenSkills[s.Name] {
+			return fmt.Errorf("skills 里技能名 %q 重复", s.Name)
+		}
+		seenSkills[s.Name] = true
+		if len(s.Triggers) == 0 {
+			return fmt.Errorf("skills[%q].triggers 为空（至少配一个触发词）", s.Name)
+		}
+		for _, tr := range s.Triggers {
+			if strings.TrimSpace(tr) == "" {
+				return fmt.Errorf("skills[%q].triggers 里有空触发词", s.Name)
+			}
+		}
+		if err := validateDownstreamURL("skills["+s.Name+"].endpoint", s.Endpoint, "http", "https"); err != nil {
+			return err
+		}
+		if s.TimeoutSeconds < 0 || s.TimeoutSeconds > 120 {
+			return fmt.Errorf("skills[%q].timeout_seconds 必须在 0–120 秒之间，实际是 %d", s.Name, s.TimeoutSeconds)
 		}
 	}
 	if err := validateDownstreamURL("netease.api", c.Netease.API, "http", "https"); err != nil {
@@ -396,6 +499,35 @@ func validateListenAddr(name, addr string) error {
 	return nil
 }
 
+// validateAgentURL 校验 Agent 的 base_url（插件式大脑专用规则）：
+// scheme 必须是 http/https、无 userinfo；https 允许公网 host
+// （云端 LLM 的 API 本来就在公网，Bearer 密钥走 TLS）；
+// http 明文只许内网 host（密钥不能裸奔到公网）。
+func validateAgentURL(name, raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s 不是合法 URL：%q", name, raw)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("%s 的 scheme 必须是 http 或 https，实际是 %q", name, u.Scheme)
+	}
+	if u.User != nil {
+		return fmt.Errorf("%s 不许带 userinfo（可能泄露凭据）", name)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%s 缺少 host，实际是 %q", name, raw)
+	}
+	if u.Scheme == "http" && !isPrivateHost(u.Hostname()) {
+		return fmt.Errorf("%s 用 http 明文时 host 必须是内网地址（公网 Agent 请用 https），实际是 %q", name, raw)
+	}
+	return nil
+}
+
+var envVarNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
 // validateDownstreamURL 校验下游 URL：scheme 在白名单内、无 userinfo、host 为内网地址。
 // 空值跳过（该下游未配置）。
 func validateDownstreamURL(name, raw string, schemes ...string) error {
@@ -542,6 +674,19 @@ func (c *Config) applyDefaults() {
 	}
 	if c.WakeWordRoutes == nil {
 		c.WakeWordRoutes = map[string]string{}
+	}
+	// 音源顺序默认值：music 块全没写时 primary=netease、fallback=local；
+	// 只写了 primary 时 fallback 保持空（= 不兜底，可显式关闭）；
+	// 只写了 fallback 时 primary 补 netease（与 fallback 相同会由
+	// Validate 拦住，提示改 primary）。
+	if c.Music.Primary == "" && c.Music.Fallback == "" {
+		c.Music.Primary = "netease"
+		c.Music.Fallback = "local"
+	} else if c.Music.Primary == "" {
+		c.Music.Primary = "netease"
+	}
+	if c.Skills == nil {
+		c.Skills = []Skill{}
 	}
 }
 
