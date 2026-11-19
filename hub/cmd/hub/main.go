@@ -837,6 +837,34 @@ func main() {
 			}
 			return d.ID, true
 		},
+		// 留言式对讲（“叫一下客厅，吃饭了”）：目标房间全部在线
+		// 设备都播（P2-27 同款）；已知房间名供无分隔切分与报错区分。
+		DevicesByRoom: func(room string) []string {
+			var ids []string
+			for _, d := range reg.ByRoomAll(room) {
+				ids = append(ids, d.ID)
+			}
+			return ids
+		},
+		KnownRooms: func() []string {
+			seen := map[string]bool{}
+			var rooms []string
+			for _, d := range reg.All() {
+				if d.Room != "" && !seen[d.Room] {
+					seen[d.Room] = true
+					rooms = append(rooms, d.Room)
+				}
+			}
+			return rooms
+		},
+		// Speak 晚绑定闭包：h.speakText 在 Router 建好之后才赋值，
+		// 调用时再读字段；speakText 经 playFrames 走统一播放协议
+		//（start_play → Opus 帧 → stop_play），客户端无需新消息类型。
+		Speak: func(deviceID, text string) {
+			if h.speakText != nil {
+				h.speakText(deviceID, text)
+			}
+		},
 		RoomClaim: h.OnRoomClaim,
 		RoomOfDevice: func(deviceID string) string {
 			if d, ok := reg.Get(deviceID); ok {
