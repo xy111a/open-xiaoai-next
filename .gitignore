@@ -19,6 +19,9 @@ client/kws/vendor-arm/reference-kws.tar.gz
 
 # 构建产物（补充）
 deploy/hub-linux-amd64
+
+# 备份归档含 .env 里的 Token，绝不能提交
+deploy/backups/
 hub/hub-data/
 **/.pytest_cache/
 **/__pycache__/

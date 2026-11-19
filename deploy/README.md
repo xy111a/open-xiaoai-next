@@ -16,6 +16,21 @@ docker compose logs -f hub
 （用法：`NAS_SSH=root@NAS_IP ./nas-install.sh up`，脚本本身只做过 `bash -n` 校验，
 NAS 上实际运行未验证）。
 
+## 备份与恢复
+
+更新 / 部署日之前先备份，见 `BACKUP.md`：
+
+```bash
+cd deploy
+./backup.sh                                   # 生成 deploy/backups/open-xiaoai-next-backup-*.tar.gz
+./restore.sh backups/open-xiaoai-next-backup-*.tar.gz   # 恢复（默认要输入 YES 确认）
+```
+
+备份含 5 个具名卷 + `hub/config.yaml` + `.env` + compose/snapserver.conf，
+TLS 证书与网易云 Cookie 随 `hub-data` 卷一起备份（manifest 里单独列出）。
+`/volume1/music` 与 Docker 镜像不备份。归档含 Token，妥善保管、不要提交
+（`deploy/backups/` 已在 `.gitignore` 里）。
+
 ## 服务
 
 | 服务 | 镜像 | 端口 | 说明 |
