@@ -176,10 +176,13 @@ whisper/piper/kws-sidecar，`snapserver` 只依赖 mpd；没有任何服务在 `
 ## 4. 已知取舍
 
 - **HA 里没了现成的音乐 `media_player`**：以前是 MA 向 HA 提供音乐播放器实体，砍 MA 后 HA 侧
-  没有音乐入口。语音点歌与 Hub Web 控制不受影响。以后要不要由 Hub 自己向 HA 暴露播放状态，
-  只提方案、不做：方向是复用 Hub 已有的 HA WebSocket 连接（`wss://NAS:8123`），由 Hub 向 HA
-  注册/更新一个 `media_player` 实体（上报播放状态 + 接受播放/暂停/切歌），或走 HA 的 Wyoming
-  语音通道；两种都未设计、未排期，需 bai 定。
+  没有音乐入口。语音点歌与 Hub Web 控制不受影响。2026-11-19 HA 融合 b 已由 Hub 自己补上
+  状态上报（`docs/HA_MEDIA_PLAYER.md`，`hub/internal/ha/mediaplayer.go`）：每 15 秒向 HA
+  上报每台音箱的 `media_player.open_xiaoai_*` 实体（playing/paused/idle/unavailable +
+  音量 + 当前曲）。实现时改了一个原方案假设：HA 的 WebSocket API 没有“设置任意实体状态”
+  的命令，所以上报走 REST `POST /api/states/<实体>`（与 WS 共用 `HASS_TOKEN`，不依赖 WS
+  连通）；控制方向（HA 里点播放/暂停/音量）仍未做，是后续工作。Wyoming 语音通道的注册
+  也在同批做了，见 `docs/HA_WYOMING.md`。
 - **网易云接口漂移仍由 `netease-api` 上游扛**：`binaryify/netease_cloud_music_api` 是非官方 API，
   随时可能失效；Hub 直连没有改变这一风险，只是少了一层转发。
 - **少一层不等于少一处故障点**：登录态从 MA 的 `ma-data` 卷改到 Hub 的 `hub-data` 卷，

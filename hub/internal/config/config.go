@@ -82,6 +82,17 @@ type Device struct {
 // HomeAssistant 是 HA 连接参数。
 type HomeAssistant struct {
 	URL string `yaml:"url" json:"url"`
+	// MediaPlayerEnabled 是否把注册表里的音箱报给 HA 做 media_player
+	// 实体（HA 融合 b，走 REST POST /api/states，见 internal/ha
+	// mediaplayer.go）。用 *bool：没写时默认 true（HA 配了就上报），
+	// 只有显式写 false 才关闭。
+	MediaPlayerEnabled *bool `yaml:"media_player_enabled" json:"media_player_enabled"`
+}
+
+// MediaPlayerEnabledOrDefault 返回 media_player 上报开关：
+// 未配时默认开启（HA 配了就上报），显式 false 才关闭。
+func (h HomeAssistant) MediaPlayerEnabledOrDefault() bool {
+	return h.MediaPlayerEnabled == nil || *h.MediaPlayerEnabled
 }
 
 // Agent 是一个 OpenAI 兼容的 Agent/LLM。

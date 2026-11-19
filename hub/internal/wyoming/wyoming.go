@@ -2,6 +2,12 @@
 // 协议格式：每条消息 = 一行 JSON 头（\n 结尾）+ 可选的二进制负载。
 // 头里 type 区分消息；payload 长度由头里的字段决定（音频帧直接跟在头后面）。
 // STT：transcribe → transcript；TTS：synthesize → audio-start/audio-chunk/audio-stop。
+//
+// HA 融合（probe.go）：HA 的 Wyoming 集成就是这样一个外部客户端——
+// 先 describe 拿服务信息，再发 transcribe / synthesize。ProbeSTT /
+// ProbeTTS 就是“假 HA”探针：用与 HA 相同的调用顺序去验证
+// Whisper（:10300）与 Piper（:10200）这两个容器；探针不连真 HA、
+// 不改容器，只在 NAS 上对 127.0.0.1:10300/10200 跑一次即可。
 package wyoming
 
 import (

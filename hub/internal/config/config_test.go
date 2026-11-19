@@ -46,6 +46,14 @@ func TestDefaults(t *testing.T) {
 	if c.TLSEnabled() {
 		t.Fatal("TLS 显式 false 时 TLSEnabled 应为 false")
 	}
+	// HA 融合 b：media_player 上报没写时默认开，显式 false 才关。
+	if !c.HomeAssistant.MediaPlayerEnabledOrDefault() {
+		t.Fatal("media_player_enabled 没写时应默认 true")
+	}
+	c.HomeAssistant.MediaPlayerEnabled = &f
+	if c.HomeAssistant.MediaPlayerEnabledOrDefault() {
+		t.Fatal("media_player_enabled 显式 false 时应为 false")
+	}
 }
 
 func TestValidateRejects(t *testing.T) {

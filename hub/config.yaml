@@ -38,6 +38,11 @@ music_folder: /volume1/music
 # 2026-11-18 bai 定：HA 未配 TLS，用 ws（此前误写成 wss，握手直接失败）。
 home_assistant:
   url: "ws://192.168.1.10:8123"
+  # media_player 上报（HA 融合 b）：Hub 每 15 秒把注册表里的音箱
+  # 报给 HA 做 media_player.open_xiaoai_* 实体（state/音量/当前曲，
+  # 走 REST POST /api/states，与上面 WS 共用 HASS_TOKEN）。
+  # 默认开；显式写 false 关闭。实体与控制范围见 docs/HA_MEDIA_PLAYER.md。
+  # media_player_enabled: true
 
 # Agent（OpenAI 兼容 /v1/chat/completions）。密钥走环境变量，不要写进文件。
 agents:
