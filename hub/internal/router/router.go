@@ -78,6 +78,16 @@ type Deps struct {
 	Agents map[string]*agent.Client
 	// WakeWordRoutes 是多唤醒词路由表（与 config.WakeWordRoutes 同源）。
 	WakeWordRoutes map[string]string
+	// FollowMeEnabled 是跟随播放总开关（main.go 读 config.Hub.FollowMeEnabled；
+	// nil 表示默认开启；Web 改配置后立即生效，不用重启）。
+	FollowMeEnabled func() bool
+	// SnapClientDevice 把 Snapcast 客户端映射回 Hub 设备 ID
+	// （main.go 按 host.ip 对注册表 IP）；nil 表示无法映射，
+	// 跟随不生效（只记日志，不动路由）。
+	SnapClientDevice func(snap music.SnapDevice) (deviceID string, ok bool)
+	// Speak 是可选的语音播报：目标房间音箱离线时向唤醒设备说一句；
+	// nil 表示只记日志。
+	Speak func(deviceID, text string)
 }
 
 // IntercomStarter 是 Router 依赖的对讲触发接口（P1-15）：
@@ -119,6 +129,10 @@ type Router struct {
 	// wakeWords 是设备最近一次唤醒词（P1-38：多 Agent 路由用）。
 	wakeMu    sync.Mutex
 	wakeWords map[string]string
+
+	// followMe 是跟随播放执行器（New 里按 Deps 建好；MPD/Snap
+	// 经 r.mpd()/r.snap() 提供方取当前值，看门狗热换后自动跟上）。
+	followMe *music.Mover
 }
 
 // currentTrack 是 Hub 内存里的当前曲（最近一次点歌成功的结果）。
@@ -208,12 +222,49 @@ func New(deps Deps, entities map[string]string) *Router {
 	if entities == nil {
 		entities = map[string]string{}
 	}
-	return &Router{
+	r := &Router{
 		deps:             deps,
 		entities:         entities,
 		emergencyCalls:   map[string]emergencyCall{},
 		EmergencyTimeout: 60 * time.Second,
 	}
+	// 跟随播放（follow-me）：MPD/Snap 经提供方函数取当前值
+	// （看门狗热换后是最新的；未接通时返回 nil，Move 报未连接）。
+	// 注意：r.mpd()/r.snap() 的 nil 指针不能直接 return——
+	// nil *MPDClient 包进接口后是非 nil 接口（typed-nil），
+	// Move 的 nil 判断失效，继而在 Status()/GetGroups() 里空指针
+	// panic；这里显式拆开再返回。
+	r.followMe = music.NewMover(music.MoverDeps{
+		MPD: func() music.MPDReader {
+			if c := r.mpd(); c != nil {
+				return c
+			}
+			return nil
+		},
+		Snap: func() music.SnapRouting {
+			if c := r.snap(); c != nil {
+				return c
+			}
+			return nil
+		},
+		// 音乐流 ID 与点歌切流共用同一配置（hub.snapcast_stream）。
+		StreamID:           deps.SnapStreamID,
+		RoomOfDevice:       deps.RoomOfDevice,
+		DeviceOfSnapClient: deps.SnapClientDevice,
+		Enabled:            deps.FollowMeEnabled,
+		Speak:              deps.Speak,
+	})
+	return r
+}
+
+// FollowMeOnWake 仲裁赢家产生后调一次：音乐跟随到赢家所在房间。
+// main.go 的仲裁回调里起 goroutine 调，不阻塞语音会话建立；
+// 返回 Outcome 供日志/测试断言（Moved=false 时音乐留在原房间）。
+func (r *Router) FollowMeOnWake(ctx context.Context, deviceID string) music.Outcome {
+	if r.followMe == nil {
+		return music.Outcome{Reason: "follow-me 未初始化"}
+	}
+	return r.followMe.Move(ctx, deviceID)
 }
 
 // SetMPD 在 MPD 晚到（后台重试连上）时补接 MPD（P1-26）。
@@ -978,6 +1029,13 @@ func (r *Router) mpd() *music.MPDClient {
 	r.depsMu.RLock()
 	defer r.depsMu.RUnlock()
 	return r.deps.MPD
+}
+
+// snap 取当前 Snapcast 客户端（看门狗热换后是最新的；nil 表示未接通）。
+func (r *Router) snap() *music.SnapClient {
+	r.depsMu.RLock()
+	defer r.depsMu.RUnlock()
+	return r.deps.Snap
 }
 
 // MusicPause 暂停播放（Web /api/music/pause 与语音“暂停”共用）。

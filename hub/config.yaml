@@ -74,6 +74,10 @@ hub:
   # 为空表示不强制切流；流名见 deploy/snapserver.conf（NAS音乐）。
   snapcast_group: ""
   snapcast_stream: "NAS音乐"
+  # 跟随播放（follow-me）：在 A 房间放音乐时去 B 房间喊唤醒词，
+  # 音乐跟到 B 房间（同一首歌、同一位置；A 房间停播）。
+  # 默认开启；改 false 关闭（Web 面板 PUT /api/config 也能改，立即生效）。
+  follow_me: true
   # 延迟补偿（ms，P1-26）：key 为 Snapcast 客户端 ID 或显示名；两房间包起始值客厅 0 / 卧室 +15。
   snapcast_latencies:
     卧室: 15

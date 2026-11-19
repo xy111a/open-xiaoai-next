@@ -19,7 +19,7 @@ go build -o hub ./cmd/hub
 | `internal/discovery` | mDNS/ARP 扫描找音箱 IP + 型号，不用手填 IP | Phase 1 |
 | `internal/arbitration` | 250ms 窗口比 RMS 信号强度，响的回，静的静默 | Phase 2 |
 | `internal/voice` | VAD → faster-whisper → Agent → Piper，流式 | Phase 1–3 |
-| `internal/music` | Snapcast 分组 + 延迟校准，音源网易云 | Phase 2 |
+| `internal/music` | Snapcast 分组 + 延迟校准，音源网易云；跟随播放（follow-me，见 `followme.go`）：在 B 房间喊唤醒词，音乐从 A 房间跟过来 | Phase 2 |
 | `internal/ha` | HA WebSocket：查状态、调服务、读场景 | Phase 1 |
 | `internal/ota` | Client/Hub 远程升级，失败回滚 boot1 | Phase 4 |
 
@@ -37,6 +37,12 @@ go build -o hub ./cmd/hub
 ## 配置
 
 只改 `config.yaml`。密钥（HASS_TOKEN、LLM API Key）走环境变量，**不要写进文件**。
+
+跟随播放（follow-me）：`hub.follow_me`（默认 `true`），在 A 房间放音乐时去 B
+房间喊唤醒词，音乐跟到 B 房间（同一首歌、同一位置；A 房间停播）。
+Web 面板 `PUT /api/config` 也能改，立即生效。实现上 MPD 不停——全屋只有
+一台 MPD、一条流，搬家只在 Snapcast 路由层做（`internal/music/followme.go`），
+所以位置精确连续、直播流也不用 seek；目标音箱离线时不搬、只记日志。
 
 ## 参考实现（当 Spec，不直接抄）
 

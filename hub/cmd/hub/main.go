@@ -642,6 +642,26 @@ func main() {
 			}
 			return ""
 		},
+		// 跟随播放（follow-me）：开关读 config（Web 改后立即生效）；
+		// Snapcast 客户端按 host.ip 对注册表 IP 找 Hub 设备；
+		// 目标音箱离线时向唤醒设备说一句（speakText 晚绑定，调用时再读）。
+		FollowMeEnabled: func() bool { return cfg.FollowMeEnabled() },
+		SnapClientDevice: func(snap music.SnapDevice) (string, bool) {
+			if snap.Host.IP == "" {
+				return "", false
+			}
+			for _, d := range reg.All() {
+				if d.IP == snap.Host.IP {
+					return d.ID, true
+				}
+			}
+			return "", false
+		},
+		Speak: func(deviceID, text string) {
+			if h.speakText != nil {
+				h.speakText(deviceID, text)
+			}
+		},
 		Notify: func(ctx context.Context, text string) error {
 			// P1-27：读当前 HA（看门狗热换后是最新的），不是启动时那个。
 			c := rt.HA()
@@ -878,6 +898,11 @@ func main() {
 				_ = c.SendJSON(map[string]string{"type": "wake_lose"})
 			}
 		}
+		// 跟随播放（follow-me）：赢家所在房间与音乐所在房间不同时，
+		// 把音乐跟过去（同一首歌、同一位置；原房间停播）。
+		// 起 goroutine 做，不阻塞会话建立；Move 内部查 MPD/Snapcast，
+		// 失败只记日志、音乐留在原房间。
+		go rt.FollowMeOnWake(context.Background(), chosen)
 	})
 	go h.sweepSessions(done)
 

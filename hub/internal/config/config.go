@@ -123,6 +123,11 @@ type Hub struct {
 	SnapcastGroup string `yaml:"snapcast_group" json:"snapcast_group"`
 	// SnapcastStream 是点歌成功后分组要切到的流 ID（P1-26），如 "NAS音乐"。
 	SnapcastStream string `yaml:"snapcast_stream" json:"snapcast_stream"`
+	// FollowMe 是跟随播放总开关（*bool：没写时默认开启，只有显式写
+	// false 才关闭；Web 面板 PUT /api/config 可改，立即生效不用重启）。
+	// 开启时：在 A 房间放音乐，去 B 房间喊唤醒词，音乐跟到 B 房间
+	// （同一首歌、同一位置；A 房间停播）。
+	FollowMe *bool `yaml:"follow_me" json:"follow_me"`
 	// WebListen 是 Web 面板监听地址，例如 ":8080"（Phase 4）。
 	WebListen string `yaml:"web_listen" json:"web_listen"`
 	// ScanCIDR 是自动发现扫描的网段，例如 "192.168.1.0/24"；为空则自动取本机网段。
@@ -152,6 +157,12 @@ func (c *Config) RoomNames() []string {
 // TLSEnabled 返回是否启用 wss。
 func (c *Config) TLSEnabled() bool {
 	return c.Hub.TLS != nil && *c.Hub.TLS
+}
+
+// FollowMeEnabled 返回跟随播放是否开启（默认开启：
+// 没写 follow_me 时 true，只有显式写 false 才关闭）。
+func (c *Config) FollowMeEnabled() bool {
+	return c.Hub.FollowMe == nil || *c.Hub.FollowMe
 }
 
 // Validate 检查必填项与取值范围，并收紧下游地址：
@@ -529,6 +540,11 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Hub.SnapcastStream == "" {
 		c.Hub.SnapcastStream = "NAS音乐"
+	}
+	// follow_me 没写时默认开启，只有显式写 false 才关闭（与 TLS 同款）。
+	if c.Hub.FollowMe == nil {
+		t := true
+		c.Hub.FollowMe = &t
 	}
 	if c.Hub.WebListen == "" {
 		// P0-1：Web 面板默认只绑回环地址，远程管理走 SSH 隧道。
