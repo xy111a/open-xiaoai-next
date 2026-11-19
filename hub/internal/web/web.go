@@ -563,8 +563,8 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		"online":    len(s.reg.Online()),
 		// KWS 边车状态：ok=可用，down=已启用但不可用（唤醒服务暂不可用），
 		// disabled=未启用。kws_down=true 时语音唤醒降级。
-		"kws_status": kwsStatus,
-		"kws_down":   kwsStatus == "down",
+		"kws_status":     kwsStatus,
+		"kws_down":       kwsStatus == "down",
 		"latest_latency": latest,
 	})
 }

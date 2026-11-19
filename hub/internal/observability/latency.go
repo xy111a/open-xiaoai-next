@@ -59,15 +59,15 @@ const pendingWakeTTL = 120 * time.Second
 
 // Interaction 是一次语音问答或一次点歌播放的分段延迟记录。
 type Interaction struct {
-	ID         string         `json:"id"`
-	DeviceID   string         `json:"device_id"`
-	Kind       string         `json:"kind"` // "voice" | "music"
-	StartedAt  time.Time      `json:"started_at"`
-	FinishedAt time.Time      `json:"finished_at,omitempty"`
+	ID         string           `json:"id"`
+	DeviceID   string           `json:"device_id"`
+	Kind       string           `json:"kind"` // "voice" | "music"
+	StartedAt  time.Time        `json:"started_at"`
+	FinishedAt time.Time        `json:"finished_at,omitempty"`
 	Stages     map[string]int64 `json:"stages"`
-	TotalMs    int64          `json:"total_ms"`
-	OK         bool           `json:"ok"`
-	Error      string         `json:"error,omitempty"`
+	TotalMs    int64            `json:"total_ms"`
+	OK         bool             `json:"ok"`
+	Error      string           `json:"error,omitempty"`
 
 	started time.Time // 墙钟起点（StartedAt 的副本，供 TotalMs 计算）
 }
@@ -83,11 +83,11 @@ type pendingWake struct {
 // 调用方不用每次判空——但 Begin/Finish 在 nil 上返回 nil，
 // 调用方拿到 nil Interaction 后续 RecordStage 也同样空操作。
 type Recorder struct {
-	mu        sync.Mutex
-	capacity  int
-	buf       []*Interaction // 倒序：最新在前
-	active    map[string]*Interaction
-	pending   map[string]pendingWake
+	mu       sync.Mutex
+	capacity int
+	buf      []*Interaction // 倒序：最新在前
+	active   map[string]*Interaction
+	pending  map[string]pendingWake
 }
 
 // NewRecorder 新建 Recorder；capacity <= 0 时用 DefaultCapacity。

@@ -25,10 +25,10 @@ func fakeHTTPServer(t *testing.T, code int, slow time.Duration) *httptest.Server
 
 func TestKWSHealthURL(t *testing.T) {
 	cases := map[string]string{
-		"ws://127.0.0.1:10400/v1/kws":  "http://127.0.0.1:10400/health",
-		"wss://127.0.0.1:10400/v1/kws": "https://127.0.0.1:10400/health",
-		"ws://127.0.0.1:10400":         "http://127.0.0.1:10400/health",
-		"ws://127.0.0.1:10400/":        "http://127.0.0.1:10400/health",
+		"ws://127.0.0.1:10400/v1/kws":   "http://127.0.0.1:10400/health",
+		"wss://127.0.0.1:10400/v1/kws":  "https://127.0.0.1:10400/health",
+		"ws://127.0.0.1:10400":          "http://127.0.0.1:10400/health",
+		"ws://127.0.0.1:10400/":         "http://127.0.0.1:10400/health",
 		"":                              "",
 		"http://127.0.0.1:10400/health": "",
 	}
@@ -134,7 +134,7 @@ func TestProbeHTTPAcceptAnyStatus(t *testing.T) {
 
 // fake Wyoming 服务：读一行 describe，回一行 info；
 // mode=wrong 时回错类型；mode=silent 时接了不回（测超时）。
-func fakeWyomingServer(t *testing.T, mode string) (addr string, close func()) {
+func fakeWyomingServer(t *testing.T, mode string) (addr string, cleanup func()) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
