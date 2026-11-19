@@ -91,3 +91,7 @@ hub:
   # discovery_fingerprints: []
   # 勿扰时段（FR-10 主动播报跳过该时段）
   do_not_disturb: "23:00-07:00"
+  # 多轮对话会话空闲超时（秒）：60 秒内没新一轮对话，会话过期清空，
+  # 下次从头聊；0 表示默认 60。只在内存里记消息历史（role + 文本），
+  # 不落盘，重启即清空；改后重启生效，Web 面板 /api/config 可改。
+  session_timeout_seconds: 60

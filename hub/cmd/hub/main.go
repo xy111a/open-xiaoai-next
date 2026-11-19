@@ -35,6 +35,7 @@ import (
 	"github.com/huajun/open-xiaoai-next/hub/internal/registry"
 	"github.com/huajun/open-xiaoai-next/hub/internal/reminders"
 	"github.com/huajun/open-xiaoai-next/hub/internal/router"
+	"github.com/huajun/open-xiaoai-next/hub/internal/session"
 	"github.com/huajun/open-xiaoai-next/hub/internal/tlscert"
 	"github.com/huajun/open-xiaoai-next/hub/internal/transport"
 	"github.com/huajun/open-xiaoai-next/hub/internal/voice"
@@ -627,6 +628,12 @@ func main() {
 			snapClient = c
 		}
 	}
+	// 多轮对话会话存根（内存 only，不落盘）：同一设备/房间在空闲超时
+	// （默认 60s，hub.session_timeout_seconds）内连续对话，历史全量
+	// 发给 LLM；过期由下面的 10s 扫荡清理。注意它与 hubHandler.sessions
+	// 的 20s 音频会话是两回事：那个是“唤醒后 20s 内不用再喊唤醒词”，
+	// 这个是“60s 内跟进式问题能对上前文”。
+	convSessions := session.New(cfg.SessionTimeout())
 	// Router 的 Notify 闭包要读看门狗热换后的最新 HA（P1-27），
 	// 而 rt 在下面才赋值：先声明变量，闭包调用时再读。
 	var rt *router.Router
@@ -634,6 +641,7 @@ func main() {
 		HA: haClient, Netease: netease, Agent: agentClient,
 		Agents: agentClients, WakeWordRoutes: cfg.WakeWordRoutes,
 		Reminders: remStore, Memory: memory,
+		Sessions:    convSessions,
 		MusicFolder: cfg.MusicFolder,
 		MPD:         mpdClient, Snap: snapClient,
 		SnapLatencies: cfg.Hub.SnapcastLatencies,
@@ -918,6 +926,8 @@ func main() {
 				log.Printf("对讲扫荡：超时挂断: %v", ended)
 			}
 			rt.SweepEmergency(time.Now())
+			// 多轮对话会话过期清理（内存释放；不调也行，取用时惰性清）。
+			rt.SweepSessions(time.Now())
 		}
 	}()
 
