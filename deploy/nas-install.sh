@@ -57,6 +57,27 @@ if ! [[ "$NAS_SSH" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+$ ]]; then
   echo "FAIL: NAS_SSH 格式不对：$NAS_SSH（应为 user@host，如 root@192.168.1.10）"; exit 1
 fi
 
+# ---------- preflight 门禁（feat/preflight：deploy/preflight.sh）----------
+# 选择：在 nas-install.sh 开头加门禁，不另起 deploy/install.sh 包装器——
+# nas-install.sh 本身就是唯一的一键部署入口（NAS_CHECKLIST.md 与
+# deploy/README.md 都这么写），再包一层只会多一个入口、检查逻辑还与
+# 下面 §0 的预检查重叠。preflight 失败即停在传文件之前。
+# preflight 自己会读 NAS_SSH：已设时 docker/端口/镜像查 NAS，否则查本机；
+# .env/配置/证书种子永远查本机（将要传过去的文件）。
+# 紧急绕过：SKIP_PREFLIGHT=1（会明确打印；只应在已知原因时用）。
+export NAS_SSH
+if [ "${SKIP_PREFLIGHT:-0}" != "1" ]; then
+  info "preflight 门禁（deploy/preflight.sh；失败即停，不传文件）"
+  if [ -x deploy/preflight.sh ]; then
+    ./deploy/preflight.sh \
+      || { echo "preflight 未通过：先修好上面 FAIL 的项再部署（单项可用 --skip-* 跳过，见 ./deploy/preflight.sh --help；紧急绕过：SKIP_PREFLIGHT=1）"; exit 1; }
+  else
+    echo "WARN: 找不到可执行的 deploy/preflight.sh，跳过门禁（直接跑 §0 预检查）"
+  fi
+else
+  echo "WARN: SKIP_PREFLIGHT=1，preflight 门禁已跳过（后果自负）"
+fi
+
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 $NAS_SSH"
 SCP="scp -o BatchMode=yes -o ConnectTimeout=10"
 
