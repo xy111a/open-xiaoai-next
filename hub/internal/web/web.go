@@ -464,7 +464,7 @@ button{font:inherit;background:var(--accent);color:#fff;border:0;border-radius:9
 button.ghost{background:#fff;color:var(--accent);border:1px solid var(--accent)}
 button.danger{background:var(--bad)}
 button:disabled{opacity:.5;cursor:default}
-input,select{font:inherit;padding:9px 11px;border:1px solid #d0d5dd;border-radius:9px;width:100%;background:#fff}
+input,select{font:inherit;padding:9px 11px;border:1px solid #d0d5dd;border-radius:9px;width:100%;background:#fff;height:42px}
 input:focus,select:focus{outline:2px solid var(--accent-bg);border-color:var(--accent)}
 label{font-size:13px;color:var(--muted);display:block;margin:0 0 5px;font-weight:600}
 .field{flex:1;min-width:150px;margin-bottom:12px}
