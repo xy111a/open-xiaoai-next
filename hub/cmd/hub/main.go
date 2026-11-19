@@ -505,6 +505,20 @@ func main() {
 			log.Printf("HA 已连接: %s", cfg.HomeAssistant.URL)
 		}
 	}
+	// HA 融合 b：media_player 上报器（REST POST /api/states，与
+	// 上面的 WebSocket 客户端共用 HASS_TOKEN，但不依赖 WS 是否连通；
+	// WS 断线时上报仍可工作）。开关见 home_assistant
+	// .media_player_enabled（默认开，显式 false 才关）；上报循环
+	// 在 Router 建好后启动（见下面的 media-player 同步 goroutine）。
+	var mediaReporter *ha.Reporter
+	if cfg.HomeAssistant.URL != "" && cfg.HomeAssistant.MediaPlayerEnabledOrDefault() {
+		if r, err := ha.NewReporterFromWSURL(cfg.HomeAssistant.URL, config.HASSToken()); err != nil {
+			log.Printf("HA media_player 上报未启用：%v", err)
+		} else {
+			mediaReporter = r
+			log.Printf("HA media_player 上报已启用（REST）：%s", cfg.HomeAssistant.URL)
+		}
+	}
 	netease := music.NewNetease(cfg.Netease.API)
 	// 网易云扫码登录（融合 B）：cookie 存在 Hub 数据卷
 	// <data_dir>/netease-cookie.json（0600），只供 SongURL 取 VIP 歌用；
@@ -733,6 +747,50 @@ func main() {
 			}
 		}
 	}()
+
+	// HA 融合 b：media_player 同步循环——每 15 秒读一次 MPD 全屋
+	// 播放状态 + 注册表设备表，上报到 HA（每台音箱一个
+	// media_player.open_xiaoai_* 实体）。Reporter 内部去重：
+	// 状态/音量/曲名都没变时不发请求。MPD 未接或无设备时跳过
+	// 本轮（只记 debug 级日志，不刷屏）；上报失败只记日志，
+	// 下一轮重试，绝不影响 Hub 主流程。退出时随 done 通道停。
+	if mediaReporter != nil {
+		go func() {
+			syncMediaPlayers := func() {
+				st, cur, err := rt.PlaybackStatus(context.Background())
+				if err != nil {
+					return // MPD 未接：本轮跳过
+				}
+				devices := reg.All()
+				if len(devices) == 0 {
+					return
+				}
+				infos := make([]ha.DeviceInfo, 0, len(devices))
+				for _, d := range devices {
+					infos = append(infos, ha.DeviceInfo{ID: d.ID, Room: d.Room, Model: d.Model, Online: d.Online})
+				}
+				title, artist := cur.Title, cur.Artist
+				if title == "" {
+					title = cur.Name // MPD 没写 Title 时用 Name 兜底
+				}
+				if err := mediaReporter.PushAll(context.Background(),
+					ha.BuildPlayback(infos, st.State, st.Volume, title, artist)); err != nil {
+					log.Printf("HA media_player 上报失败（下轮重试）: %v", err)
+				}
+			}
+			syncMediaPlayers() // 启动即同步一次，不等第一个 15 秒
+			ticker := time.NewTicker(15 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					syncMediaPlayers()
+				}
+			}
+		}()
+	}
 
 	// Pipeline 的 onReply：把回答的 Opus 帧发给对应设备播放
 	//（P1-16/N-P1-3：统一走 playFrames——start_play → 帧 → stop_play，

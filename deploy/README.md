@@ -42,7 +42,8 @@ NAS 上实际运行未验证）。
 
 - 少一个容器、少一次转发、少一个 8095 对外端口；登录从 MA 界面收进 Hub Web 面板。
 - 代价：HA 里没了现成的音乐 `media_player`（以前是 MA 提供的）；语音点歌与 Hub Web 控制不受影响。
-  以后要不要由 Hub 自己向 HA 暴露播放状态，只提方案、不做（见 `MUSIC_FUSION.md`“已知取舍”）。
+  2026-11-19 HA 融合 b 已补上：Hub 自己向 HA 上报播放状态（见下文“Home Assistant
+  深度融合”与 `docs/HA_MEDIA_PLAYER.md`）。
 - 网易云接口漂移仍由 `netease-api` 上游扛（非官方 API，随时可能失效）。
 
 ### 部署迁移说明（从 MA 版升级）
@@ -181,3 +182,18 @@ API 也自带一个演示页 `public/qrlogin.html`，但本部署的标准路径
 - Snapcast 参数沿用已写的两房间包（`speaker-snapcast-3room/`，同样未实测），
   包括 fifo 必须是文件（`/tmp/snapfifo/snapfifo`）这个已修过的坑。
 - 网易云 VIP 歌需要 VIP 账号；非官方 API 可能失效，Cookie 过期要扫码重登。
+
+## Home Assistant 深度融合
+
+- **Wyoming STT/TTS 注册**：把 NAS 上的 Whisper（:10300）与 Piper
+  （:10200）注册进 HA 做语音识别/合成——先在 NAS 上跑探针
+  `go run ./cmd/wyoming-probe`，再按步骤加集成。详见
+  [`docs/HA_WYOMING.md`](../docs/HA_WYOMING.md)（注意先确认 HA
+  容器的网络模式：端口只绑了 `127.0.0.1`，HA 须能连到 NAS 本机回环）。
+- **音箱 media_player 实体**：Hub 每 15 秒把注册表里的音箱上报给
+  HA（`media_player.open_xiaoai_*`，state/音量/当前曲；默认开，
+  `home_assistant.media_player_enabled: false` 可关）。只做状态上报，
+  HA 里控制音箱（播放/暂停/音量）尚未接。详见
+  [`docs/HA_MEDIA_PLAYER.md`](../docs/HA_MEDIA_PLAYER.md)。
+- 两项都只在 stub/假服务上验证过，尚未在真 NAS、真 HA 上走通过；
+  待验证清单见各文档末尾。

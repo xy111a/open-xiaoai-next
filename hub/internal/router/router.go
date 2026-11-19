@@ -998,6 +998,25 @@ func (r *Router) MusicResume(_ context.Context) error {
 	return mpd.Resume()
 }
 
+// PlaybackStatus 取 Hub 侧的播放状态：MPD status（含音量）+ 当前曲。
+// HA media_player 上报（main.go 同步循环）用它；Web /api/music/*
+// 用的 PlaybackState 不含音量，保持原样不动。
+func (r *Router) PlaybackStatus(_ context.Context) (music.MPDStatus, music.MPDSong, error) {
+	mpd := r.mpd()
+	if mpd == nil {
+		return music.MPDStatus{}, music.MPDSong{}, fmt.Errorf("MPD 未连接")
+	}
+	st, err := mpd.Status()
+	if err != nil {
+		return music.MPDStatus{}, music.MPDSong{}, err
+	}
+	cur, err := mpd.CurrentSong()
+	if err != nil {
+		return music.MPDStatus{}, music.MPDSong{}, err
+	}
+	return st, cur, nil
+}
+
 // MusicNext 下一首（Web /api/music/next 与语音“下一首”共用）。
 func (r *Router) MusicNext(_ context.Context) error {
 	mpd := r.mpd()
