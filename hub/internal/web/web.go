@@ -416,6 +416,9 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	//    Hub 回来。唤醒词不支持热修改，重启是必须的（bai 接受）。
 	//  - 排版：粘性顶栏（标题+总状态）；主网格用 auto-fit/minmax 自适应，
 	//    任意缩放都不挤压（窄屏自动单栏）；表格横向滚动；body 禁横向溢出。
+	//    表单字段用 .form-grid（auto-fit/minmax(240px,1fr)），每栏至少
+	//    240px 宽——之前 .row + .field{flex:1;min-width:150px} 把 7 个
+	//    配置项压成 6 窄 + 1 宽，URL 输入框尤其挤。
 	//  - 单文件内嵌，无外部依赖；JS 里不用反引号（Go raw string 不能含反引号）。
 	fmt.Fprint(w, `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>小爱音箱 · Hub</title>
 <style>
@@ -440,6 +443,8 @@ main{max-width:1080px;margin:0 auto;padding:18px 16px 0;display:grid;grid-templa
 .card h2::before{content:"";width:4px;height:18px;border-radius:2px;background:var(--accent)}
 .card .desc{color:var(--muted);font-size:13px;margin:0 0 14px}
 .row{display:flex;gap:10px;flex-wrap:wrap}
+.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-bottom:12px}
+.form-grid .field{margin-bottom:0;min-width:0}
 .stat{flex:1;min-width:110px;background:#f9fafb;border:1px solid var(--line);border-radius:10px;padding:12px 14px}
 .stat .k{font-size:13px;color:var(--muted)}
 .stat .v{font-size:22px;font-weight:700;margin-top:4px}
@@ -525,7 +530,7 @@ pre.lyric{white-space:pre-wrap;font-size:13px;max-height:220px;overflow:auto;bac
 <div class="muted" id="qrmsg" style="margin-top:8px"></div></div>
 
 <div class="card span2"><h2>配置</h2><p class="desc">直接改 Hub 配置（走 PUT /api/config，后端校验后写 config.yaml 并热更新内存配置）。Agent / HA 类连接在 Hub 重启后生效。</p>
-<div class="row">
+<div class="form-grid">
 <div class="field"><label>唤醒词</label><input id="cfg-wake" placeholder="如 你好小李"></div>
 <div class="field"><label>唤醒词走哪个 Agent</label><select id="cfg-route"><option value="qwen">qwen（本地 Qwen3.5-4B）</option><option value="hermes">hermes</option><option value="openclaw">openclaw</option></select></div>
 <div class="field"><label>Home Assistant 地址</label><input id="cfg-ha" placeholder="ws://192.168.88.247:8123"></div>
@@ -539,10 +544,10 @@ pre.lyric{white-space:pre-wrap;font-size:13px;max-height:220px;overflow:auto;bac
 
 <div class="card"><h2>固件 OTA</h2><p class="desc">给音箱下发新固件（只许 https 白名单地址）。</p>
 <div id="otajobs"><p class="muted">加载中…</p></div>
-<div class="row" style="margin-top:12px">
+<div class="form-grid" style="margin-top:12px">
 <div class="field"><label>设备 ID</label><input id="ota-dev" placeholder="如 oh2p-001"></div>
 <div class="field"><label>版本</label><input id="ota-ver" placeholder="如 0.2.0"></div></div>
-<div class="row"><div class="field"><label>固件 URL（只许 https 白名单）</label><input id="ota-url" placeholder="https://…"></div>
+<div class="form-grid"><div class="field"><label>固件 URL（只许 https 白名单）</label><input id="ota-url" placeholder="https://…"></div>
 <div class="field"><label>SHA-256</label><input id="ota-sha" placeholder="64 位 hex"></div></div>
 <button id="ota-push">下发 OTA</button> <span class="err" id="otaerr"></span></div>
 
