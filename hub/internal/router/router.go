@@ -37,6 +37,7 @@ import (
 	"github.com/huajun/open-xiaoai-next/hub/internal/agent"
 	"github.com/huajun/open-xiaoai-next/hub/internal/ha"
 	"github.com/huajun/open-xiaoai-next/hub/internal/music"
+	"github.com/huajun/open-xiaoai-next/hub/internal/observability"
 	"github.com/huajun/open-xiaoai-next/hub/internal/registry"
 	"github.com/huajun/open-xiaoai-next/hub/internal/reminders"
 )
@@ -119,6 +120,15 @@ type Router struct {
 	// wakeWords 是设备最近一次唤醒词（P1-38：多 Agent 路由用）。
 	wakeMu    sync.Mutex
 	wakeWords map[string]string
+
+	// Latency 是可选的分段延迟记录器（可观测性）：main 注入
+	// observability.Recorder；为 nil 时不记录。
+	// Route 里只记两段，均写进语音管线 Begin 的进行中交互：
+	// 真正跑 LLM 对话时记 llm_ms（HA/音乐/提醒等本地快路不记，
+	// 所以 llm_ms 缺失 = 本句没走 LLM，不是没测到）；
+	// 点歌成功时记 music_ms（搜歌+取地址+MPD 起播的耗时，
+	// 见 music() 入口的计时起点）。
+	Latency *observability.Recorder
 }
 
 // currentTrack 是 Hub 内存里的当前曲（最近一次点歌成功的结果）。
@@ -337,10 +347,12 @@ func (r *Router) Route(ctx context.Context, deviceID, text string) (string, erro
 	if ag == nil {
 		return "抱歉，我现在没接大脑（Agent 未配置），只能执行家电、音乐和提醒。", nil
 	}
+	llmStart := time.Now()
 	out, err := ag.Chat(ctx, []agent.Message{
 		{Role: "system", Content: "你是家里的语音管家，回答简短口语化，一两句话。"},
 		{Role: "user", Content: text},
 	})
+	r.Latency.RecordStageForDevice(deviceID, observability.StageLLM, time.Since(llmStart))
 	if err != nil {
 		return "", err
 	}
@@ -791,11 +803,20 @@ func fetchSongURLs(ctx context.Context, netease *music.NeteaseClient, songs []mu
 	return urls, lastErr
 }
 
+// noteMusicPlayed 记一次点歌起播耗时（从 music() 入口算起）：
+// 问答进行中写进该条语音交互的 music_ms，不在问答里则单独立一条
+// music 记录（见 observability.Recorder.RecordMusic）。
+// Latency 为 nil 时空操作。
+func (r *Router) noteMusicPlayed(deviceID string, start time.Time) {
+	r.Latency.RecordMusic(deviceID, time.Since(start))
+}
+
 // musicSlowFallback 是点歌超时后的本地兜底（H-1）：Router 只有一个回复
 // 通道，语音管线把返回的回复整句 TTS 播出，所以“网易云有点慢，先试本地”
 // 这句播报就落在回复句首，再接本地结果，不另起播报通道。
-func (r *Router) musicSlowFallback(ctx context.Context, query string) (string, bool, error) {
+func (r *Router) musicSlowFallback(ctx context.Context, deviceID, query string, start time.Time) (string, bool, error) {
 	if reply, ok := r.playLocal(ctx, query); ok {
+		r.noteMusicPlayed(deviceID, start)
 		return "网易云有点慢，先试本地，" + reply, true, nil
 	}
 	if !r.localMusicAvailable() {
@@ -852,6 +873,10 @@ func (r *Router) music(ctx context.Context, deviceID, text string) (string, bool
 	if query == "" {
 		return "", false, nil
 	}
+	// 可观测性：点歌计时起点——搜歌+取地址+MPD 起播（或本地兜底起播）
+	// 的总耗时记为 music_ms；播放控制（暂停/继续等）在上面已返回，
+	// 不计入点歌。
+	musicStart := time.Now()
 	// 快照运行时可替换的依赖（MPD/Snap 可能被后台重试补接）。
 	r.depsMu.RLock()
 	netease := r.deps.Netease
@@ -874,16 +899,18 @@ func (r *Router) music(ctx context.Context, deviceID, text string) (string, bool
 		// 不等满 15s 单次超时、更不等串行 3 首的最坏 60–90s。
 		if errors.Is(musicCtx.Err(), context.DeadlineExceeded) {
 			log.Printf("netease: 搜歌 %q 超时（预算 %s），先试本地兜底", query, r.musicBudget())
-			return r.musicSlowFallback(ctx, query)
+			return r.musicSlowFallback(ctx, deviceID, query, musicStart)
 		}
 		log.Printf("netease: 搜歌 %q 失败，先试本地兜底: %v", query, err)
 		if reply, ok := r.playLocal(ctx, query); ok {
+			r.noteMusicPlayed(deviceID, musicStart)
 			return reply, true, nil
 		}
 		return "网易云搜歌失败，本地曲库里也没有这首歌，请稍后再试。", true, nil
 	}
 	if len(songs) == 0 {
 		if reply, ok := r.playLocal(ctx, query); ok {
+			r.noteMusicPlayed(deviceID, musicStart)
 			return reply, true, nil
 		}
 		return "没搜到“" + query + "”，换个歌名试试？", true, nil
@@ -902,16 +929,18 @@ func (r *Router) music(ctx context.Context, deviceID, text string) (string, bool
 		}
 		r.setCurrent(song, "netease")
 		r.applySnapcast()
+		r.noteMusicPlayed(deviceID, musicStart)
 		return "正在播放" + displaySongName(song) + "。", true, nil
 	}
 	// 全失败：取地址阶段被预算掐断 → 按超时走（先播报再试本地）；
 	// 否则是确实无可播地址（VIP/无版权等），走原有明确回复。
 	if errors.Is(musicCtx.Err(), context.DeadlineExceeded) {
 		log.Printf("netease: 直连点歌 %q 取地址超时（预算 %s），走本地兜底", query, r.musicBudget())
-		return r.musicSlowFallback(ctx, query)
+		return r.musicSlowFallback(ctx, deviceID, query, musicStart)
 	}
 	log.Printf("netease: 直连点歌 %q 失败（%v），走本地兜底", query, lastErr)
 	if reply, ok := r.playLocal(ctx, query); ok {
+		r.noteMusicPlayed(deviceID, musicStart)
 		return reply, true, nil
 	}
 	if !r.localMusicAvailable() {

@@ -32,6 +32,7 @@ import (
 
 	"github.com/huajun/open-xiaoai-next/hub/internal/config"
 	"github.com/huajun/open-xiaoai-next/hub/internal/music"
+	"github.com/huajun/open-xiaoai-next/hub/internal/observability"
 	"github.com/huajun/open-xiaoai-next/hub/internal/ota"
 	"github.com/huajun/open-xiaoai-next/hub/internal/registry"
 )
@@ -139,6 +140,16 @@ type Server struct {
 	// 为 nil 时登录端点一律 503。
 	NeteaseAuth *music.NeteaseAuth
 
+	// Latency 是分段延迟记录器（可观测性，main 注入）：
+	// /api/latency 读它的最近 20 次交互，/api/status 附最新一条。
+	// 为 nil 时 /api/latency 返回空列表，不 503——“还没人说过话”
+	// 与“没接线”在面板上没有区别，不值得为此多一个错误态。
+	Latency *observability.Recorder
+	// Health 是 7 容器健康检查器（可观测性，main 注入）：
+	// /api/health 每次调用都实时探活一次。
+	// 为 nil 时 /api/health 回 503（健康检查未接线）。
+	Health *observability.Checker
+
 	authMu       sync.Mutex
 	authFailures map[string]*authAttempt
 
@@ -201,6 +212,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", s.index)
 	mux.HandleFunc("/api/status", s.requireAuth(s.status))
 	mux.HandleFunc("/api/devices", s.requireAuth(s.devices))
+	mux.HandleFunc("/api/latency", s.requireAuth(s.latency))
+	mux.HandleFunc("/api/health", s.requireAuth(s.health))
 	mux.HandleFunc("/api/config", s.requireAuth(s.configAPI))
 	mux.HandleFunc("/api/ota", s.requireAuth(s.otaAPI))
 	mux.HandleFunc("/api/fingerprint", s.requireAuth(s.fingerprintAPI))
@@ -377,12 +390,137 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// Web 面板：状态 + 设备 + 系统健康（7 容器探活）+ 分段延迟。
+	// /api/* 都要 Bearer Token（OPEN_XIAOAI_WEB_TOKEN）：Token 存在
+	// sessionStorage（关掉标签页即丢，不落 localStorage），
+	// 未填/401 时页面顶部提示，不静默画空表。
+	// 响应式：卡片用 auto-fit 网格（320px 下单列），表格包在
+	// .tablewrap 里横向滚动，页面本身不横向溢出。
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>open-xiaoai-next</title>
-<style>body{font-family:system-ui;max-width:720px;margin:40px auto;padding:0 16px}table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:6px 10px}</style>
-</head><body><h1>open-xiaoai-next</h1><p>Hub 运行中。用 <code>/api/status</code>、<code>/api/devices</code>、<code>/api/config</code>、<code>/api/ota</code> 管理。</p>
-<div id="s">加载中…</div><script>
-fetch('/api/status').then(r=>r.json()).then(j=>{document.getElementById('s').innerHTML='<pre>'+JSON.stringify(j,null,2)+'</pre>'});
+	fmt.Fprint(w, `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>open-xiaoai-next</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;max-width:960px;margin:24px auto;padding:0 12px;color:#222;line-height:1.5}
+h1{font-size:20px;margin:0 0 4px}
+h2{font-size:16px;margin:0 0 8px}
+p{margin:4px 0}
+.muted{color:#666;font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px;margin-top:12px}
+.card{border:1px solid #ddd;border-radius:8px;padding:12px;min-width:0;background:#fff}
+.wide{grid-column:1/-1}
+.tablewrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:13px}
+td,th{border-bottom:1px solid #eee;padding:6px 8px;text-align:left;vertical-align:top}
+th{color:#666;font-weight:600;white-space:nowrap}
+td.detail{word-break:break-word;min-width:140px}
+.ok{color:#137333;font-weight:600}
+.bad{color:#b3261e;font-weight:600}
+.dim{color:#888}
+.tokenrow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:12px}
+.tokenrow input{flex:1 1 200px;min-width:0;padding:8px;border:1px solid #ccc;border-radius:6px;font-size:14px}
+button{padding:8px 14px;border:1px solid #ccc;border-radius:6px;background:#f5f5f5;font-size:14px;cursor:pointer}
+button:hover{background:#e8e8e8}
+.bar-row{display:grid;grid-template-columns:88px 1fr 64px;gap:8px;align-items:center;margin:6px 0;font-size:13px}
+.bar-track{height:10px;background:#eee;border-radius:5px;overflow:hidden}
+.bar-fill{height:100%;background:#4a90d9;border-radius:5px}
+.bar-ms{text-align:right;white-space:nowrap}
+#err{color:#b3261e;font-size:13px}
+</style>
+</head><body>
+<h1>open-xiaoai-next</h1>
+<p class="muted">Hub 运行中。面板只绑回环地址，远程管理请走 SSH 隧道；接口都要 Web Token。</p>
+<div class="tokenrow">
+<input id="token" type="password" placeholder="Web Token（OPEN_XIAOAI_WEB_TOKEN）" autocomplete="off">
+<button id="saveToken">保存 Token</button>
+<button id="refresh">刷新</button>
+<span id="err"></span>
+</div>
+<div class="grid">
+<div class="card"><h2>状态</h2><div id="status">加载中…</div></div>
+<div class="card"><h2>设备</h2><div id="devices">加载中…</div></div>
+<div class="card wide"><h2>系统健康（7 个容器）</h2><div id="health">加载中…</div></div>
+<div class="card wide"><h2>语音延迟（最近一次）</h2><div id="latency">加载中…</div></div>
+<div class="card wide"><h2>最近交互（最多 20 条）</h2><div class="tablewrap"><div id="recent">加载中…</div></div></div>
+</div>
+<p class="muted">接口：<code>/api/status</code>、<code>/api/devices</code>、<code>/api/health</code>、<code>/api/latency</code>、<code>/api/config</code>、<code>/api/ota</code>。健康每 30 秒自动刷新一次。</p>
+<script>
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function token(){return sessionStorage.getItem('oxn-web-token')||'';}
+function showErr(m){document.getElementById('err').textContent=m||'';}
+function api(p){
+  return fetch(p,{headers:{'Authorization':'Bearer '+token()}}).then(function(r){
+    if(r.status===401){showErr('Token 未填或无效：请在上方输入 Web Token 后点保存。');throw new Error('401');}
+    return r.json().then(function(j){if(!r.ok){throw new Error(j.error||('HTTP '+r.status));}return j;});
+  });
+}
+var STAGE_LABELS={'kws_ms':'唤醒 KWS','stt_ms':'识别 STT','llm_ms':'对话 LLM','tts_ms':'合成 TTS','music_ms':'点歌播放'};
+var STAGE_ORDER=['kws_ms','stt_ms','llm_ms','tts_ms','music_ms'];
+function fmtTime(s){if(!s)return '—';try{return new Date(s).toLocaleString('zh-CN',{hour12:false});}catch(e){return s;}}
+function stageBars(it){
+  if(!it)return '<p class="muted">暂无语音交互记录。</p>';
+  var total=it.total_ms||0;
+  var h='<p>设备 '+esc(it.device_id)+' · '+esc(it.kind==='music'?'点歌':'语音问答')+' · '+fmtTime(it.started_at)+' · 总计 <b>'+total+' ms</b>'+(it.ok?'':' · <span class="bad">失败：'+esc(it.error||'')+'</span>')+'</p>';
+  STAGE_ORDER.forEach(function(k){
+    var v=(it.stages||{})[k];
+    if(v==null)return;
+    var pct=total>0?Math.min(100,Math.round(v/total*100)):0;
+    h+='<div class="bar-row"><span>'+STAGE_LABELS[k]+'</span><span class="bar-track"><span class="bar-fill" style="display:block;width:'+pct+'%"></span></span><span class="bar-ms">'+v+' ms</span></div>';
+  });
+  return h;
+}
+function renderStatus(j){
+  var h='<p>唤醒词：'+esc(j.wake_word||'—')+'</p>';
+  h+='<p>设备：'+esc(j.online)+' 在线 / '+esc(j.devices)+' 已注册</p>';
+  h+='<p>房间：'+esc((j.rooms||[]).join('、')||'未认领')+'</p>';
+  h+='<p>KWS 边车：'+(j.kws_status==='ok'?'<span class="ok">正常</span>':j.kws_status==='down'?'<span class="bad">不可用（唤醒降级）</span>':'<span class="dim">未启用</span>')+'</p>';
+  document.getElementById('status').innerHTML=h;
+  document.getElementById('latency').innerHTML=stageBars(j.latest_latency||null);
+}
+function renderDevices(list){
+  if(!list||list.length===0){document.getElementById('devices').innerHTML='<p class="muted">暂无设备注册。</p>';return;}
+  var h='<table><tr><th>设备</th><th>型号</th><th>房间</th></tr>';
+  list.forEach(function(d){
+    h+='<tr><td>'+esc(d.ID||d.id||'')+'</td><td>'+esc(d.Model||d.model||'')+'</td><td>'+esc(d.Room||d.room||'—')+'</td></tr>';
+  });
+  document.getElementById('devices').innerHTML=h+'</table>';
+}
+function renderHealth(rep){
+  var h='<p>'+esc(rep.healthy)+' / '+esc(rep.total)+' 正常'+(rep.down?(' · <span class="bad">'+esc(rep.down)+' 个异常</span>'):'')+'<span class="muted">（'+fmtTime(rep.checked_at)+' 探活）</span></p>';
+  h+='<div class="tablewrap"><table><tr><th>服务</th><th>容器</th><th>状态</th><th>延迟</th><th>详情</th></tr>';
+  (rep.services||[]).forEach(function(s){
+    var st=s.status==='ok'?'<span class="ok">正常</span>':s.status==='disabled'?'<span class="dim">未启用</span>':'<span class="bad">异常</span>';
+    h+='<tr><td>'+esc(s.name)+'</td><td>'+esc(s.container)+'</td><td>'+st+'</td><td>'+esc(s.latency_ms)+' ms</td><td class="detail">'+esc(s.detail||'')+'</td></tr>';
+  });
+  document.getElementById('health').innerHTML=h+'</table></div>';
+}
+function renderRecent(j){
+  var list=j.interactions||[];
+  if(list.length===0){document.getElementById('recent').innerHTML='<p class="muted">暂无记录——说一句话或点一首歌后这里会出现分段耗时。</p>';return;}
+  var h='<table><tr><th>时间</th><th>设备</th><th>类型</th><th>总计</th><th>KWS</th><th>STT</th><th>LLM</th><th>TTS</th><th>点歌</th><th>结果</th></tr>';
+  list.forEach(function(it){
+    var st=it.stages||{};
+    function cell(k){return st[k]==null?'—':st[k]+' ms';}
+    h+='<tr><td>'+fmtTime(it.started_at)+'</td><td>'+esc(it.device_id)+'</td><td>'+esc(it.kind==='music'?'点歌':'语音')+'</td><td>'+esc(it.total_ms)+' ms</td><td>'+cell('kws_ms')+'</td><td>'+cell('stt_ms')+'</td><td>'+cell('llm_ms')+'</td><td>'+cell('tts_ms')+'</td><td>'+cell('music_ms')+'</td><td>'+(it.ok?'<span class="ok">成功</span>':'<span class="bad">失败</span>')+'</td></tr>';
+  });
+  document.getElementById('recent').innerHTML=h+'</table>';
+}
+function refreshAll(){
+  showErr('');
+  api('/api/status').then(renderStatus).catch(function(e){if(e.message!=='401')showErr('状态加载失败：'+e.message);});
+  api('/api/devices').then(renderDevices).catch(function(){});
+  api('/api/health').then(renderHealth).catch(function(e){if(e.message!=='401')document.getElementById('health').innerHTML='<p class="bad">健康检查失败：'+esc(e.message)+'</p>';});
+  api('/api/latency').then(renderRecent).catch(function(){});
+}
+document.getElementById('saveToken').addEventListener('click',function(){
+  var v=document.getElementById('token').value.trim();
+  if(!v){showErr('请先输入 Token。');return;}
+  sessionStorage.setItem('oxn-web-token',v);
+  document.getElementById('token').value='';
+  refreshAll();
+});
+document.getElementById('refresh').addEventListener('click',refreshAll);
+if(token()){refreshAll();}else{showErr('请先输入 Web Token。');}
+setInterval(function(){if(token()){api('/api/health').then(renderHealth).catch(function(){});api('/api/latency').then(renderRecent).catch(function(){});}},30000);
 </script></body></html>`)
 }
 
@@ -406,10 +544,17 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	lock.Unlock()
 	s.mu.Lock()
 	kwsFn := s.KWSStatus
+	lat := s.Latency
 	s.mu.Unlock()
 	kwsStatus := "disabled"
 	if kwsFn != nil {
 		kwsStatus = kwsFn()
+	}
+	// 可观测性：/api/status 附最新一条延迟记录（没有时为 null），
+	// 面板首页不用再等 /api/latency 也能看到上次问答各段耗时。
+	var latest *observability.Interaction
+	if lat != nil {
+		latest = lat.Latest()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"wake_word": wakeWord,
@@ -420,6 +565,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		// disabled=未启用。kws_down=true 时语音唤醒降级。
 		"kws_status": kwsStatus,
 		"kws_down":   kwsStatus == "down",
+		"latest_latency": latest,
 	})
 }
 
@@ -429,6 +575,51 @@ func (s *Server) devices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.reg.All())
+}
+
+// latency：GET /api/latency，返回最近 20 次交互的分段延迟
+// （倒序：最新在前）。JSON 契约见
+// hub/internal/observability/latency.go 的包注释。
+// Latency 未注入时返回空列表（还没人说过话与没接线无区别，
+// 不另设错误态）。
+func (s *Server) latency(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只支持 GET"})
+		return
+	}
+	s.mu.Lock()
+	lat := s.Latency
+	s.mu.Unlock()
+	var items []observability.Interaction
+	if lat != nil {
+		items = lat.Recent()
+	}
+	if items == nil {
+		items = []observability.Interaction{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"interactions": items,
+		"count":        len(items),
+	})
+}
+
+// health：GET /api/health，对 7 个容器实时探活一次并返回结果
+// （JSON 契约见 hub/internal/observability/health.go 的包注释）。
+// 每次调用都重新探活（单服务超时 3s，全量最坏约 3s，并发跑）；
+// Health 未注入时回 503（健康检查未接线）。
+func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只支持 GET"})
+		return
+	}
+	s.mu.Lock()
+	chk := s.Health
+	s.mu.Unlock()
+	if chk == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "健康检查未接线"})
+		return
+	}
+	writeJSON(w, http.StatusOK, chk.Check(r.Context()))
 }
 
 // mergeJSON 把 patch 递归合并进 dst（P1-22：PUT 是合并不是全量替换）：
