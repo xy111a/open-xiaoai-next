@@ -16,6 +16,28 @@ docker compose logs -f hub
 （用法：`NAS_SSH=root@NAS_IP ./nas-install.sh up`，脚本本身只做过 `bash -n` 校验，
 NAS 上实际运行未验证）。
 
+## 部署前检查（preflight）
+
+`deploy/preflight.sh` 在传文件之前 fail-fast 检查 7 项，任一失败即停并说明原因与修复方法：
+
+1. docker：`docker` + `docker compose` 可用；
+2. .env：`OPEN_XIAOAI_TOKEN` / `OPEN_XIAOAI_WEB_TOKEN` 各 ≥16 位、互不相同、非弱值，`HASS_TOKEN` / `NAS_IP` / `MUSIC_FOLDER` 已填；`LLM_API_KEY` 为空只提示（本地 OVMS，不阻塞）；
+3. 端口：`HUB_PORT`（默认 4399）+ 8080/3000/10300/10200/10400/1704/1705/6600——`HUB_PORT` 被旧 Hub（`oxn-hub`）占着是割接预期（不停旧 Hub 可改 `HUB_PORT=4400` 并行），被未知进程占着则失败；其他端口被占只警告；
+4. 镜像：compose 里的 5 个拉取镜像 + 两个 Dockerfile 的基础镜像，本地没有时查 `manifest inspect` 确认仓库可拉；hub/kws-sidecar 的本地构建输入（`Dockerfile.hub`、`hub-linux-amd64`、kws-sidecar 源文件）缺了也失败；
+5. 证书种子：`hub-certs/`（`ca.crt`/`ca.key`/`hub.crt`/`hub.key`）齐全且配对（`openssl verify` + 公钥比对），`client.toml` 的 `hub_ca_fingerprint` 必须与种子 `hub.crt` 的 SHA-256 指纹一致——没种子就 up 的话 Hub 会生成全新 CA，指纹与音箱 mTLS 同时失效；
+6. 音箱可达性：ping 或 TCP :22（只测可达，不登录）；`SPEAKER_IP` 未设时跳过本项；
+7. 配置：`hub/config.yaml` 与 `docker-compose.yml` 可解析，compose 含 7 个服务。
+
+```
+./deploy/preflight.sh                        # 查本机
+NAS_SSH=huajun@192.168.88.247 ./deploy/preflight.sh   # docker/端口/镜像改查 NAS（经 SSH）
+./deploy/preflight.sh --skip-speaker         # 单项跳过（--skip-docker/--skip-env/--skip-ports/--skip-images/--skip-certs/--skip-speaker/--skip-config）
+SPEAKER_IP=192.168.88.190 ./deploy/preflight.sh       # 音箱 IP（.env 里也可写 SPEAKER_IP=）
+HUB_CERTS_DIR=<种子目录> ./deploy/preflight.sh       # 证书种子不在默认搜索位置时指定
+```
+
+默认搜索证书种子：`deploy/hub-certs` → `release/flash-kit/hub-certs`（含其上两级 `../release/`、`../../release/`，即闪存套件 `flash-kit/hub-certs/` 的位置）；`client.toml` 同理。`nas-install.sh` 开头已接 preflight 门禁（失败即停，不传文件；紧急绕过：`SKIP_PREFLIGHT=1`）。Mock 测试见 `deploy/test_preflight.sh`（`bash deploy/test_preflight.sh`，假 docker/ss/ping/nc/ssh 垫片，不碰真 NAS/真音箱/真 Docker）。
+
 ## 服务
 
 | 服务 | 镜像 | 端口 | 说明 |
