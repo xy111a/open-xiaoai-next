@@ -20,8 +20,9 @@ kws:
 wake_word: "你好小李"
 
 # 多唤醒词路由：唤醒词 → Agent 名
+# 2026-11-19 bai 定：对话用本地 Qwen3.5-4B（NAS 上 OVMS，9000/v3，无需 key）。
 wake_word_routes:
-  "你好小李": hermes
+  "你好小李": qwen
   "你好龙虾": openclaw
 
 # 已注册的设备（P2-27/P2-51：空 IP 占位已删——占位键与设备真实 ID
@@ -75,7 +76,13 @@ skills:
 # 对应唤醒词就路由到哪个；没配进路由的 Agent 也可以存在（备用）。
 # 2026-11-19：Hub 走 host 网络，没有 compose 域名解析，容器名解析不到；
 # hermes 在 127.0.0.1:8642 可达，openclaw 只绑了 NAS 的 LAN IP，所以都用 NAS 的 LAN IP。
+# 2026-11-19 bai 定：对话用本地 Qwen3.5-4B——qwen 直接连 NAS 上已在跑的 OVMS
+# （openvino/model_server，9000/v3，模型 qwen3.5-4b，无需 key；已实测
+# /v3/chat/completions 正常回中文）。hermes 保留在列表里备用，不再是主路由。
 agents:
+  qwen:
+    base_url: "http://192.168.88.247:9000/v3"
+    model: "qwen3.5-4b"
   hermes:
     base_url: "http://192.168.88.247:8642/v1"
     model: "deepseek-chat"

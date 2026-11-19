@@ -122,11 +122,11 @@ if [ -f deploy/.env ]; then
   ok ".env 存在"
   for k in HASS_TOKEN LLM_API_KEY OPEN_XIAOAI_TOKEN OPEN_XIAOAI_WEB_TOKEN; do
     v="$(grep -E "^${k}=" deploy/.env | cut -d= -f2- || true)"
-    # 2026-11-19 bai 定：现在不配大模型做对话。LLM_API_KEY 为空是
-    # 有意的（只影响对话：没接大脑；音乐/家电/提醒照常），不算 FAIL，
+    # 2026-11-19 bai 定：对话用本地 OVMS Qwen3.5-4B（NAS 9000/v3，无需 key），
+    # 所以 LLM_API_KEY 为空是正常的（只在改用云端模型时才需要填），不算 FAIL，
     # 只提示一声；其它三个 Token 为空才是真缺失。
     if [ "$k" = "LLM_API_KEY" ] && [ -z "$v" ]; then
-      echo "WARN: .env 里 LLM_API_KEY 为空（有意不配大模型；对话不可用，音乐/家电/提醒照常。以后想加对话时填上再重启 Hub 即可，无需重刷）"
+      echo "WARN: .env 里 LLM_API_KEY 为空（正常：对话走本地 OVMS Qwen3.5-4B，无需 key；改用云端模型时才需填）"
     else
       [ -n "$v" ] && ok ".env 里 $k 已填" || bad ".env 里 $k 为空"
     fi
