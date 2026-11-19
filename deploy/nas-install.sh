@@ -114,6 +114,7 @@ fi
 [ -f deploy/docker-compose.yml ]     && ok "docker-compose.yml 存在" || bad "缺 deploy/docker-compose.yml"
 [ -f deploy/Dockerfile.hub ]          && ok "Dockerfile.hub 存在" || bad "缺 deploy/Dockerfile.hub"
 [ -f deploy/snapserver.conf ]         && ok "snapserver.conf 存在" || bad "缺 deploy/snapserver.conf"
+[ -f deploy/mpd.conf ]                && ok "mpd.conf 存在" || bad "缺 deploy/mpd.conf（MPD 的 fifo 输出配置，缺了点歌不出声）"
 [ -f hub/config.yaml ]                && ok "hub/config.yaml 存在" || bad "缺 hub/config.yaml"
 python3 -c "import yaml; yaml.safe_load(open('deploy/docker-compose.yml'))" \
   && ok "docker-compose.yml YAML 语法 OK" || bad "docker-compose.yml YAML 语法错误"
@@ -169,7 +170,7 @@ info "2. 传文件到 $NAS_SSH:$NAS_DIR"
 $SSH "mkdir -p $NAS_DIR/deploy $NAS_DIR/hub" \
   && ok "NAS 目录已建 $NAS_DIR/deploy + $NAS_DIR/hub" || { bad "NAS 上建目录失败"; exit 1; }
 $SCP deploy/docker-compose.yml deploy/Dockerfile.hub deploy/hub-linux-amd64 \
-      deploy/snapserver.conf deploy/.env "$NAS_SSH:$NAS_DIR/deploy/" \
+      deploy/snapserver.conf deploy/mpd.conf deploy/.env "$NAS_SSH:$NAS_DIR/deploy/" \
   && ok "部署文件已传到 $NAS_DIR/deploy/" || { bad "scp 传部署文件失败"; exit 1; }
 # P2-55：kws-sidecar 的构建上下文不在 deploy/ 里——compose 里它是
 # build: ../kws-sidecar，且无 image:，只传 deploy/ 的话 NAS 上
@@ -243,10 +244,11 @@ $SSH "sed -i 's#http://netease-api:3000#http://127.0.0.1:3000#' $NAS_DIR/hub/con
     && grep -q \"http://$NAS_IP:18789/v1\" $NAS_DIR/hub/config.yaml \
     && grep -q 'music_folder: /volume1/Music' $NAS_DIR/hub/config.yaml \
     && grep -q \"listen: \\\":$HUB_PORT\\\"\" $NAS_DIR/hub/config.yaml \
+    && grep -q '97c1ed53e3cbd112cbbe217a0efd3400b519bd2ad331108dbf2c911d9cfd2103' $NAS_DIR/hub/config.yaml \
     && ! grep -q 'music_assistant:' $NAS_DIR/hub/config.yaml \
     && grep -E 'api:|url:|kws:|  url:' $NAS_DIR/hub/config.yaml" \
-  && ok "config.yaml 已改：netease.api 走 127.0.0.1:3000，kws 走 ws://127.0.0.1:10400/v1/kws，HA 走 $NAS_IP:8123，agents 走 $NAS_IP:8642 / $NAS_IP:18789，music_folder 是 /volume1/Music，Hub listen 是 :$HUB_PORT（以上改写均已断言；已废弃的 music_assistant 行如有也已删——新 Hub 读到该行会直接拒绝启动）" \
-  || bad "config.yaml 调整失败（sed 后断言不通过：HA/agents/music_folder/listen 任一改写未生效，或 music_assistant 行没删掉，见上）"
+  && ok "config.yaml 已改：netease.api 走 127.0.0.1:3000，kws 走 ws://127.0.0.1:10400/v1/kws，HA 走 $NAS_IP:8123，agents 走 $NAS_IP:8642 / $NAS_IP:18789，music_folder 是 /volume1/Music，Hub listen 是 :$HUB_PORT，discovery_fingerprints 含客户端证书指纹 97c1ed53…（以上改写均已断言；已废弃的 music_assistant 行如有也已删——新 Hub 读到该行会直接拒绝启动）" \
+  || bad "config.yaml 调整失败（sed 后断言不通过：HA/agents/music_folder/listen/指纹白名单任一改写未生效，或 music_assistant 行没删掉，见上）"
 
 [ "$DO_UP" != "up" ] && {
   echo; echo "文件已传好，未执行 up。如需启动：NAS_SSH=$NAS_SSH $0 up"

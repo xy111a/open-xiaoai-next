@@ -219,8 +219,15 @@ services:
       # 音乐文件夹（可选本地兜底）：默认 /volume1/Music；不存在只警告，
       # 不阻塞启动（网易云直连是主路）。缺了也不用建目录。
       - ${MUSIC_FOLDER:-/volume1/Music}:/music:ro
+      # MPD 配置（2026-11-19 再审补：镜像默认配置里 audio_output 全是
+      # 注释，MPD 找不到输出、点歌不出声；必须显式配 fifo 输出到
+      # /tmp/snapfifo/snapfifo，format 与 snapserver.conf 一致）。
+      - ./mpd.conf:/etc/mpd.conf:ro
       - snapfifo:/tmp/snapfifo
       - mpd-data:/var/lib/mpd
+    # 用挂载的配置启动（绕开镜像默认 CMD 的 /etc/mpd/mpd.conf 路径，
+    # Alpine 包默认配置在 /etc/mpd.conf，两者不一致）。
+    command: ["mpd", "--no-daemon", "/etc/mpd.conf"]
 
   # 网易云：只留 NeteaseCloudMusicApi（官方镜像，见 README 镜像核实表）。
   # Music Assistant 已砍（2026-11-18 融合 B）：Hub 直连本 API，
