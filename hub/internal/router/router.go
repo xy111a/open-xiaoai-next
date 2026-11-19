@@ -39,6 +39,7 @@ import (
 	"github.com/huajun/open-xiaoai-next/hub/internal/music"
 	"github.com/huajun/open-xiaoai-next/hub/internal/registry"
 	"github.com/huajun/open-xiaoai-next/hub/internal/reminders"
+	"github.com/huajun/open-xiaoai-next/hub/internal/session"
 )
 
 // Deps 是 Router 依赖的下游（都可为 nil；为 nil 的路会被跳过并在回复里说明）。
@@ -78,6 +79,13 @@ type Deps struct {
 	Agents map[string]*agent.Client
 	// WakeWordRoutes 是多唤醒词路由表（与 config.WakeWordRoutes 同源）。
 	WakeWordRoutes map[string]string
+	// Sessions 是多轮对话会话存根（session.Store，内存 only，不落盘）：
+	// Route 走 Agent 分支时把本轮问答追加进会话，下次把完整历史发给
+	// LLM，跟进式问题（“那明天呢”）才能对上前文；60s 空闲过期。
+	// 为 nil 时 Route 保持旧行为（只发本轮），现有测试与未配场景
+	// 不受影响。只记 Agent 问答：家电/音乐/提醒走本地执行，不进 LLM，
+	// 也不进会话历史。
+	Sessions *session.Store
 }
 
 // IntercomStarter 是 Router 依赖的对讲触发接口（P1-15）：
@@ -272,6 +280,28 @@ func (r *Router) applySnapcast() {
 	}
 }
 
+// sessionKey 取某设备的多轮对话会话 key：已认领房间时按房间
+// （"room:<房间名>"，同房间的两台音箱共享一次对话），未认领时
+// 按设备（"device:<设备 ID>"，各自独立）。新唤醒不重置会话——
+// 同 key 在 60s 空闲超时内继续同一会话，过期后才新开。
+func (r *Router) sessionKey(deviceID string) string {
+	if r.deps.RoomOfDevice != nil {
+		if room := r.deps.RoomOfDevice(deviceID); room != "" {
+			return "room:" + room
+		}
+	}
+	return "device:" + deviceID
+}
+
+// SweepSessions 清理过期的多轮对话会话，返回清理掉的会话数。
+// main.go 的 10s 扫荡调它；Sessions 为 nil 时返回 0。
+func (r *Router) SweepSessions(now time.Time) int {
+	if r.deps.Sessions == nil {
+		return 0
+	}
+	return r.deps.Sessions.Sweep(now)
+}
+
 // emergencyTimeout 返回生效的超时（0 时用默认 60s）。
 func (r *Router) emergencyTimeout() time.Duration {
 	if r.EmergencyTimeout <= 0 {
@@ -333,16 +363,31 @@ func (r *Router) Route(ctx context.Context, deviceID, text string) (string, erro
 		return reply, err
 	}
 	// 默认：Agent 对话（P1-38：按唤醒词路由多 Agent）。
+	// 多轮对话：Sessions 配了时，本轮先拼上该设备/房间会话的
+	// 完整历史再发给 LLM（system + 前文 + 本轮 user），拿到回复
+	// 后才把本轮问答追加进会话——LLM 失败的那轮不进历史，下次
+	// 不会留半截；Sessions 为 nil 时只发本轮（旧行为）。
 	ag := r.agentFor(deviceID)
 	if ag == nil {
 		return "抱歉，我现在没接大脑（Agent 未配置），只能执行家电、音乐和提醒。", nil
 	}
-	out, err := ag.Chat(ctx, []agent.Message{
+	msgs := []agent.Message{
 		{Role: "system", Content: "你是家里的语音管家，回答简短口语化，一两句话。"},
-		{Role: "user", Content: text},
-	})
+	}
+	key := ""
+	if r.deps.Sessions != nil {
+		key = r.sessionKey(deviceID)
+		for _, m := range r.deps.Sessions.History(key) {
+			msgs = append(msgs, agent.Message{Role: m.Role, Content: m.Content})
+		}
+	}
+	msgs = append(msgs, agent.Message{Role: "user", Content: text})
+	out, err := ag.Chat(ctx, msgs)
 	if err != nil {
 		return "", err
+	}
+	if r.deps.Sessions != nil && out != "" {
+		r.deps.Sessions.AppendTurn(key, text, out)
 	}
 	return out, nil
 }

@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -136,6 +137,11 @@ type Hub struct {
 	DiscoveryFingerprints []string `yaml:"discovery_fingerprints" json:"discovery_fingerprints"`
 	// DoNotDisturb 是勿扰时段（FR-10 主动播报跳过该时段），格式 "23:00-07:00"。
 	DoNotDisturb string `yaml:"do_not_disturb" json:"do_not_disturb"`
+	// SessionTimeoutSeconds 是多轮对话会话的空闲超时（秒）：
+	// 60s 内没新一轮对话，会话过期清空，下次从头聊；0 表示默认 60。
+	// 只在内存里记消息历史（role + 文本），不落盘，重启即清空；
+	// 改后重启生效，Web 面板 /api/config 可改。
+	SessionTimeoutSeconds int `yaml:"session_timeout_seconds" json:"session_timeout_seconds"`
 }
 
 // RoomNames 返回已认领的房间名列表。
@@ -152,6 +158,15 @@ func (c *Config) RoomNames() []string {
 // TLSEnabled 返回是否启用 wss。
 func (c *Config) TLSEnabled() bool {
 	return c.Hub.TLS != nil && *c.Hub.TLS
+}
+
+// SessionTimeout 返回多轮对话会话的空闲超时（0 时默认 60s；
+// 负数由 Validate 拒绝，不会走到这里）。
+func (c *Config) SessionTimeout() time.Duration {
+	if c.Hub.SessionTimeoutSeconds <= 0 {
+		return 60 * time.Second
+	}
+	return time.Duration(c.Hub.SessionTimeoutSeconds) * time.Second
 }
 
 // Validate 检查必填项与取值范围，并收紧下游地址：
@@ -240,6 +255,10 @@ func (c *Config) Validate() error {
 		if err := validateDND(c.Hub.DoNotDisturb); err != nil {
 			return err
 		}
+	}
+	// 多轮对话会话超时：负数无意义，直接拒绝；0 表示默认 60s。
+	if c.Hub.SessionTimeoutSeconds < 0 {
+		return fmt.Errorf("hub.session_timeout_seconds 不能为负数，实际是 %d", c.Hub.SessionTimeoutSeconds)
 	}
 	// P1-45：唤醒词路由的值必须是在 agents 里配了的 Agent 名，
 	// 否则唤醒后路由不到任何大脑（P1-38 的回退只能兜底，不能当配置）。
