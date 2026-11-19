@@ -20,6 +20,7 @@ NAS_SSH="${NAS_SSH:-}"                       # 如 huajun@192.168.88.247（必�
 NAS_DIR="${NAS_DIR:-/volume4/docker/open-xiaoai-next}"  # NAS 上的部署目录（2026-11-19：Docker 根目录是 /volume4/docker，不是 /volume1/docker）
 NAS_IP="${NAS_IP:-}"                         # 如 192.168.88.247（不填则从 deploy/.env 读）
 HUB_PORT="${HUB_PORT:-4399}"                 # Hub 监听端口，部署时定：4399=停老 Hub 直接接管；其它值=与老 Hub 并行
+CLIENT_CERT_FINGERPRINT="${CLIENT_CERT_FINGERPRINT:-97c1ed53e3cbd112cbbe217a0efd3400b519bd2ad331108dbf2c911d9cfd2103}"  # 音箱 mTLS 客户端证书的 SHA-256 指纹（LX06 与 OH2P 共用同一张证书）。部署时注入 NAS 端 config.yaml 的 discovery_fingerprints（随仓库发的 config.yaml 里保持为空，见 TestShippedConfigRegistrationDefaults）。若客户端证书重新生成，须同步更新此值（openssl x509 -in client.crt -noout -fingerprint -sha256）。
 DO_UP="${1:-}"                               # 传 up 才执行 docker compose up
 
 PASS=0; FAIL=0
@@ -236,6 +237,12 @@ info "3. NAS 端 config 调整（只改 NAS 上的副本，不动本机 hub/conf
 # 并断言改写结果；音箱端 client.toml 的 hub_url 端口必须与这里一致（见 CHECKLIST）。
 # agents 与 music_folder 的改写是防旧副本：种子已是正确值（NAS 的 LAN IP、/volume1/Music），
 # 但 NAS 上旧副本可能还是容器名 /volume1/music，也在这里一并改过来并断言。
+# 指纹注入（部署时值，幂等）：随仓库发的 config.yaml 里 discovery_fingerprints
+# 为空；这里把 CLIENT_CERT_FINGERPRINT 注入 NAS 端副本（已存在则跳过），
+# 再由下面第 3 步的 grep 断言确认。指纹是部署时才定的值，不写进仓库。
+$SSH "grep -q '$CLIENT_CERT_FINGERPRINT' $NAS_DIR/hub/config.yaml || sed -i 's#^[[:space:]]*discovery_fingerprints:\$#  discovery_fingerprints:\n    - \"$CLIENT_CERT_FINGERPRINT\"#' $NAS_DIR/hub/config.yaml" \
+  && ok "discovery_fingerprints 已含客户端证书指纹" \
+  || bad "注入 discovery_fingerprints 指纹失败"
 $SSH "sed -i 's#http://netease-api:3000#http://127.0.0.1:3000#' $NAS_DIR/hub/config.yaml
   sed -i 's#ws://kws-sidecar:10400#ws://127.0.0.1:10400#' $NAS_DIR/hub/config.yaml
   sed -i \"s#192.168.1.10:8123#$NAS_IP:8123#\" $NAS_DIR/hub/config.yaml
@@ -251,7 +258,7 @@ $SSH "sed -i 's#http://netease-api:3000#http://127.0.0.1:3000#' $NAS_DIR/hub/con
     && grep -q \"http://$NAS_IP:18789/v1\" $NAS_DIR/hub/config.yaml \
     && grep -q 'music_folder: /volume1/Music' $NAS_DIR/hub/config.yaml \
     && grep -q \"listen: \\\":$HUB_PORT\\\"\" $NAS_DIR/hub/config.yaml \
-    && grep -q '97c1ed53e3cbd112cbbe217a0efd3400b519bd2ad331108dbf2c911d9cfd2103' $NAS_DIR/hub/config.yaml \
+    && grep -q '$CLIENT_CERT_FINGERPRINT' $NAS_DIR/hub/config.yaml \
     && ! grep -q 'music_assistant:' $NAS_DIR/hub/config.yaml \
     && grep -E 'api:|url:|kws:|  url:' $NAS_DIR/hub/config.yaml" \
   && ok "config.yaml 已改：netease.api 走 127.0.0.1:3000，kws 走 ws://127.0.0.1:10400/v1/kws，HA 走 $NAS_IP:8123，agents 走 $NAS_IP:8642 / $NAS_IP:18789，music_folder 是 /volume1/Music，Hub listen 是 :$HUB_PORT，discovery_fingerprints 含客户端证书指纹 97c1ed53…（以上改写均已断言；已废弃的 music_assistant 行如有也已删——新 Hub 读到该行会直接拒绝启动）" \

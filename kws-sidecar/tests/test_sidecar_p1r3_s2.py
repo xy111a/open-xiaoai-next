@@ -25,6 +25,18 @@ CHECKLIST = REPO_DIR / "deploy" / "NAS_CHECKLIST.md"
 ENTRYPOINT = SIDECAR_DIR / "entrypoint.sh"
 DOCKERFILE = SIDECAR_DIR / "Dockerfile"
 
+
+def _write_regen_stub(tmp_path):
+    """写一个 regen 替身脚本（只 exit 0），供 entrypoint 测试用。
+    entrypoint 的 happy-path 测试只验证“走到 exec”，不验证 regen 本身；
+    真 regen 脚本在 CI 里会走 sherpa-onnx-cli 分支，而测试用的空
+    tokens.txt 会让 text2token 失败——所以这里用替身隔离。"""
+    stub = tmp_path / "regen-stub.sh"
+    stub.write_text("#!/bin/bash\n# stub: simulate successful keywords.txt regeneration\nexit 0\n",
+                    encoding="utf-8")
+    stub.chmod(0o755)
+    return stub
+
 REQUIRED_MODEL_FILES = (
     "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
     "decoder-epoch-12-avg-2-chunk-16-left-64.onnx",
@@ -75,7 +87,8 @@ def _run_entrypoint_copy(tmp_path, model_dir, extra_env=None):
     返回 CompletedProcess。只传最小环境，避免宿主环境变量干扰。"""
     copy = tmp_path / "entrypoint.sh"
     shutil.copy(ENTRYPOINT, copy)
-    env = {"PATH": os.environ["PATH"], "KWS_MODEL_DIR": str(model_dir)}
+    env = {"PATH": os.environ["PATH"], "KWS_MODEL_DIR": str(model_dir),
+           "REGEN_KEYWORDS_SCRIPT": str(_write_regen_stub(tmp_path))}
     if extra_env:
         env.update(extra_env)
     return subprocess.run(["bash", str(copy)], capture_output=True,
@@ -142,7 +155,8 @@ def test_p1r3_s2_entrypoint_happy_path_reaches_exec(tmp_path):
     copy.write_text(text.replace(
         'exec python /app/server.py "$@"',
         'echo ENTRYPOINT-EXEC-REACHED "$@"'))
-    env = {"PATH": os.environ["PATH"], "KWS_MODEL_DIR": str(model_dir)}
+    env = {"PATH": os.environ["PATH"], "KWS_MODEL_DIR": str(model_dir),
+           "REGEN_KEYWORDS_SCRIPT": str(_write_regen_stub(tmp_path))}
     proc = subprocess.run(["bash", str(copy), "--help"],
                           capture_output=True, text=True, timeout=30,
                           env=env)

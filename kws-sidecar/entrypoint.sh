@@ -61,7 +61,9 @@ if [ -f /app/config.yaml ]; then
 fi
 WAKE_WORD="${WAKE_WORD:-你好小李}"
 echo "==> regenerating keywords.txt for wake word: $WAKE_WORD" >&2
-if ! /app/scripts/regen-keywords.sh "$WAKE_WORD" "$MODEL_DIR"; then
+# REGEN_KEYWORDS_SCRIPT 可覆盖 regen 脚本路径（默认容器内 /app/scripts/regen-keywords.sh；
+# 测试时指向仓库内的 kws-sidecar/scripts/regen-keywords.sh）。
+if ! "${REGEN_KEYWORDS_SCRIPT:-/app/scripts/regen-keywords.sh}" "$WAKE_WORD" "$MODEL_DIR"; then
     echo "FATAL: failed to regenerate keywords.txt for wake word '$WAKE_WORD'; refusing to start with a stale keyword table" >&2
     exit 1
 fi
