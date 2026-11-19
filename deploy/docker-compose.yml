@@ -216,9 +216,9 @@ services:
           cpus: "0.5"
           memory: 512M
     volumes:
-      # 音乐文件夹（可选本地兜底）：默认 /volume1/music；不存在只警告，
+      # 音乐文件夹（可选本地兜底）：默认 /volume1/Music；不存在只警告，
       # 不阻塞启动（网易云直连是主路）。缺了也不用建目录。
-      - ${MUSIC_FOLDER:-/volume1/music}:/music:ro
+      - ${MUSIC_FOLDER:-/volume1/Music}:/music:ro
       - snapfifo:/tmp/snapfifo
       - mpd-data:/var/lib/mpd
 

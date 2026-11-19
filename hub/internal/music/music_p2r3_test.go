@@ -136,7 +136,7 @@ func TestValidatePlayableURL(t *testing.T) {
 		"http://localhost/x.mp3",
 		"https://foo.localhost/x.mp3",
 		"http://127.0.0.1/x.mp3",
-		"http://192.168.1.10/x.mp3",
+		"http://192.168.88.247/x.mp3",
 		"http://10.0.0.5/x.mp3",
 		"http://172.16.0.1/x.mp3",
 		"http://[::1]/x.mp3",
@@ -166,7 +166,7 @@ func TestPlayURLRejectsDisallowedURL(t *testing.T) {
 	for _, bad := range []string{
 		"file:///etc/passwd",
 		"http://127.0.0.1/x.mp3",
-		"http://192.168.1.10/x.mp3",
+		"http://192.168.88.247/x.mp3",
 		"http://localhost/x.mp3",
 		"ftp://music.example.com/x.mp3",
 	} {
@@ -190,7 +190,7 @@ func TestPlayURLRejectsDisallowedURL(t *testing.T) {
 func TestSongURLRejectsDisallowedURL(t *testing.T) {
 	for _, badURL := range []string{
 		"file:///etc/passwd",
-		"http://192.168.1.10/secret.mp3",
+		"http://192.168.88.247/secret.mp3",
 		"http://localhost:3000/x.mp3",
 	} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

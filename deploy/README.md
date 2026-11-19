@@ -13,7 +13,7 @@ docker compose logs -f hub
 ```
 
 按顺序做的检查清单见 `NAS_CHECKLIST.md`；一键传文件 + 检查见 `nas-install.sh`
-（用法：`NAS_SSH=root@NAS_IP ./nas-install.sh up`，脚本本身只做过 `bash -n` 校验，
+（用法：`NAS_SSH=huajun@NAS_IP NAS_DIR=/volume4/docker/open-xiaoai-next HUB_PORT=4399 ./nas-install.sh up`，脚本本身只做过 `bash -n` 校验，
 NAS 上实际运行未验证）。
 
 ## 部署前检查（preflight）
@@ -62,7 +62,7 @@ TLS 证书与网易云 Cookie 随 `hub-data` 卷一起备份（manifest 里单�
 | piper | rhasspy/wyoming-piper | 10200 | zh_CN-huayan-medium，流式合成 |
 | kws-sidecar | 本地构建（kws-sidecar/Dockerfile + server.py，模型首次启动下载到 kws-data 卷） | host（10400） | 服务端唤醒检测（sherpa-onnx WenetSpeech，“你好小李”）；Hub 经 ws://127.0.0.1:10400/v1/kws 连它 |
 | snapserver | ivdata/snapserver | host | 多房间同步播放服务端 |
-| mpd | vimagick/mpd | host | 读 /volume1/music（可选本地兜底），写 snapfifo |
+| mpd | vimagick/mpd | host | 读 /volume1/Music（可选本地兜底），写 snapfifo |
 | netease-api | binaryify/netease_cloud_music_api | 3000 | 网易云非官方 API，只绑 127.0.0.1；本身不保存登录态，Cookie 由 Hub 存在 hub-data 卷，约 1–2 个月过期需重扫 |
 
 > Music Assistant 已砍（2026-11-18 融合 B）：`music-assistant` 服务、`ma-data` 卷、8095 端口全部删除。
@@ -98,7 +98,7 @@ TLS 证书与网易云 Cookie 随 `hub-data` 卷一起备份（manifest 里单�
    确认卷名再删（如 `docker volume rm <卷名>`）。删了 MA 的登录态就作废——没关系，
    Hub 侧登录是独立的，去 Web 面板重扫即可。**不要**用 `docker compose down -v`，那会连
    `hub-data` 等其他卷一起删掉。
-5. **`music_folder` 现在是可选本地兜底**：`/volume1/music` 不建、不放歌也不阻塞启动；
+5. **`music_folder` 现在是可选本地兜底**：`/volume1/Music` 不建、不放歌也不阻塞启动；
    想放本地歌时再建（MPD 读它作降级/本地播放）。
 
 ## 2026-11-17 部署包更新（G）
@@ -143,8 +143,9 @@ TLS 证书与网易云 Cookie 随 `hub-data` 卷一起备份（manifest 里单�
   - vimagick/mpd 镜像的默认配置是否把 `/music` 输出到 `/tmp/snapfifo/snapfifo` 未核实
     （本机无 Docker，拉不了镜像看默认配置）。若 MPD 库为空或 snapserver 收不到流，
     需要挂自定义 mpd.conf。
-  - `hub/config.yaml` 里 HA 地址 `ws://192.168.1.10:8123` 是占位，`nas-install.sh`
-    会按 `.env` 的 `NAS_IP` 改掉。
+  - `hub/config.yaml` 里的 HA 地址已是真实 NAS 地址 `ws://192.168.88.247:8123`
+    （2026-11-19 改）；`nas-install.sh` 第 3 步仍会按 `.env` 的 `NAS_IP` 改写
+    NAS 上的副本（防旧副本还是 `192.168.1.10`），并有 grep 断言。
 
 ## 网易云扫码登录（H，FR-05，融合 B 版）
 
@@ -162,7 +163,7 @@ TLS 证书与网易云 Cookie 随 `hub-data` 卷一起备份（manifest 里单�
 
 **在 Hub Web 面板里扫码**：
 
-1. 电脑上建 SSH 隧道：`ssh -L 8080:127.0.0.1:8080 root@NAS_IP`（保持该终端不退出）。
+1. 电脑上建 SSH 隧道：`ssh -L 8080:127.0.0.1:8080 huajun@NAS_IP`（保持该终端不退出）。
    面板只绑回环（`hub/config.yaml` 里 `web_listen: 127.0.0.1:8080`），浏览器不能直连 `NAS_IP:8080`。
 2. 浏览器开 `http://127.0.0.1:8080`，进 Hub Web 面板 → **网易云登录**页。
    要输 Web Token 时用 `deploy/.env` 里的 `OPEN_XIAOAI_WEB_TOKEN`（不要把 Token 发给别人或贴进群聊）。
@@ -214,7 +215,7 @@ API 也自带一个演示页 `public/qrlogin.html`，但本部署的标准路径
 ## 诚实说明
 
 - 本部署包仍是**未在真机上跑过**（关口 2 BLOCKED）。第一次 `up` 出错最可能是：
-  UGOS Docker 路径、端口占用——把报错贴回来再改。`/volume1/music` 不存在不再是
+  UGOS Docker 路径、端口占用——把报错贴回来再改。`/volume1/Music` 不存在不再是
   失败原因（music_folder 是可选本地兜底，缺了只警告）。
 - Snapcast 参数沿用已写的两房间包（`speaker-snapcast-3room/`，同样未实测），
   包括 fifo 必须是文件（`/tmp/snapfifo/snapfifo`）这个已修过的坑。

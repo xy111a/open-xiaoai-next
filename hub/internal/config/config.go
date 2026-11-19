@@ -34,7 +34,7 @@ type Config struct {
 	// 本地曲库兜底不可用（点歌仍走网易云直连，不阻塞启动）。
 	MusicFolder string `yaml:"music_folder" json:"music_folder"`
 
-	// HomeAssistant 地址，例如 ws://192.168.1.10:8123，Token 走环境变量 HASS_TOKEN。
+	// HomeAssistant 地址，例如 ws://192.168.88.247:8123，Token 走环境变量 HASS_TOKEN。
 	HomeAssistant HomeAssistant `yaml:"home_assistant" json:"home_assistant"`
 
 	// Agents 可用的 Agent（OpenAI 兼容 /v1/chat/completions）。

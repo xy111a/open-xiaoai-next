@@ -115,7 +115,7 @@ func TestValidateDownstreamURLs(t *testing.T) {
 	}
 	// 内网组合（真实 config 风格：私有 IP + Docker 单标签主机名）→ 通过。
 	c = base()
-	c.HomeAssistant.URL = "ws://192.168.1.10:8123"
+	c.HomeAssistant.URL = "ws://192.168.88.247:8123"
 	c.Agents = map[string]Agent{"hermes": {BaseURL: "http://hermes:8642/v1", Model: "deepseek-chat"}}
 	c.Netease.API = "http://netease-api:3000"
 	c.Hub.ScanCIDR = "192.168.1.0/24"

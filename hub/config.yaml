@@ -30,14 +30,15 @@ wake_word_routes:
 # IP 由设备注册时上报；room 由语音认领写入，未认领为空。
 devices: {}
 
-# 音乐文件夹，默认 /volume1/music；不存在时只警告，本地曲库兜底不可用
+# 音乐文件夹，默认 /volume1/Music；不存在时只警告，本地曲库兜底不可用
 #（点歌仍走网易云直连，不阻塞启动）。
-music_folder: /volume1/music
+music_folder: /volume1/Music
 
 # Home Assistant：Token 走环境变量 HASS_TOKEN，不要写进文件。
 # 2026-11-18 bai 定：HA 未配 TLS，用 ws（此前误写成 wss，握手直接失败）。
+# 2026-11-19：HA 就在 NAS 上，地址是 NAS 的 LAN IP（不是旧的 192.168.1.10）。
 home_assistant:
-  url: "ws://192.168.1.10:8123"
+  url: "ws://192.168.88.247:8123"
   # media_player 上报（HA 融合 b）：Hub 每 15 秒把注册表里的音箱
   # 报给 HA 做 media_player.open_xiaoai_* 实体（state/音量/当前曲，
   # 走 REST POST /api/states，与上面 WS 共用 HASS_TOKEN）。
@@ -72,14 +73,16 @@ skills:
 # 云端 LLM（DeepSeek / Claude / 云端 Qwen）的 base_url 走 https 时允许公网地址；
 # http 明文只许内网（密钥不能裸奔）。wake_word_routes 里配了哪个 Agent，
 # 对应唤醒词就路由到哪个；没配进路由的 Agent 也可以存在（备用）。
+# 2026-11-19：Hub 走 host 网络，没有 compose 域名解析，容器名解析不到；
+# hermes 在 127.0.0.1:8642 可达，openclaw 只绑了 NAS 的 LAN IP，所以都用 NAS 的 LAN IP。
 agents:
   hermes:
-    base_url: "http://hermes:8642/v1"
+    base_url: "http://192.168.88.247:8642/v1"
     model: "deepseek-chat"
     # hermes 用全局 LLM_API_KEY；system_prompt 不写就是默认管家提示词。
     system_prompt: "你是家里的语音管家，回答简短口语化，一两句话。"
   openclaw:
-    base_url: "http://openclaw:18789/v1"
+    base_url: "http://192.168.88.247:18789/v1"
     model: "deepseek-chat"
   # 云端例子（默认注释掉）：取消注释 + 在 NAS 环境里 export 对应密钥
   # 再把唤醒词路由指过来即可，不用改代码。注意：只有 OpenAI 兼容
@@ -98,8 +101,10 @@ agents:
 
 # 网易云：NeteaseCloudMusicApi 地址（Hub 直连，MA 已移除；扫码登录走
 # Web 面板 /api/netease/*，cookie 存在 hub-data/netease-cookie.json）。
+# 2026-11-19：同 agents 一样用 127.0.0.1（Hub 走 host 网络，容器名解析不到；
+# 已有 netease-api 容器在 host 3100，新栈的 127.0.0.1:3000 不冲突）。
 netease:
-  api: "http://netease-api:3000"
+  api: "http://127.0.0.1:3000"
 
 # 家电实体别名表：语音只认这里配了的别名；门锁/燃气/热水器不配进来。
 ha_entities:

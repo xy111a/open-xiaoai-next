@@ -221,9 +221,19 @@ musl 包装器是 `~/workspace/tools/zig-cc-arm.sh`
 
 ## 部署到音箱
 
+部署流程以 `release/flash-kit/CHECKLIST.md` 步骤 4 为准（OH2P 优先，LX06 暂缓）。
+音箱的 Dropbear 只提供 ssh-rsa 主机密钥，新版 OpenSSH 默认拒绝，
+所以所有 ssh/scp 必须加 `-o HostKeyAlgorithms=+ssh-rsa`（2026-11-19 实测：
+不加连不上音箱）。新客户端只读 `client.toml`，**不读 `server.txt`**——
+下面这行是旧客户端的做法，**不要再用**：
+`ssh root@<音箱IP> 'echo "wss://<NAS_IP>:4399" > /data/open-xiaoai/server.txt'`
+（旧的 server.txt 留在 /data/open-xiaoai/ 里无害，新客户端忽略它。）
+
 ```bash
-scp target/armv7-unknown-linux-gnueabihf/release/open-xiaoai-client root@<音箱IP>:/data/open-xiaoai/client
-ssh root@<音箱IP> 'echo "wss://<NAS_IP>:4399" > /data/open-xiaoai/server.txt'
+# OH2P（192.168.88.190）：用 client-oh2p.toml（model = "oh2p"），不要用 client.toml（model = "lx06"）
+scp -o HostKeyAlgorithms=+ssh-rsa release/flash-kit/open-xiaoai-client root@192.168.88.190:/data/open-xiaoai/client
+scp -o HostKeyAlgorithms=+ssh-rsa release/flash-kit/client-oh2p.toml root@192.168.88.190:/data/open-xiaoai/client.toml
+scp -o HostKeyAlgorithms=+ssh-rsa release/flash-kit/init.sh release/flash-kit/init.sh.sha256 root@192.168.88.190:/data/
 # 随后由 Hub OTA 统一升级，不用再手动 scp
 ```
 
@@ -231,7 +241,7 @@ ssh root@<音箱IP> 'echo "wss://<NAS_IP>:4399" > /data/open-xiaoai/server.txt'
 
 | 路径 | 内容 | 状态 |
 |---|---|---|
-| `client` | 客户端二进制（gnueabihf 默认产物，见上） | ✅ 已构建（2,444,332 字节，SHA256 e33dd0e575f15c1d61ae33a2d2679ef88284ff136535b268d1ca7f48e20ebd19，服务端唤醒模式后重编） |
+| `client` | 客户端二进制（gnueabihf 默认产物，见上） | ✅ 已构建（2,457,500 字节，SHA256 bdac4280d13028627def8e760d932e9f496344a8f5f0edd4ecb49a33f98fe45d，服务端唤醒模式，`--no-sherpa-kws`；部署包见 release/flash-kit/CHECKLIST.md） |
 | `lib/libsherpa-onnx-c-api.so` | sherpa-onnx C API（KWS 后端，`$ORIGIN/lib` rpath 指向这里） | ⏳ 待定：**server 模式不需要**（默认部署可不装）；local 模式才需要。待 P1-40 的 .so 落定后补（官方预编译版要求 GLIBC 最高 2.34，音箱只有 2.25，**不能直接用**；从源码重编是另一路的工作） |
 | `lib/libonnxruntime.so` | ONNX Runtime（sherpa 的依赖，**同样要求 GLIBC 最高 2.34**，不是早先写的 GLIBC_2.4） | ⏳ 待定：**server 模式不需要**；local 模式才需要，待 P1-40 的 .so 落定后补 |
 | `kws/<模型文件>` | kws-zipformer 模型（见 `kws/README.md` 下载脚本，模型文件不进仓库） | ⏳ **server 模式不需要**；local 模式部署时按脚本下载后拷贝 |
@@ -249,7 +259,7 @@ client.toml 示例（`/data/open-xiaoai/client.toml`；宿主机调试可用
 `OPEN_XIAOAI_CLIENT_TOML` 环境变量改路径）：
 
 ```toml
-hub_url = "wss://192.168.1.10:4399"
+hub_url = "wss://192.168.88.247:4399"
 token = "CHANGE_ME"               # 必须与 Hub 的 OPEN_XIAOAI_TOKEN 一致
 wake_word = "你好小李"
 kws_mode = "server"               # server（默认）= 唤醒在 NAS 边车做，持续推流，
@@ -260,7 +270,8 @@ model = "lx06"                    # lx06 / oh2p
 ram_mb = 256
 tls = true                        # false = 纯 ws，仅本地测试
 hub_ca_fingerprint = "aa:bb:cc:..."  # Hub 自签证书 SHA-256 指纹（可带冒号）；
-                                  # 不配则跳过校验并打警告（仅测试环境可接受）
+                                  # tls=true 时必填（P1-10：缺指纹拒绝启动）；
+                                  # 指纹从 Hub 启动日志或 fingerprints.txt 抄
 room = "客厅"                     # 可选，已认领的房间名
 ```
 

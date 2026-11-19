@@ -46,7 +46,7 @@ fn default_tls() -> bool {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// Hub 地址，例如 wss://192.168.1.10:4399。必填，无默认值
+    /// Hub 地址，例如 wss://192.168.88.247:4399。必填，无默认值
     /// （C-15 / P2-42，2026-11-18 bai 定）：缺失或空串时 `validate()`
     /// 拒绝启动；写死的内网 IP 默认值已删，换网络/NAS 换 IP 时不再
     /// 静默连错地方。
@@ -193,12 +193,12 @@ impl Config {
         }
         if self.hub_url.trim().is_empty() {
             anyhow::bail!(
-                "hub_url is required in client.toml (no default): set it to the Hub WebSocket address, e.g. wss://192.168.1.10:4399"
+                "hub_url is required in client.toml (no default): set it to the Hub WebSocket address, e.g. wss://192.168.88.247:4399"
             )
         }
         if !(self.hub_url.starts_with("ws://") || self.hub_url.starts_with("wss://")) {
             anyhow::bail!(
-                "invalid hub_url {:?}: expected ws:// or wss:// (e.g. wss://192.168.1.10:4399)",
+                "invalid hub_url {:?}: expected ws:// or wss:// (e.g. wss://192.168.88.247:4399)",
                 self.hub_url
             )
         }
@@ -320,7 +320,7 @@ mod tests {
         // 补上 hub_url 后，P1-10：无指纹 + tls=true 仍拒绝启动
         // （以前只 warn 走系统根证书）。配上合法指纹后才通过。
         let mut with_url = cfg.clone();
-        with_url.hub_url = "wss://192.168.1.10:4399".to_string();
+        with_url.hub_url = "wss://192.168.88.247:4399".to_string();
         let err = with_url
             .validate()
             .expect_err("config without fingerprint must fail validation");
@@ -373,7 +373,7 @@ mod tests {
         // P1-10：load_from_str 走 validate，tls=true 时须带合法指纹。
         // C-15：hub_url 必填，TOML 里必须显式写。
         let fp_line = format!("hub_ca_fingerprint = \"{}\"", "aa".repeat(32));
-        let hub_line = "hub_url = \"wss://192.168.1.10:4399\"";
+        let hub_line = "hub_url = \"wss://192.168.88.247:4399\"";
         let local =
             load_from_str(&format!("kws_mode = \"local\"\n{hub_line}\n{fp_line}\n")).unwrap();
         assert_eq!(local.kws_mode, "local");
@@ -481,7 +481,7 @@ mod tests {
     fn validate_requires_fingerprint_when_tls() {
         // C-15：hub_url 必填，构造测试配置时必须显式给。
         let mut cfg = Config {
-            hub_url: "wss://192.168.1.10:4399".to_string(),
+            hub_url: "wss://192.168.88.247:4399".to_string(),
             hub_ca_fingerprint: Some("aa".repeat(32)),
             ..Config::default()
         };
@@ -530,11 +530,11 @@ mod tests {
     fn validate_rejects_bad_hub_url_model_ram() {
         let mut cfg = Config {
             hub_ca_fingerprint: Some("aa".repeat(32)),
-            hub_url: "192.168.1.10:4399".to_string(),
+            hub_url: "192.168.88.247:4399".to_string(),
             ..Config::default()
         };
         assert!(cfg.validate().is_err(), "hub_url without scheme must fail");
-        cfg.hub_url = "wss://192.168.1.10:4399".to_string();
+        cfg.hub_url = "wss://192.168.88.247:4399".to_string();
         cfg.model = "lx05".to_string();
         assert!(cfg.validate().is_err(), "unknown model must fail");
         cfg.model = "oh2p".to_string();

@@ -3,8 +3,12 @@
 #
 # 用法（在本机 open-xiaoai-next/ 目录下跑）：
 #   1. cp deploy/.env.example deploy/.env，填好 NAS_IP / HASS_TOKEN / LLM_API_KEY / OPEN_XIAOAI_TOKEN / OPEN_XIAOAI_WEB_TOKEN
-#   2. NAS_SSH=root@192.168.1.10 ./deploy/nas-install.sh        # 只传文件 + 检查，不 up
-#      NAS_SSH=root@192.168.1.10 ./deploy/nas-install.sh up     # 传文件 + up + 逐项检查
+#   2. NAS_SSH=huajun@192.168.88.247 ./deploy/nas-install.sh        # 只传文件 + 检查，不 up
+#      NAS_SSH=huajun@192.168.88.247 ./deploy/nas-install.sh up     # 传文件 + up + 逐项检查
+#   部署时端口（HUB_PORT）：默认 4399（停掉老 Hub、新 Hub 直接接管 4399，走切换路线）。
+#   若部署时决定新 Hub 与老 Hub 并行（老 Hub 继续占 4399），则设 HUB_PORT=4400
+#   （或其它空闲端口），脚本会把 config.yaml 的 listen 改过去；音箱端 client.toml
+#   的 hub_url 端口也要改成同一个值（见 release/flash-kit/CHECKLIST.md）。
 #
 # 依赖：本机有 scp/ssh；NAS 上已开 SSH、已装 Docker（含 docker compose 插件）。
 # 注意：本脚本只在本机做过 bash -n 语法校验，NAS 上实际运行未验证（关口 2 BLOCKED）。
@@ -12,9 +16,10 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1   # 切到 open-xiaoai-next/
 
-NAS_SSH="${NAS_SSH:-}"                       # 如 root@192.168.1.10（必填）
-NAS_DIR="${NAS_DIR:-/volume1/docker/open-xiaoai-next}"  # NAS 上的部署目录
-NAS_IP="${NAS_IP:-}"                         # 如 192.168.1.10（不填则从 deploy/.env 读）
+NAS_SSH="${NAS_SSH:-}"                       # 如 huajun@192.168.88.247（必填）
+NAS_DIR="${NAS_DIR:-/volume4/docker/open-xiaoai-next}"  # NAS 上的部署目录（2026-11-19：Docker 根目录是 /volume4/docker，不是 /volume1/docker）
+NAS_IP="${NAS_IP:-}"                         # 如 192.168.88.247（不填则从 deploy/.env 读）
+HUB_PORT="${HUB_PORT:-4399}"                 # Hub 监听端口，部署时定：4399=停老 Hub 直接接管；其它值=与老 Hub 并行
 DO_UP="${1:-}"                               # 传 up 才执行 docker compose up
 
 PASS=0; FAIL=0
@@ -40,21 +45,26 @@ check_strong_token() {
   fi
 }
 
-[ -n "$NAS_SSH" ] || { echo "FAIL: 请先设置 NAS_SSH，如 NAS_SSH=root@192.168.1.10 $0 up"; exit 1; }
+[ -n "$NAS_SSH" ] || { echo "FAIL: 请先设置 NAS_SSH，如 NAS_SSH=huajun@192.168.88.247 $0 up"; exit 1; }
 if [ -z "$NAS_IP" ] && [ -f deploy/.env ]; then
   NAS_IP="$(grep -E '^NAS_IP=' deploy/.env | cut -d= -f2 | tr -d '[:space:]')"
 fi
 [ -n "$NAS_IP" ] || { echo "FAIL: NAS_IP 未设置（环境变量或 deploy/.env 里的 NAS_IP）"; exit 1; }
+# HUB_PORT：部署时定的 Hub 监听端口（默认 4399=停老 Hub 直接接管；其它值=并行）。
+# 只允许 1-65535 的数字。
+if ! [[ "$HUB_PORT" =~ ^[0-9]+$ ]] || [ "$HUB_PORT" -lt 1 ] || [ "$HUB_PORT" -gt 65535 ]; then
+  echo "FAIL: HUB_PORT 格式不对：$HUB_PORT（应为 1-65535 的数字，如 4399 或 4400）"; exit 1
+fi
 # P2-24：NAS_IP / NAS_DIR / NAS_SSH 未校验即拼进 `$SSH "…"`——注入面。
 # 只允许安全字符集，含 shell 元字符（; $ ` \ " ' ( ) < > | & 空格等）即拒绝。
 if ! [[ "$NAS_IP" =~ ^[A-Za-z0-9.-]+$ ]]; then
-  echo "FAIL: NAS_IP 格式不对：$NAS_IP（只允许字母/数字/./-，如 192.168.1.10）"; exit 1
+  echo "FAIL: NAS_IP 格式不对：$NAS_IP（只允许字母/数字/./-，如 192.168.88.247）"; exit 1
 fi
 if ! [[ "$NAS_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]] || [[ "$NAS_DIR" =~ \.\. ]]; then
   echo "FAIL: NAS_DIR 格式不对：$NAS_DIR（只允许绝对路径安全字符，不含 ..）"; exit 1
 fi
 if ! [[ "$NAS_SSH" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+$ ]]; then
-  echo "FAIL: NAS_SSH 格式不对：$NAS_SSH（应为 user@host，如 root@192.168.1.10）"; exit 1
+  echo "FAIL: NAS_SSH 格式不对：$NAS_SSH（应为 user@host，如 huajun@192.168.88.247）"; exit 1
 fi
 
 # ---------- preflight 门禁（feat/preflight：deploy/preflight.sh）----------
@@ -136,14 +146,17 @@ $SSH "docker --version && docker compose version" \
 # 2026-11-18 融合 B：music_folder 是可选本地兜底，不存在只警告、
 # 不记 FAIL、不退出（网易云直连是主路；Hub 侧 ValidateStartup 的
 # Fatal 也要由 Hub 面改掉，见 MUSIC_FUSION.md“待 Hub 面确认”）。
-$SSH "[ -d /volume1/music ]" \
-  && ok "/volume1/music 存在" || echo "WARN: /volume1/music 不存在（可选本地兜底，缺了只警告；想放本地歌时在 UGOS 文件管理里建，并放几首歌）"
-$SSH "[ \"\$(ls -A /volume1/music 2>/dev/null | head -1)\" ]" \
-  && ok "/volume1/music 非空" || echo "WARN: /volume1/music 是空的（MPD 库会是空的，先放几首歌；不影响网易云直连）"
-# P1-4：1883 已随 mosquitto 删除而去掉；4399（Hub 主端口）与 1704/1705
+$SSH "[ -d /volume1/Music ]" \
+  && ok "/volume1/Music 存在" || echo "WARN: /volume1/Music 不存在（可选本地兜底，缺了只警告；想放本地歌时在 UGOS 文件管理里建，并放几首歌）"
+$SSH "[ \"\$(ls -A /volume1/Music 2>/dev/null | head -1)\" ]" \
+  && ok "/volume1/Music 非空" || echo "WARN: /volume1/Music 是空的（MPD 库会是空的，先放几首歌；不影响网易云直连）"
+# P1-4：1883 已随 mosquitto 删除而去掉；Hub 主端口（$HUB_PORT，默认 4399）与 1704/1705
 # （Snapcast 流/控制）补上——之前漏 4399 时 Hub 绑定失败脚本还报全部空闲。
 # 2026-11-18 融合 B：8095 已随 Music Assistant 删除而去掉（不再占用）。
-for p in 10300 10200 10400 4399 1704 1705 3000 8080; do
+# 2026-11-19：Hub 端口是部署时定的（HUB_PORT）。HUB_PORT=4399（默认，停老 Hub 直接接管）时
+# 4399 被占是正常的——部署前要先停老 Hub；HUB_PORT 为其它值（并行）时 4399 被占是预期的，
+# 只要求 $HUB_PORT 本身空闲。下面只警告不记 FAIL、不退出，具体看 WARN 内容再定。
+for p in 10300 10200 10400 "$HUB_PORT" 1704 1705 3000 8080; do
   if $SSH "ss -tln 2>/dev/null | grep -q \":$p \""; then
     echo "WARN: 端口 $p 已被占用（up 之后对应服务可能起不来，先查谁占了：ss -tlnp | grep $p）"
   else
@@ -210,17 +223,30 @@ info "3. NAS 端 config 调整（只改 NAS 上的副本，不动本机 hub/conf
 # 以前这里 cp 的是刚传上去的本机文件，备错了文件）。
 # FW-P1-2：sed 后逐项断言结果——以前 sed 静默无操作、grep 只打印不比对，
 # HA 地址没改也会照常 ok。
+# 2026-11-19：Hub 监听端口是部署时定的（HUB_PORT，默认 4399=停老 Hub 直接接管；
+# 其它值=与老 Hub 并行）。种子 config.yaml 的 listen 是 ":4399"，这里按 HUB_PORT 改写，
+# 并断言改写结果；音箱端 client.toml 的 hub_url 端口必须与这里一致（见 CHECKLIST）。
+# agents 与 music_folder 的改写是防旧副本：种子已是正确值（NAS 的 LAN IP、/volume1/Music），
+# 但 NAS 上旧副本可能还是容器名 /volume1/music，也在这里一并改过来并断言。
 $SSH "sed -i 's#http://netease-api:3000#http://127.0.0.1:3000#' $NAS_DIR/hub/config.yaml
   sed -i 's#ws://kws-sidecar:10400#ws://127.0.0.1:10400#' $NAS_DIR/hub/config.yaml
   sed -i \"s#192.168.1.10:8123#$NAS_IP:8123#\" $NAS_DIR/hub/config.yaml
+  sed -i \"s#http://hermes:8642#http://$NAS_IP:8642#\" $NAS_DIR/hub/config.yaml
+  sed -i \"s#http://openclaw:18789#http://$NAS_IP:18789#\" $NAS_DIR/hub/config.yaml
+  sed -i 's#/volume1/music#/volume1/Music#' $NAS_DIR/hub/config.yaml
+  sed -i 's#listen: \":4399\"#listen: \":'$HUB_PORT'\"#' $NAS_DIR/hub/config.yaml
   sed -i '/^[[:space:]]*music_assistant:/d' $NAS_DIR/hub/config.yaml
   grep -q 'http://127.0.0.1:3000' $NAS_DIR/hub/config.yaml \
     && grep -q 'ws://127.0.0.1:10400' $NAS_DIR/hub/config.yaml \
     && grep -q \"://$NAS_IP:8123\" $NAS_DIR/hub/config.yaml \
+    && grep -q \"http://$NAS_IP:8642/v1\" $NAS_DIR/hub/config.yaml \
+    && grep -q \"http://$NAS_IP:18789/v1\" $NAS_DIR/hub/config.yaml \
+    && grep -q 'music_folder: /volume1/Music' $NAS_DIR/hub/config.yaml \
+    && grep -q \"listen: \\\":$HUB_PORT\\\"\" $NAS_DIR/hub/config.yaml \
     && ! grep -q 'music_assistant:' $NAS_DIR/hub/config.yaml \
     && grep -E 'api:|url:|kws:|  url:' $NAS_DIR/hub/config.yaml" \
-  && ok "config.yaml 已改：netease.api 走 127.0.0.1:3000，kws 走 ws://127.0.0.1:10400/v1/kws，HA 走 $NAS_IP:8123（保持原有 ws/wss 协议，三处改写均已断言；已废弃的 music_assistant 行如有也已删——新 Hub 读到该行会直接拒绝启动）" \
-  || bad "config.yaml 调整失败（sed 后断言不通过：HA 地址或 127.0.0.1 改写未生效，或 music_assistant 行没删掉，见上）"
+  && ok "config.yaml 已改：netease.api 走 127.0.0.1:3000，kws 走 ws://127.0.0.1:10400/v1/kws，HA 走 $NAS_IP:8123，agents 走 $NAS_IP:8642 / $NAS_IP:18789，music_folder 是 /volume1/Music，Hub listen 是 :$HUB_PORT（以上改写均已断言；已废弃的 music_assistant 行如有也已删——新 Hub 读到该行会直接拒绝启动）" \
+  || bad "config.yaml 调整失败（sed 后断言不通过：HA/agents/music_folder/listen 任一改写未生效，或 music_assistant 行没删掉，见上）"
 
 [ "$DO_UP" != "up" ] && {
   echo; echo "文件已传好，未执行 up。如需启动：NAS_SSH=$NAS_SSH $0 up"
@@ -272,10 +298,10 @@ if [ "$_up" = "7" ]; then
 else
   bad "Up 的容器是 ${_up:-?} 个，不是 7 个（见上 ps 输出，查哪个容器没起来）"
 fi
-# FW-P1-2：端口表与 checklist §3 对齐——补 4399（Hub 主端口）与 10400（边车），
+# FW-P1-2：端口表与 checklist §3 对齐——补 Hub 主端口（$HUB_PORT，默认 4399）与 10400（边车），
 # 1883 随 mosquitto 删除而去掉，8095 随 Music Assistant 删除而去掉（融合 B）；
 # 8080 走下面的 HTTP 检查，不在这里测 TCP。
-for p in 10300 10200 10400 4399 3000; do
+for p in 10300 10200 10400 "$HUB_PORT" 3000; do
   $SSH "timeout 3 bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/$p'" 2>/dev/null \
     && ok "端口 $p 通" || bad "端口 $p 不通"
 done
