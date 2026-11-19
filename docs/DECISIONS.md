@@ -2,6 +2,16 @@
 
 按时间倒序。每个决策写清“定了什么、为什么、谁定的”，改了就追加一条，不改旧条。
 
+## 2026-11-19：Web 面板改绑 NAS 内网 IP，局域网直开（bai 定）
+
+- `hub/config.yaml` 的 `web_listen` 从 `127.0.0.1:8081` 改到 `192.168.88.247:8081`
+  （P0-1 的回环绑定就此作废）；局域网内浏览器直接开 `http://192.168.88.247:8081`，
+  不用再建 SSH 隧道。
+- 不绑 `0.0.0.0`（`validateWebListen` 仍禁全接口）；只绑这一个明确内网 IP。
+  Token 认证不变；NAS IP 变了要同步改 `web_listen` 与健康检查地址。
+- nas-install.sh 健康检查、NAS_CHECKLIST/README/CHECKLIST 的面板地址同步改到
+  `192.168.88.247:8081`。
+
 ## 2026-11-18：六项决定——S-3 / HA / P1-40 / P2-12 / C-15 / gnueabihf（bai 定）
 
 - S-3：接受回环 + token，不给边车加 TLS。`kws-sidecar/server.py` 启动期守门

@@ -24,8 +24,8 @@ func TestLoadRealConfig(t *testing.T) {
 	if cfg.Hub.Listen != ":4399" {
 		t.Fatalf("Listen 应为 :4399，实际 %q", cfg.Hub.Listen)
 	}
-	if cfg.Hub.WebListen != "127.0.0.1:8081" {
-		t.Fatalf("WebListen 应为 127.0.0.1:8081（P0-1：只绑回环），实际 %q", cfg.Hub.WebListen)
+	if cfg.Hub.WebListen != "192.168.88.247:8081" {
+		t.Fatalf("WebListen 应为 192.168.88.247:8081（2026-11-19 bai 定：局域网直开），实际 %q", cfg.Hub.WebListen)
 	}
 }
 
