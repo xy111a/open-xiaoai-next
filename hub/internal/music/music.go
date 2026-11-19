@@ -54,6 +54,19 @@ type SnapDevice struct {
 	Connected bool   `json:"connected"`
 	Name      string `json:"config.name"`
 	Latency   int    `json:"config.latency"`
+	// Host 是 Snapcast 上报的客户端主机信息（follow-me 用它把
+	// Snapcast 客户端映射回 Hub 设备：Host.IP 与注册表的设备 IP 对上
+	// 即同一台音箱；config.name/config.latency 两个扁平 tag 是历史
+	// 写法——真服务端发的是嵌套 config 对象，它们在生产上恒为空，
+	// 这里不动它们，只新增 Host）。
+	Host SnapHost `json:"host"`
+}
+
+// SnapHost 是 Snapcast 客户端的主机信息（Server.GetStatus 原样返回）。
+type SnapHost struct {
+	Name string `json:"name"` // 客户端主机名
+	IP   string `json:"ip"`   // 客户端 IP（与 Hub 注册表设备 IP 对照用）
+	MAC  string `json:"mac"`
 }
 
 // DialSnap 连上 Snapcast。
@@ -186,6 +199,18 @@ func (s *SnapClient) SetGroupStream(groupID, streamID string) error {
 // SetGroupMute 设置分组静音。
 func (s *SnapClient) SetGroupMute(groupID string, mute bool) error {
 	_, err := s.call("Group.SetMute", map[string]any{"id": groupID, "mute": mute})
+	return err
+}
+
+// SetGroupClients 设置一个分组的客户端列表（follow-me 用它搬音箱）：
+// 列表里新出现的客户端会被服务端从原分组移过来，列表里消失的客户端
+// 由服务端另行安置（新分组/销毁旧分组，见 snapweb 的同款用法）；
+// 搬完后调用方用 GetGroups 再核对一次，不要假设一次调用即生效。
+func (s *SnapClient) SetGroupClients(groupID string, clientIDs []string) error {
+	if clientIDs == nil {
+		clientIDs = []string{}
+	}
+	_, err := s.call("Group.SetClients", map[string]any{"id": groupID, "clients": clientIDs})
 	return err
 }
 

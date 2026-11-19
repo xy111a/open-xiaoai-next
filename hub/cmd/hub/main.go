@@ -576,6 +576,14 @@ func (h *hubHandler) onArbitrationResult(winner string, losers []string) {
 			h.setDeviceState(id, DeviceStateIdle)
 		}
 	}
+	// 跟随播放（follow-me）：赢家所在房间与音乐所在房间不同时，
+	// 把音乐跟过去（同一首歌、同一位置；原房间停播）。
+	// 起 goroutine 做，不阻塞会话建立；Move 内部查 MPD/Snapcast，
+	// 失败只记日志、音乐留在原房间。h.router 为 nil 时（单元测试
+	// 的裸 hubHandler）跳过，不 panic。
+	if h.router != nil {
+		go h.router.FollowMeOnWake(context.Background(), chosen)
+	}
 }
 
 // sweepSessions 清理过期会话（每秒一次）。
@@ -872,6 +880,21 @@ func main() {
 			}
 			return ""
 		},
+		// 跟随播放（follow-me）：开关读 config（Web 改后立即生效）；
+		// Snapcast 客户端按 host.ip 对注册表 IP 找 Hub 设备；
+		// 目标音箱离线时向唤醒设备说一句（speakText 晚绑定，调用时再读）。
+		FollowMeEnabled: func() bool { return cfg.FollowMeEnabled() },
+		SnapClientDevice: func(snap music.SnapDevice) (string, bool) {
+			if snap.Host.IP == "" {
+				return "", false
+			}
+			for _, d := range reg.All() {
+				if d.IP == snap.Host.IP {
+					return d.ID, true
+				}
+			}
+			return "", false
+		},
 		Notify: func(ctx context.Context, text string) error {
 			// P1-27：读当前 HA（看门狗热换后是最新的），不是启动时那个。
 			c := rt.HA()
@@ -1081,6 +1104,8 @@ func main() {
 	// 仲裁：窗口关闭后走 h.onArbitrationResult——赢家开会话 + 发
 	// wake_win，输家发 wake_lose（P1-13：赢家已断线时按 RMS 降序试
 	// losers 补位；都掉线则本轮无人回；无会话的输家回 Idle）。
+	// 跟随播放钩子在 onArbitrationResult 末尾（赢家确定后调
+	// h.router.FollowMeOnWake，见该方法）。
 	h.arbiter = arbitration.New(arbitration.Window, h.onArbitrationResult)
 	go h.sweepSessions(done)
 
