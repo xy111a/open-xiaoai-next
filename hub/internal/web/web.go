@@ -403,48 +403,67 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	// 响应式：卡片用 auto-fit 网格（320px 下单列），表格包在
 	// .tablewrap 里横向滚动，页面本身不横向溢出。
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	// 2026-11-19 重写：旧版首页只是标题 + 一段裸 JSON，还不带 Token，
-	// 实际访问时 /api/status 会 401，页面永远停在“加载中…”。
-	// 新版是完整的管理面板：Token 一次粘贴（sessionStorage 保存，
-	// 所有 API 调用都带 Bearer）、状态卡片、设备表、音乐控制、
-	// 网易云扫码登录、OTA、Hub 指纹、配置只读视图。单文件内嵌，
-	// 无外部依赖；JS 里不用反引号（Go raw string 不能含反引号）。
+	// 2026-11-19 重写 v2：管理面板 + 配置编辑 + 双栏排版。
+	//  - 配置可编辑：唤醒词、唤醒词路由、HA 地址、音乐文件夹、勿扰时段、
+	//    Qwen Agent 地址/模型，走 PUT /api/config（后端合并+校验+写文件）。
+	//  - 唤醒词特别说明：只改 config.yaml 不够，边车 keywords.txt 也要
+	//    重新生成（download-model.sh + WAKE_WORD），且 Hub 与边车都要
+	//    重启（边车启动时才读 keywords.txt；Hub 启动时才建 KWS 客户端）。
+	//    面板里写明这一步，不假装一键生效。
+	//  - 排版：粘性顶栏（标题+总状态）、桌面双栏（左：状态/设备/配置，
+	//    右：音乐/网易云/OTA/指纹）、移动端单栏；卡片统一样式。
+	//  - 单文件内嵌，无外部依赖；JS 里不用反引号（Go raw string 不能含反引号）。
 	fmt.Fprint(w, `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>小爱音箱 · Hub</title>
 <style>
-:root{--bg:#f4f5f7;--card:#fff;--text:#1a1a1a;--muted:#666;--line:#e2e2e2;--accent:#1677ff;--ok:#1a9e54;--bad:#d93025;--warn:#b06000}
+:root{--bg:#f2f3f5;--card:#fff;--text:#1a1a1a;--muted:#667085;--line:#e4e7ec;--accent:#175cd3;--accent-bg:#eff4ff;--ok:#067647;--ok-bg:#ecfdf3;--bad:#b42318;--bad-bg:#fef3f2;--warn:#b54708;--warn-bg:#fffaeb;--radius:14px}
 *{box-sizing:border-box}
-body{font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);margin:0;padding:0 14px 40px}
-header{max-width:860px;margin:0 auto;padding:22px 0 6px}
-header h1{font-size:22px;margin:0}
-header p{color:var(--muted);margin:6px 0 0;font-size:14px}
-main{max-width:860px;margin:0 auto;display:grid;gap:14px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
-.card h2{font-size:16px;margin:0 0 12px}
-.card h2 span{color:var(--muted);font-weight:400;font-size:13px}
+body{font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);margin:0;padding:0 0 48px}
+.topbar{position:sticky;top:0;z-index:10;background:rgba(255,255,255,.92);backdrop-filter:blur(6px);border-bottom:1px solid var(--line)}
+.topbar-in{max-width:1080px;margin:0 auto;padding:14px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.topbar h1{font-size:19px;margin:0}
+.topbar .sub{color:var(--muted);font-size:13px}
+.topbar .spacer{flex:1}
+.pill{display:inline-block;padding:3px 10px;border-radius:99px;font-size:12px;font-weight:600;background:var(--ok-bg);color:var(--ok)}
+.pill.off{background:var(--bad-bg);color:var(--bad)}
+.pill.warn{background:var(--warn-bg);color:var(--warn)}
+.pill.grey{background:#f2f4f7;color:var(--muted)}
+main{max-width:1080px;margin:0 auto;padding:18px 16px 0;display:grid;grid-template-columns:1fr;gap:16px}
+@media(min-width:900px){ main{grid-template-columns:1fr 1fr} .span2{grid-column:1 / -1} }
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px 20px;box-shadow:0 1px 2px rgba(16,24,40,.05)}
+.card h2{font-size:16px;margin:0 0 4px;display:flex;align-items:center;gap:8px}
+.card h2::before{content:"";width:4px;height:18px;border-radius:2px;background:var(--accent)}
+.card .desc{color:var(--muted);font-size:13px;margin:0 0 14px}
 .row{display:flex;gap:10px;flex-wrap:wrap}
-.stat{flex:1;min-width:120px;background:#f8f9fb;border:1px solid var(--line);border-radius:10px;padding:12px}
+.stat{flex:1;min-width:110px;background:#f9fafb;border:1px solid var(--line);border-radius:10px;padding:12px 14px}
 .stat .k{font-size:13px;color:var(--muted)}
-.stat .v{font-size:20px;font-weight:700;margin-top:4px}
+.stat .v{font-size:22px;font-weight:700;margin-top:4px}
 .stat .v.ok{color:var(--ok)}
 .stat .v.bad{color:var(--bad)}
 .stat .v.warn{color:var(--warn)}
+.stat .v.sm{font-size:16px}
 table{width:100%;border-collapse:collapse;font-size:14px}
-td,th{border-bottom:1px solid var(--line);padding:8px 6px;text-align:left;vertical-align:top}
-th{color:var(--muted);font-weight:600}
+td,th{border-bottom:1px solid var(--line);padding:9px 6px;text-align:left;vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:13px}
+tr:last-child td{border-bottom:0}
 .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
-button{font:inherit;background:var(--accent);color:#fff;border:0;border-radius:8px;padding:8px 14px;cursor:pointer}
+button{font:inherit;background:var(--accent);color:#fff;border:0;border-radius:9px;padding:9px 16px;cursor:pointer;font-weight:600}
 button.ghost{background:#fff;color:var(--accent);border:1px solid var(--accent)}
 button.danger{background:var(--bad)}
 button:disabled{opacity:.5;cursor:default}
-input,select{font:inherit;padding:8px 10px;border:1px solid #ccc;border-radius:8px;width:100%}
-label{font-size:13px;color:var(--muted);display:block;margin:0 0 4px}
-.field{flex:1;min-width:160px;margin-bottom:10px}
+input,select{font:inherit;padding:9px 11px;border:1px solid #d0d5dd;border-radius:9px;width:100%;background:#fff}
+input:focus,select:focus{outline:2px solid var(--accent-bg);border-color:var(--accent)}
+label{font-size:13px;color:var(--muted);display:block;margin:0 0 5px;font-weight:600}
+.field{flex:1;min-width:150px;margin-bottom:12px}
 .muted{color:var(--muted);font-size:13px}
 .err{color:var(--bad);font-size:13px}
 .ok{color:var(--ok)}
+.note{background:var(--warn-bg);border:1px solid #fedf89;border-radius:10px;padding:10px 12px;font-size:13px;color:#7a3a00;margin-top:12px}
+.note b{color:#7a3a00}
 #tokenbar{display:none}
 #tokenbar.show{display:block}
-#qrimg{max-width:220px;border:1px solid var(--line);border-radius:8px;display:none;margin-top:10px}
+#qrimg{max-width:220px;border:1px solid var(--line);border-radius:10px;display:none;margin-top:10px}
+details summary{cursor:pointer;font-weight:600;font-size:14px}
+pre.lyric{white-space:pre-wrap;font-size:13px;max-height:220px;overflow:auto;background:#f9fafb;border:1px solid var(--line);border-radius:10px;padding:12px}
 .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:12px;background:#e8f5ee;color:var(--ok)}
 .pill.off{background:#fdecea;color:var(--bad)}
 .pill.warn{background:#fff3e0;color:var(--warn)}
@@ -455,23 +474,27 @@ label{font-size:13px;color:var(--muted);display:block;margin:0 0 4px}
 .bar-ms{text-align:right;white-space:nowrap}
 </style>
 </head><body>
-<header><h1>小爱音箱 · Hub</h1><p>open-xiaoai-next · 内网管理面板（经 SSH 隧道访问）</p></header>
+<div class="topbar"><div class="topbar-in">
+<h1>小爱音箱 · Hub</h1><span class="sub">open-xiaoai-next · 内网管理面板</span>
+<span class="spacer"></span><span id="topstat" class="pill grey">连接中…</span>
+</div></div>
 <main>
-<div class="card" id="tokenbar"><h2>登录 Token <span>首次打开需粘贴一次 OPEN_XIAOAI_WEB_TOKEN，之后保存在本浏览器会话里</span></h2>
-<div class="row"><div class="field" style="flex:3"><input id="token" type="password" placeholder="粘贴 OPEN_XIAOAI_WEB_TOKEN" autocomplete="off"></div>
-<div class="field" style="flex:0 0 auto"><button id="saveToken">保存并加载</button></div></div>
-<div class="err" id="tokenmsg"></div></div>
+<div class="card span2" id="tokenbar"><h2>登录 Token</h2><p class="desc">首次打开需粘贴一次 OPEN_XIAOAI_WEB_TOKEN，之后保存在本浏览器会话里。</p>
+<div class="row"><div class="field" style="flex:3;margin-bottom:0"><input id="token" type="password" placeholder="粘贴 OPEN_XIAOAI_WEB_TOKEN" autocomplete="off"></div>
+<div class="field" style="flex:0 0 auto;margin-bottom:0"><button id="saveToken">保存并加载</button></div></div>
+<div class="err" id="tokenmsg" style="margin-top:8px"></div></div>
 
-<div class="card"><h2>状态 <span id="statusline">加载中…</span></h2>
+<div class="card"><h2>状态</h2><p class="desc">Hub 与唤醒服务总览，5 秒自动刷新。</p>
 <div class="row">
 <div class="stat"><div class="k">在线设备</div><div class="v" id="st-online">–</div></div>
 <div class="stat"><div class="k">注册设备</div><div class="v" id="st-devices">–</div></div>
 <div class="stat"><div class="k">唤醒服务 (KWS)</div><div class="v" id="st-kws">–</div></div>
-<div class="stat"><div class="k">唤醒词</div><div class="v" id="st-wake" style="font-size:16px">–</div></div>
+<div class="stat"><div class="k">唤醒词</div><div class="v sm" id="st-wake">–</div></div>
 </div>
-<div class="muted" id="st-rooms" style="margin-top:10px"></div></div>
+<div class="muted" id="st-rooms" style="margin-top:12px"></div></div>
 
-<div class="card"><h2>设备</h2><div id="devlist"><p class="muted">加载中…</p></div></div>
+<div class="card"><h2>设备</h2><p class="desc">已注册的音箱。房间由语音认领（“你好小李，我在客厅”）。</p>
+<div id="devlist"><p class="muted">加载中…</p></div></div>
 
 <div class="card"><h2>系统健康 <span>7 个容器</span></h2><div id="health"><p class="muted">加载中…</p></div></div>
 
@@ -479,39 +502,55 @@ label{font-size:13px;color:var(--muted);display:block;margin:0 0 4px}
 
 <div class="card"><h2>最近交互 <span>最多 20 条</span></h2><div class="tablewrap"><div id="recent"><p class="muted">加载中…</p></div></div></div>
 
-<div class="card"><h2>音乐</h2>
+<div class="card"><h2>音乐</h2><p class="desc">当前播放与队列控制（经 MPD）。</p>
 <div id="musnow"><p class="muted">加载中…</p></div>
-<div class="row" style="margin-top:12px">
+<div class="row" style="margin-top:14px">
 <button id="m-prev">上一首</button><button id="m-pause">暂停</button><button id="m-resume">继续</button><button id="m-next">下一首</button>
 <button class="ghost" id="m-refresh">刷新</button></div>
-<div id="musqueue" style="margin-top:12px"></div>
+<div id="musqueue" style="margin-top:14px"></div>
 <div id="muslyric" style="margin-top:12px"></div></div>
 
-<div class="card"><h2>网易云音乐</h2><div id="neinfo"><p class="muted">加载中…</p></div>
-<div class="row" style="margin-top:12px">
+<div class="card"><h2>网易云音乐</h2><p class="desc">扫码登录后 VIP 歌可播完整版（否则仅 30 秒试听）。</p>
+<div id="neinfo"><p class="muted">加载中…</p></div>
+<div class="row" style="margin-top:14px">
 <button id="ne-qr">扫码登录</button><button class="ghost" id="ne-refresh">刷新状态</button>
 <button class="danger" id="ne-logout">退出登录</button></div>
 <img id="qrimg" alt="扫码登录二维码">
 <div class="muted" id="qrmsg" style="margin-top:8px"></div></div>
 
-<div class="card"><h2>固件 OTA</h2><div id="otajobs"><p class="muted">加载中…</p></div>
+<div class="card span2"><h2>配置</h2><p class="desc">直接改 Hub 配置（走 PUT /api/config，后端校验后写 config.yaml 并热更新内存配置）。Agent / HA 类连接在 Hub 重启后生效。</p>
+<div class="row">
+<div class="field"><label>唤醒词</label><input id="cfg-wake" placeholder="如 你好小李"></div>
+<div class="field"><label>唤醒词走哪个 Agent</label><select id="cfg-route"><option value="qwen">qwen（本地 Qwen3.5-4B）</option><option value="hermes">hermes</option><option value="openclaw">openclaw</option></select></div>
+<div class="field"><label>Home Assistant 地址</label><input id="cfg-ha" placeholder="ws://192.168.88.247:8123"></div>
+<div class="field"><label>音乐文件夹</label><input id="cfg-music" placeholder="/volume1/Music"></div>
+<div class="field"><label>勿扰时段</label><input id="cfg-dnd" placeholder="23:00-07:00"></div>
+<div class="field"><label>Qwen Agent 地址</label><input id="cfg-qwen-url" placeholder="http://192.168.88.247:9000/v3"></div>
+<div class="field"><label>Qwen 模型</label><input id="cfg-qwen-model" placeholder="qwen3.5-4b"></div>
+</div>
+<button id="cfg-save">保存配置</button> <span id="cfgmsg" style="font-size:13px"></span>
+<div class="note"><b>改唤醒词注意：</b>只改这里不够。边车的关键词表（keywords.txt）也要重新生成，且 Hub 与边车都要重启才生效（边车启动时才读 keywords.txt；Hub 启动时才建 KWS 客户端）。NAS 上执行：<br>
+<span class="mono">cd /volume4/docker/open-xiaoai-next/deploy &amp;&amp; WAKE_WORD="新唤醒词" ../kws-sidecar/scripts/download-model.sh /data/kws/models 2&gt;/dev/null || docker compose exec kws-sidecar /app/scripts/download-model.sh /data/kws/models<br>
+docker compose restart hub kws-sidecar</span><br>
+（download-model.sh 需 sherpa-onnx-cli 做 token 化；只有“你好小李”有内置的已验证 token 行，其它词必须装 sherpa-onnx 才能生成。）</div></div>
+
+<div class="card"><h2>固件 OTA</h2><p class="desc">给音箱下发新固件（只许 https 白名单地址）。</p>
+<div id="otajobs"><p class="muted">加载中…</p></div>
 <div class="row" style="margin-top:12px">
-<div class="field"><label>设备 ID</label><input id="ota-dev" placeholder="如 oh2p-xxx"></div>
+<div class="field"><label>设备 ID</label><input id="ota-dev" placeholder="如 oh2p-001"></div>
 <div class="field"><label>版本</label><input id="ota-ver" placeholder="如 0.2.0"></div></div>
 <div class="row"><div class="field"><label>固件 URL（只许 https 白名单）</label><input id="ota-url" placeholder="https://…"></div>
 <div class="field"><label>SHA-256</label><input id="ota-sha" placeholder="64 位 hex"></div></div>
 <button id="ota-push">下发 OTA</button> <span class="err" id="otaerr"></span></div>
 
-<div class="card"><h2>Hub 指纹 <span>写进 client.toml 的 hub_ca_fingerprint</span></h2>
+<div class="card"><h2>Hub 指纹</h2><p class="desc">写进 client.toml 的 hub_ca_fingerprint。</p>
 <div class="mono" id="fp">加载中…</div></div>
-
-<div class="card"><h2>配置 <span>只读视图（脱敏）；改配置请走 /api/config 或改 config.yaml</span></h2>
-<div id="cfgview"><p class="muted">加载中…</p></div></div>
 </main>
 <script>
 var T = sessionStorage.getItem('oxn_token') || '';
 var tokenbar = document.getElementById('tokenbar');
 var tokenmsg = document.getElementById('tokenmsg');
+var topstat = document.getElementById('topstat');
 function showToken(msg){ tokenbar.classList.add('show'); if(msg) tokenmsg.textContent = msg; }
 function hideToken(){ tokenbar.classList.remove('show'); tokenmsg.textContent=''; }
 document.getElementById('saveToken').onclick = function(){
@@ -531,9 +570,9 @@ function api(p, o){
   });
 }
 function esc(s){ return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function setTop(ok, txt){ topstat.textContent = txt; topstat.className = 'pill ' + (ok ? '' : 'off'); }
 function loadStatus(){
   return api('/api/status').then(function(j){
-    document.getElementById('statusline').textContent = '已连接';
     document.getElementById('st-online').textContent = j.online;
     document.getElementById('st-devices').textContent = j.devices;
     var k = document.getElementById('st-kws');
@@ -542,6 +581,7 @@ function loadStatus(){
     document.getElementById('st-wake').textContent = j.wake_word || '–';
     document.getElementById('st-rooms').textContent = (j.rooms && j.rooms.length) ? ('房间：' + j.rooms.join('、')) : '暂无房间认领（对音箱说“你好小李，我在客厅”认领）';
     document.getElementById('latency').innerHTML = stageBars(j.latest_latency||null);
+    setTop(true, j.online + ' 台在线 · ' + (j.kws_status || ''));
   });
 }
 function loadDevices(){
@@ -562,15 +602,15 @@ function loadMusic(){
     var name = cur ? (cur.name + (cur.artist ? ' — ' + cur.artist : '')) : '未在播放';
     var src = cur && cur.source ? ('（来源：' + esc(cur.source) + '）') : '';
     var pill = j.state === 'play' ? '<span class="pill">播放中</span>' : (j.state === 'pause' ? '<span class="pill warn">已暂停</span>' : '<span class="pill off">已停止</span>');
-    el.innerHTML = '<div style="font-size:18px;font-weight:700">' + esc(name) + '</div><div style="margin-top:6px">' + pill + ' <span class="muted">' + src + ' · 队列 ' + (j.queue_len || 0) + ' 首</span></div>';
+    el.innerHTML = '<div style="font-size:18px;font-weight:700">' + esc(name) + '</div><div style="margin-top:8px">' + pill + ' <span class="muted">' + src + ' · 队列 ' + (j.queue_len || 0) + ' 首</span></div>';
     var q = document.getElementById('musqueue');
     if(j.queue_len){ api('/api/music/queue').then(function(qj){
-      var items = (qj.queue || []).slice(0, 8).map(function(s,i){ return '<li>' + esc(s.Title || s.Name || s.File || '') + (s.Artist ? ' — ' + esc(s.Artist) : '') + '</li>'; }).join('');
-      q.innerHTML = items ? '<div class="muted">队列（前 8 首）</div><ol style="margin:6px 0 0;padding-left:20px;font-size:14px">' + items + '</ol>' : '';
+      var items = (qj.queue || []).slice(0, 8).map(function(s){ return '<li>' + esc(s.Title || s.Name || s.File || '') + (s.Artist ? ' — ' + esc(s.Artist) : '') + '</li>'; }).join('');
+      q.innerHTML = items ? '<div class="muted">队列（前 8 首）</div><ol style="margin:8px 0 0;padding-left:20px;font-size:14px">' + items + '</ol>' : '';
     }).catch(function(){}); } else { q.innerHTML = ''; }
     var ly = document.getElementById('muslyric');
     if(cur && cur.id){ api('/api/music/lyric?id=' + cur.id).then(function(lj){
-      ly.innerHTML = lj.lyric ? '<details><summary style="cursor:pointer">歌词</summary><pre style="white-space:pre-wrap;font-size:13px;max-height:220px;overflow:auto">' + esc(lj.lyric) + '</pre></details>' : '';
+      ly.innerHTML = lj.lyric ? '<details><summary>歌词</summary><pre class="lyric">' + esc(lj.lyric) + '</pre></details>' : '';
     }).catch(function(){ ly.innerHTML = ''; }); } else { ly.innerHTML = ''; }
   }).catch(function(e){ if(e.message !== '401') document.getElementById('musnow').innerHTML = '<p class="err">音乐状态不可用：' + esc(e.message) + '</p>'; });
 }
@@ -637,18 +677,22 @@ function loadFP(){
     document.getElementById('fp').textContent = j.fingerprint || '–';
   }).catch(function(e){ if(e.message !== '401') document.getElementById('fp').textContent = '不可用：' + e.message; });
 }
+// ---- 配置编辑（走 PUT /api/config）----
 function loadCfg(){
   return api('/api/config').then(function(j){
-    var el = document.getElementById('cfgview');
-    var rows = [];
-    if(j.wake_word) rows.push(['唤醒词', j.wake_word]);
-    if(j.home_assistant && j.home_assistant.url) rows.push(['Home Assistant', j.home_assistant.url]);
-    if(j.music_folder) rows.push(['音乐文件夹', j.music_folder]);
-    if(j.netease && j.netease.api) rows.push(['网易云 API', j.netease.api]);
-    if(j.agents){ Object.keys(j.agents).forEach(function(n){ var a = j.agents[n]; rows.push(['Agent ' + n, (a.model || '') + ' @ ' + (a.base_url || '')]); }); }
-    if(!rows.length){ el.innerHTML = '<p class="muted">配置为空。</p>'; return; }
-    el.innerHTML = '<table>' + rows.map(function(r){ return '<tr><th style="width:160px">' + esc(r[0]) + '</th><td class="mono">' + esc(r[1]) + '</td></tr>'; }).join('') + '</table>';
-  }).catch(function(e){ if(e.message !== '401') document.getElementById('cfgview').innerHTML = '<p class="err">配置不可用：' + esc(e.message) + '</p>'; });
+    if(j.wake_word) document.getElementById('cfg-wake').value = j.wake_word;
+    if(j.wake_word_routes && j.wake_word){
+      var ag = j.wake_word_routes[j.wake_word];
+      if(ag) document.getElementById('cfg-route').value = ag;
+    }
+    if(j.home_assistant && j.home_assistant.url) document.getElementById('cfg-ha').value = j.home_assistant.url;
+    if(j.music_folder) document.getElementById('cfg-music').value = j.music_folder;
+    if(j.hub && j.hub.do_not_disturb) document.getElementById('cfg-dnd').value = j.hub.do_not_disturb;
+    if(j.agents && j.agents.qwen){
+      if(j.agents.qwen.base_url) document.getElementById('cfg-qwen-url').value = j.agents.qwen.base_url;
+      if(j.agents.qwen.model) document.getElementById('cfg-qwen-model').value = j.agents.qwen.model;
+    }
+  }).catch(function(e){ if(e.message !== '401'){ var m = document.getElementById('cfgmsg'); m.textContent = '配置加载失败：' + e.message; m.className = 'err'; } });
 }
 var STAGE_LABELS={'kws_ms':'唤醒 KWS','stt_ms':'识别 STT','llm_ms':'对话 LLM','tts_ms':'合成 TTS','music_ms':'点歌播放'};
 var STAGE_ORDER=['kws_ms','stt_ms','llm_ms','tts_ms','music_ms'];
@@ -691,6 +735,28 @@ function loadHealth(){
 function loadRecent(){
   return api('/api/latency').then(renderRecent).catch(function(){});
 }
+document.getElementById('cfg-save').onclick = function(){
+  var msg = document.getElementById('cfgmsg'); msg.textContent = '保存中…'; msg.className = 'muted';
+  var wake = document.getElementById('cfg-wake').value.trim();
+  var route = document.getElementById('cfg-route').value;
+  if(!wake){ msg.textContent = '唤醒词不能为空。'; msg.className = 'err'; return; }
+  var routes = {};
+  routes[wake] = route;
+  var patch = {
+    wake_word: wake,
+    wake_word_routes: routes,
+    kws: {keywords: [wake]},
+    home_assistant: {url: document.getElementById('cfg-ha').value.trim()},
+    music_folder: document.getElementById('cfg-music').value.trim(),
+    hub: {do_not_disturb: document.getElementById('cfg-dnd').value.trim()},
+    agents: {qwen: {base_url: document.getElementById('cfg-qwen-url').value.trim(), model: document.getElementById('cfg-qwen-model').value.trim()}}
+  };
+  api('/api/config', {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(patch)}).then(function(j){
+    msg.textContent = '已保存。' + (j.note ? j.note : '') + ' 改唤醒词的话，记得按上面黄框里的步骤重生成边车关键词并重启 Hub 与边车，否则新唤醒词不会生效。';
+    msg.className = 'ok';
+    loadStatus();
+  }).catch(function(e){ if(e.message !== '401'){ msg.textContent = '保存失败：' + e.message; msg.className = 'err'; } });
+};
 function loadAll(){
   if(!T){ showToken('首次打开请粘贴 OPEN_XIAOAI_WEB_TOKEN。'); return; }
   hideToken();
@@ -709,7 +775,6 @@ setInterval(function(){ if(T){ loadStatus().catch(function(){}); loadMusic().cat
 setInterval(function(){ if(T){ loadHealth().catch(function(){}); } }, 30000);
 </script></body></html>`)
 }
-
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只支持 GET"})
