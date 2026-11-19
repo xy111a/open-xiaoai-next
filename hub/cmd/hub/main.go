@@ -266,6 +266,13 @@ func (h *hubHandler) decoderFor(deviceID string) (*opus.Decoder, error) {
 }
 
 func (h *hubHandler) OnWake(deviceID string, w transport.Wake) {
+	// 打断后续（决定 6）：新唤醒到达时先取消该设备在途的回答
+	// （STT→Router→TTS 半路，旧答案不再播出）。只取消本设备，
+	// 不碰其他设备；无在途回答时是空操作。pipeline 为 nil 只在
+	// 单测里出现（生产路径恒非 nil）。
+	if h.pipeline != nil {
+		h.pipeline.Cancel(deviceID)
+	}
 	// 打断（barge-in）：放音中收到唤醒 = SPEAKING → LISTENING，
 	// 先停播再开新一轮听。interrupt 在仲裁（250ms 窗口）之前就发——
 	// TTS 必须立刻停，不能等仲裁结果；只停被唤醒的这一台，

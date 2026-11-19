@@ -18,6 +18,7 @@ package voice
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -59,6 +60,18 @@ type utterance struct {
 	silenceMs int  // 当前连续静音毫秒数
 }
 
+// errAnswerCancelled 是回答被取消的哨兵错误（打断后续：新唤醒到达时
+// Cancel 取消在途回答）。与超时（answerTimeout 触发的 DeadlineExceeded）
+// 区分开——超时是故障要记失败日志，取消是正常打断只记一行提示。
+var errAnswerCancelled = errors.New("voice: 回答已取消")
+
+// flight 是一次在途回答：gen 是代际（防旧 goroutine 的 defer 误删
+// 新一轮的 inFlight 条目），cancel 取消该回答的 ctx。
+type flight struct {
+	gen    uint64
+	cancel context.CancelFunc
+}
+
 // Pipeline 是语音管线。
 type Pipeline struct {
 	stt    STT
@@ -74,9 +87,15 @@ type Pipeline struct {
 	utterances map[string]*utterance
 	onReply    func(deviceID string, opusFrames [][]byte)
 
-	// inFlight 是每设备正在回答的标记（P1-29）：同一设备上一句还没
-	// 答完时新结算直接丢弃（只记日志），不让回答在后台无限排队。
-	inFlight map[string]bool
+	// inFlight 是每设备正在回答的在途记录（P1-29 + 打断后续）：
+	// 同一设备上一句还没答完时新结算直接丢弃（只记日志），不让回答
+	// 在后台无限排队；Cancel 用它找到并取消在途回答的 ctx。
+	inFlight map[string]*flight
+
+	// genSeq 是 inFlight 的代际计数器（每次 settle +1）：旧回答的
+	// goroutine 退出时只删自己那一代的条目，不误删 Cancel 后新一轮
+	// 已写入的条目。
+	genSeq uint64
 
 	// sem 是 answer 的总并发上限（P1-2）：满了直接报“繁忙”，不排队阻塞
 	// transport 读循环。
@@ -93,7 +112,7 @@ func New(stt STT, tts TTS, router Router, voice string, onReply func(deviceID st
 		stt: stt, tts: tts, router: router, voice: voice,
 		silenceThreshold: 200, silenceEndMs: 800,
 		utterances: map[string]*utterance{},
-		inFlight:   map[string]bool{},
+		inFlight:   map[string]*flight{},
 		onReply:    onReply,
 		sem:        make(chan struct{}, MaxConcurrentAnswers),
 	}
@@ -108,28 +127,52 @@ func (p *Pipeline) Discard(deviceID string) {
 	delete(p.utterances, deviceID)
 }
 
+// Cancel 取消某设备正在进行的回答（打断后续，决定 6：新唤醒到达时
+// Hub 的 OnWake 调）。取消在途的 STT→Router→TTS，旧答案不再播出；
+// 无在途回答时是空操作。取消后 inFlight 立即释放，新一轮结算可马上
+// 进行，不用等旧 goroutine 退出（旧 goroutine 的 defer 按代际删条目，
+// 不会误删新一轮的）。只取消本设备，不碰其他设备。
+func (p *Pipeline) Cancel(deviceID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if f, ok := p.inFlight[deviceID]; ok {
+		f.cancel()
+		delete(p.inFlight, deviceID)
+	}
+}
+
 // settle 异步结算一句话（P1-29）：FramePCM/End 只把 PCM 交出来就返回，
 // 回答（STT→Router→TTS→编码）在后台 goroutine 跑，不再阻塞 transport
 // 读循环；带 120s 超时 ctx；同一设备上一句未答完时新结算直接丢弃。
 func (p *Pipeline) settle(ctx context.Context, deviceID string, pcm []int16) error {
 	p.mu.Lock()
-	if p.inFlight[deviceID] {
+	if _, ok := p.inFlight[deviceID]; ok {
 		p.mu.Unlock()
 		log.Printf("voice: 设备 %s 上一句还没答完，本句丢弃", deviceID)
 		return nil
 	}
-	p.inFlight[deviceID] = true
-	p.mu.Unlock()
+	p.genSeq++
+	gen := p.genSeq
 	ctx, cancel := context.WithTimeout(ctx, answerTimeout)
+	p.inFlight[deviceID] = &flight{gen: gen, cancel: cancel}
+	p.mu.Unlock()
 	go func() {
 		defer cancel()
 		defer func() {
 			p.mu.Lock()
-			delete(p.inFlight, deviceID)
+			// 只删自己这一代的条目：Cancel 后新一轮可能已写入同设备
+			// 的新 flight（代际不同），不能误删。
+			if f, ok := p.inFlight[deviceID]; ok && f.gen == gen {
+				delete(p.inFlight, deviceID)
+			}
 			p.mu.Unlock()
 		}()
 		if err := p.answer(ctx, deviceID, pcm); err != nil {
-			log.Printf("voice: 设备 %s 回答失败: %v", deviceID, err)
+			if errors.Is(err, errAnswerCancelled) || errors.Is(err, context.Canceled) {
+				log.Printf("voice: 设备 %s 回答已取消（新唤醒打断）", deviceID)
+			} else {
+				log.Printf("voice: 设备 %s 回答失败: %v", deviceID, err)
+			}
 		}
 	}()
 	return nil
@@ -225,12 +268,20 @@ func (p *Pipeline) End(ctx context.Context, deviceID string) error {
 // answer 转写 → 路由 → 合成 → 回 Opus 帧。
 // P1-2：STT/TTS 为 nil 时返回明确错误（不 panic，由调用方播报降级回复）；
 // 总并发超上限时直接报“繁忙”；panic 转错误。
+// 打断后续（决定 6）：每段之间都查 ctx——Cancel 取消后，已取消的回答
+// 在任何一段结束时都直接返回 errAnswerCancelled，不再往下走，尤其
+// 不调 onReply（旧答案绝不播出）。STT/TTS 本身不接 ctx，所以显式
+// 查 ctx.Err() 是唯一的取消保证，不能只靠 Router 的 ctx。
 func (p *Pipeline) answer(ctx context.Context, deviceID string, pcm []int16) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("voice: answer panic 已兜底: %v", r)
 		}
 	}()
+	// Cancel 可能发生在 settle 与 goroutine 启动之间：先查一次。
+	if ctx.Err() != nil {
+		return errAnswerCancelled
+	}
 	select {
 	case p.sem <- struct{}{}:
 		defer func() { <-p.sem }()
@@ -251,6 +302,9 @@ func (p *Pipeline) answer(ctx context.Context, deviceID string, pcm []int16) (er
 	if err != nil {
 		return err
 	}
+	if ctx.Err() != nil {
+		return errAnswerCancelled
+	}
 	if text == "" {
 		return nil
 	}
@@ -258,8 +312,14 @@ func (p *Pipeline) answer(ctx context.Context, deviceID string, pcm []int16) (er
 	if p.router != nil {
 		reply, err = p.router.Route(ctx, deviceID, text)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return errAnswerCancelled
+			}
 			return err
 		}
+	}
+	if ctx.Err() != nil {
+		return errAnswerCancelled
 	}
 	if reply == "" {
 		return nil
@@ -267,6 +327,9 @@ func (p *Pipeline) answer(ctx context.Context, deviceID string, pcm []int16) (er
 	audio, err := p.tts.Synthesize(reply, p.voice)
 	if err != nil {
 		return err
+	}
+	if ctx.Err() != nil {
+		return errAnswerCancelled
 	}
 	enc, err := opus.NewEncoder()
 	if err != nil {
@@ -291,6 +354,10 @@ func (p *Pipeline) answer(ctx context.Context, deviceID string, pcm []int16) (er
 			return err
 		}
 		frames = append(frames, f)
+	}
+	// 播出前的最后一道关：取消的回答即使已合成好也不播。
+	if ctx.Err() != nil {
+		return errAnswerCancelled
 	}
 	if p.onReply != nil {
 		p.onReply(deviceID, frames)
