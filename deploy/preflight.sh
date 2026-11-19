@@ -272,7 +272,7 @@ check_ports() {
   # HUB_PORT 来自 check_env（.env/环境变量）；--skip-env 时用默认 4399。
   local hub_port="${HUB_PORT:-4399}"
   echo "---- [3/$TOTAL_CHECKS] 端口（目标：$TARGET_DESC；HUB_PORT=$hub_port）"
-  local p others="8080 3000 10300 10200 10400 1704 1705 6600"
+  local p others="8081 3000 10300 10200 10400 1704 1705 6600"
   local busy="" containers
   # HUB_PORT：被占时必须分清“旧 Hub”与“未知进程”。
   if port_in_use "$hub_port"; then
@@ -307,7 +307,7 @@ check_ports() {
   if [ -n "$busy" ]; then
     pass "$name" "端口已核对（被占：$busy ；其余空闲；HUB_PORT 未被未知进程占用）"
   else
-    pass "$name" "全部 9 个端口空闲（$hub_port 8080 3000 10300 10200 10400 1704 1705 6600）"
+    pass "$name" "全部 9 个端口空闲（$hub_port 8081 3000 10300 10200 10400 1704 1705 6600）"
   fi
 }
 

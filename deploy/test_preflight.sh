@@ -266,8 +266,8 @@ reset_case; export FAKE_SS_BUSY="4399"; export FAKE_DOCKER_PS="oxn-hub,oxn-whisp
 run_case "hub-port-old-hub" 0 "旧 Hub 占用"
 
 note "10. 其他端口被占（只警告，应通过）"
-reset_case; export FAKE_SS_BUSY="8080"
-run_case "other-port-busy" 0 "端口 8080 已被占用"
+reset_case; export FAKE_SS_BUSY="8081"
+run_case "other-port-busy" 0 "端口 8081 已被占用"
 
 note "11. 镜像本地缺失且仓库拉不到"
 reset_case

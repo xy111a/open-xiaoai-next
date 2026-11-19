@@ -165,7 +165,7 @@ $SSH "[ \"\$(ls -A /volume1/Music 2>/dev/null | head -1)\" ]" \
 # 2026-11-19：Hub 端口是部署时定的（HUB_PORT）。HUB_PORT=4399（默认，停老 Hub 直接接管）时
 # 4399 被占是正常的——部署前要先停老 Hub；HUB_PORT 为其它值（并行）时 4399 被占是预期的，
 # 只要求 $HUB_PORT 本身空闲。下面只警告不记 FAIL、不退出，具体看 WARN 内容再定。
-for p in 10300 10200 10400 "$HUB_PORT" 1704 1705 3000 8080; do
+for p in 10300 10200 10400 "$HUB_PORT" 1704 1705 3000 8081; do
   if $SSH "ss -tln 2>/dev/null | grep -q \":$p \""; then
     echo "WARN: 端口 $p 已被占用（up 之后对应服务可能起不来，先查谁占了：ss -tlnp | grep $p）"
   else
@@ -298,7 +298,7 @@ sleep 15   # 等 Whisper 首次加载模型、Hub 启动
 remote_curl_api() { # $1=API 路径，如 /api/status
   $SSH "bash -s -- $NAS_DIR $1" <<'REMOTE_EOF'
 tok="$(grep -E '^OPEN_XIAOAI_WEB_TOKEN=' "$1/deploy/.env" | cut -d= -f2-)"
-curl -s -m 5 -w ' %{http_code}' -H "Authorization: Bearer $tok" "http://127.0.0.1:8080$2"
+curl -s -m 5 -w ' %{http_code}' -H "Authorization: Bearer $tok" "http://127.0.0.1:8081$2"
 REMOTE_EOF
 }
 
@@ -316,7 +316,7 @@ else
 fi
 # FW-P1-2：端口表与 checklist §3 对齐——补 Hub 主端口（$HUB_PORT，默认 4399）与 10400（边车），
 # 1883 随 mosquitto 删除而去掉，8095 随 Music Assistant 删除而去掉（融合 B）；
-# 8080 走下面的 HTTP 检查，不在这里测 TCP。
+# 8081 走下面的 HTTP 检查，不在这里测 TCP。
 for p in 10300 10200 10400 "$HUB_PORT" 3000; do
   $SSH "timeout 3 bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/$p'" 2>/dev/null \
     && ok "端口 $p 通" || bad "端口 $p 不通"

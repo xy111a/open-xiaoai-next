@@ -22,7 +22,7 @@ NAS 上实际运行未验证）。
 
 1. docker：`docker` + `docker compose` 可用；
 2. .env：`OPEN_XIAOAI_TOKEN` / `OPEN_XIAOAI_WEB_TOKEN` 各 ≥16 位、互不相同、非弱值，`HASS_TOKEN` / `NAS_IP` / `MUSIC_FOLDER` 已填；`LLM_API_KEY` 为空只提示（本地 OVMS，不阻塞）；
-3. 端口：`HUB_PORT`（默认 4399）+ 8080/3000/10300/10200/10400/1704/1705/6600——`HUB_PORT` 被旧 Hub（`oxn-hub`）占着是割接预期（不停旧 Hub 可改 `HUB_PORT=4400` 并行），被未知进程占着则失败；其他端口被占只警告；
+3. 端口：`HUB_PORT`（默认 4399）+ 8081/3000/10300/10200/10400/1704/1705/6600——`HUB_PORT` 被旧 Hub（`oxn-hub`）占着是割接预期（不停旧 Hub 可改 `HUB_PORT=4400` 并行），被未知进程占着则失败；其他端口被占只警告；
 4. 镜像：compose 里的 5 个拉取镜像 + 两个 Dockerfile 的基础镜像，本地没有时查 `manifest inspect` 确认仓库可拉；hub/kws-sidecar 的本地构建输入（`Dockerfile.hub`、`hub-linux-amd64`、kws-sidecar 源文件）缺了也失败；
 5. 证书种子：`hub-certs/`（`ca.crt`/`ca.key`/`hub.crt`/`hub.key`）齐全且配对（`openssl verify` + 公钥比对），`client.toml` 的 `hub_ca_fingerprint` 必须与种子 `hub.crt` 的 SHA-256 指纹一致——没种子就 up 的话 Hub 会生成全新 CA，指纹与音箱 mTLS 同时失效；
 6. 音箱可达性：ping 或 TCP :22（只测可达，不登录）；`SPEAKER_IP` 未设时跳过本项；
@@ -110,7 +110,7 @@ TLS 证书与网易云 Cookie 随 `hub-data` 卷一起备份（manifest 里单�
   清单 `deploy/hub-linux-amd64.sha256` 已生成（`nas-install.sh` §0 会比对，
   不一致即 FAIL；重编后须重新生成清单）。本机冒烟验证：`--help` 打印用法退出 0；
   弱 Token（`CHANGE_ME`）启动即 Fatal 退出 1；设强 Token 后启动，
-  `curl :8080/api/status` 无 Token 返回 401，带 Web Token 返回
+  `curl :8081/api/status` 无 Token 返回 401，带 Web Token 返回
   `{"devices":0,"kws_down":true,"kws_status":"down","online":0,"rooms":null,"wake_word":"你好小李"}`
   （`kws_status: down` 是本机无边车的预期结果）；收信号后干净退出，未常驻。
   未设 `OPEN_XIAOAI_TOKEN` 时 Hub 直接退出（日志 `环境变量 OPEN_XIAOAI_TOKEN 未设置`），
@@ -163,9 +163,9 @@ TLS 证书与网易云 Cookie 随 `hub-data` 卷一起备份（manifest 里单�
 
 **在 Hub Web 面板里扫码**：
 
-1. 电脑上建 SSH 隧道：`ssh -L 8080:127.0.0.1:8080 huajun@NAS_IP`（保持该终端不退出）。
-   面板只绑回环（`hub/config.yaml` 里 `web_listen: 127.0.0.1:8080`），浏览器不能直连 `NAS_IP:8080`。
-2. 浏览器开 `http://127.0.0.1:8080`，进 Hub Web 面板 → **网易云登录**页。
+1. 电脑上建 SSH 隧道：`ssh -L 8081:127.0.0.1:8081 huajun@NAS_IP`（保持该终端不退出）。
+   面板只绑回环（`hub/config.yaml` 里 `web_listen: 127.0.0.1:8081`），浏览器不能直连 `NAS_IP:8081`。
+2. 浏览器开 `http://127.0.0.1:8081`，进 Hub Web 面板 → **网易云登录**页。
    要输 Web Token 时用 `deploy/.env` 里的 `OPEN_XIAOAI_WEB_TOKEN`（不要把 Token 发给别人或贴进群聊）。
 3. 点**生成二维码**（调 `POST /api/netease/login/qr`），页面显示二维码。
 4. 手机打开**网易云音乐 App**扫这个二维码，App 内点确认登录。
@@ -186,7 +186,7 @@ API 也自带一个演示页 `public/qrlogin.html`，但本部署的标准路径
 - **NeteaseCloudMusicApi 容器本身不保存登录态**：它是无状态转发，重启容器不丢登录，
   但 `hub-data` 卷丢了就要重扫。
 - 验证登录态：面板里看状态为已登录，或
-  `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env | cut -d= -f2-); curl -s -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8080/api/netease/status`
+  `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env | cut -d= -f2-); curl -s -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8081/api/netease/status`
   返回 `logged_in:true`（在 NAS 上跑，或走 SSH 隧道）。
 
 ### Cookie 过期与重登

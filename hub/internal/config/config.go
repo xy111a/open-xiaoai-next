@@ -23,7 +23,7 @@ type Config struct {
 	WakeWord string `yaml:"wake_word" json:"wake_word"`
 
 	// WakeWordRoutes 多唤醒词路由：唤醒词 → Agent 名。
-	// 例：你好小李 → hermes（管家），你好龙虾 → openclaw（通用）。
+	// 例：你好小李 → qwen（本地模型）。
 	WakeWordRoutes map[string]string `yaml:"wake_word_routes" json:"wake_word_routes"`
 
 	// Devices 已发现的设备（自动发现写入；手工改也行）。
