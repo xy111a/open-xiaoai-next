@@ -49,5 +49,22 @@ if ! model_complete; then
     exit 1
 fi
 
+# 唤醒词以 Hub 的 config.yaml 为准：每次启动都按当前唤醒词重生成
+# keywords.txt（面板改唤醒词后重启边车即生效；不重生成的话边车
+# 仍用旧词，Hub 的新词永远唤不醒——静默失配，比启动失败更糟）。
+# config.yaml 由 compose 以只读挂载进边车（/app/config.yaml）；
+# 未挂载时退回 WAKE_WORD 环境变量（默认“你好小李”）。
+WAKE_WORD="${WAKE_WORD:-}"
+if [ -f /app/config.yaml ]; then
+    CFG_WAKE="$(grep -E '^[[:space:]]*wake_word[[:space:]]*:' /app/config.yaml | head -1 | sed -E 's/^[^:]*:[[:space:]]*//; s/^"//; s/"[[:space:]]*$//; s/^'"'"'//; s/'"'"'[[:space:]]*$//')"
+    if [ -n "$CFG_WAKE" ]; then WAKE_WORD="$CFG_WAKE"; fi
+fi
+WAKE_WORD="${WAKE_WORD:-你好小李}"
+echo "==> regenerating keywords.txt for wake word: $WAKE_WORD" >&2
+if ! /app/scripts/regen-keywords.sh "$WAKE_WORD" "$MODEL_DIR"; then
+    echo "FATAL: failed to regenerate keywords.txt for wake word '$WAKE_WORD'; refusing to start with a stale keyword table" >&2
+    exit 1
+fi
+
 echo "==> KWS model ready in $MODEL_DIR"
 exec python /app/server.py "$@"

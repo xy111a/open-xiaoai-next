@@ -167,6 +167,9 @@ services:
           memory: 512M
     volumes:
       - kws-data:/data/kws/models
+      # 唤醒词以 Hub 的 config.yaml 为准：entrypoint 每次启动按它重生成
+      # keywords.txt（面板改唤醒词后重启边车即生效）。只读挂载。
+      - ../hub/config.yaml:/app/config.yaml:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:10400/health', timeout=5).status == 200 else 1)"]
       interval: 30s

@@ -83,23 +83,9 @@ if [ "$FP32" = 1 ]; then
 fi
 
 echo "==> generating keywords.txt for wake word: $WAKE_WORD"
-if command -v sherpa-onnx-cli >/dev/null 2>&1; then
-    printf '%s @%s\n' "$WAKE_WORD" "$WAKE_WORD" > "$TMP/keywords_raw.txt"
-    sherpa-onnx-cli text2token \
-        --tokens "$OUT_DIR/tokens.txt" \
-        --tokens-type ppinyin \
-        "$TMP/keywords_raw.txt" "$OUT_DIR/keywords.txt"
-elif [ "$WAKE_WORD" = "你好小李" ]; then
-    echo "sherpa-onnx-cli not found; writing the verified token line for 你好小李" >&2
-    cat > "$OUT_DIR/keywords.txt" <<'EOF'
-n ǐ h ǎo x iǎo l ǐ @你好小李
-EOF
-    echo "NOTE: this fallback line was verified in the 2026-11-17 experiment; for any other wake word, install sherpa-onnx and re-run." >&2
-else
-    echo "ERROR: sherpa-onnx-cli not found and no verified token line for wake word '$WAKE_WORD'." >&2
-    echo "Install it first: pip install sherpa-onnx sentencepiece pypinyin" >&2
-    exit 1
-fi
+# 关键词生成抽到 scripts/regen-keywords.sh（与 entrypoint 启动时
+# 的重生成同一份逻辑，避免两处各写一份漂移）。
+"$(dirname "$0")/regen-keywords.sh" "$WAKE_WORD" "$OUT_DIR"
 
 echo "==> done: $OUT_DIR"
 ls -la "$OUT_DIR"

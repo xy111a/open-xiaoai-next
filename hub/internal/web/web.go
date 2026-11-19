@@ -37,6 +37,9 @@ import (
 	"github.com/huajun/open-xiaoai-next/hub/internal/registry"
 )
 
+// exitFunc 是进程退出函数（restart 端点用）；测试可替换以避免真的退出。
+var exitFunc = os.Exit
+
 // maxRequestBody 是 PUT/POST 请求体上限（1MB）。
 const maxRequestBody = 1 << 20
 
@@ -215,6 +218,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/latency", s.requireAuth(s.latency))
 	mux.HandleFunc("/api/health", s.requireAuth(s.health))
 	mux.HandleFunc("/api/config", s.requireAuth(s.configAPI))
+	mux.HandleFunc("/api/restart", s.requireAuth(s.restart))
 	mux.HandleFunc("/api/ota", s.requireAuth(s.otaAPI))
 	mux.HandleFunc("/api/fingerprint", s.requireAuth(s.fingerprintAPI))
 	// 网易云扫码登录（融合 B）与音乐控制：与上面一样走 requireAuth，
@@ -403,21 +407,21 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	// 响应式：卡片用 auto-fit 网格（320px 下单列），表格包在
 	// .tablewrap 里横向滚动，页面本身不横向溢出。
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	// 2026-11-19 重写 v2：管理面板 + 配置编辑 + 双栏排版。
+	// 2026-11-19 重写 v2/v3：管理面板 + 配置编辑 + 唤醒词一键重启 + 自适应排版。
 	//  - 配置可编辑：唤醒词、唤醒词路由、HA 地址、音乐文件夹、勿扰时段、
 	//    Qwen Agent 地址/模型，走 PUT /api/config（后端合并+校验+写文件）。
-	//  - 唤醒词特别说明：只改 config.yaml 不够，边车 keywords.txt 也要
-	//    重新生成（download-model.sh + WAKE_WORD），且 Hub 与边车都要
-	//    重启（边车启动时才读 keywords.txt；Hub 启动时才建 KWS 客户端）。
-	//    面板里写明这一步，不假装一键生效。
-	//  - 排版：粘性顶栏（标题+总状态）、桌面双栏（左：状态/设备/配置，
-	//    右：音乐/网易云/OTA/指纹）、移动端单栏；卡片统一样式。
+	//  - 唤醒词：保存后若改了词，自动调 POST /api/restart——先重启边车
+	//    （entrypoint 按 config.yaml 新词重生成 keywords.txt），再退出
+	//    Hub（Docker 重启它，新 KWS 客户端），面板轮询 /api/status 直到
+	//    Hub 回来。唤醒词不支持热修改，重启是必须的（bai 接受）。
+	//  - 排版：粘性顶栏（标题+总状态）；主网格用 auto-fit/minmax 自适应，
+	//    任意缩放都不挤压（窄屏自动单栏）；表格横向滚动；body 禁横向溢出。
 	//  - 单文件内嵌，无外部依赖；JS 里不用反引号（Go raw string 不能含反引号）。
 	fmt.Fprint(w, `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>小爱音箱 · Hub</title>
 <style>
 :root{--bg:#f2f3f5;--card:#fff;--text:#1a1a1a;--muted:#667085;--line:#e4e7ec;--accent:#175cd3;--accent-bg:#eff4ff;--ok:#067647;--ok-bg:#ecfdf3;--bad:#b42318;--bad-bg:#fef3f2;--warn:#b54708;--warn-bg:#fffaeb;--radius:14px}
 *{box-sizing:border-box}
-body{font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);margin:0;padding:0 0 48px}
+body{font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);margin:0;padding:0 0 48px;overflow-x:hidden}
 .topbar{position:sticky;top:0;z-index:10;background:rgba(255,255,255,.92);backdrop-filter:blur(6px);border-bottom:1px solid var(--line)}
 .topbar-in{max-width:1080px;margin:0 auto;padding:14px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .topbar h1{font-size:19px;margin:0}
@@ -427,8 +431,10 @@ body{font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-se
 .pill.off{background:var(--bad-bg);color:var(--bad)}
 .pill.warn{background:var(--warn-bg);color:var(--warn)}
 .pill.grey{background:#f2f4f7;color:var(--muted)}
-main{max-width:1080px;margin:0 auto;padding:18px 16px 0;display:grid;grid-template-columns:1fr;gap:16px}
-@media(min-width:900px){ main{grid-template-columns:1fr 1fr} .span2{grid-column:1 / -1} }
+main{max-width:1080px;margin:0 auto;padding:18px 16px 0;display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:16px}
+.span2{grid-column:1 / -1}
+.tablewrap{overflow-x:auto}
+.card{min-width:0}
 .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px 20px;box-shadow:0 1px 2px rgba(16,24,40,.05)}
 .card h2{font-size:16px;margin:0 0 4px;display:flex;align-items:center;gap:8px}
 .card h2::before{content:"";width:4px;height:18px;border-radius:2px;background:var(--accent)}
@@ -529,10 +535,7 @@ pre.lyric{white-space:pre-wrap;font-size:13px;max-height:220px;overflow:auto;bac
 <div class="field"><label>Qwen 模型</label><input id="cfg-qwen-model" placeholder="qwen3.5-4b"></div>
 </div>
 <button id="cfg-save">保存配置</button> <span id="cfgmsg" style="font-size:13px"></span>
-<div class="note"><b>改唤醒词注意：</b>只改这里不够。边车的关键词表（keywords.txt）也要重新生成，且 Hub 与边车都要重启才生效（边车启动时才读 keywords.txt；Hub 启动时才建 KWS 客户端）。NAS 上执行：<br>
-<span class="mono">cd /volume4/docker/open-xiaoai-next/deploy &amp;&amp; WAKE_WORD="新唤醒词" ../kws-sidecar/scripts/download-model.sh /data/kws/models 2&gt;/dev/null || docker compose exec kws-sidecar /app/scripts/download-model.sh /data/kws/models<br>
-docker compose restart hub kws-sidecar</span><br>
-（download-model.sh 需 sherpa-onnx-cli 做 token 化；只有“你好小李”有内置的已验证 token 行，其它词必须装 sherpa-onnx 才能生成。）</div></div>
+<div class="note"><b>改唤醒词：</b>点“保存配置”后会自动重启边车与 Hub（约 20–30 秒），新唤醒词即生效——不用你手动敲命令。原理：边车启动时按 config.yaml 里的新词重生成关键词表，Hub 启动时按新词建唤醒客户端；唤醒词不支持热修改，重启是必须的（Docker 会把两个容器都拉起来）。其它配置（HA 地址、音乐文件夹等）保存即生效，Agent 类连接在 Hub 重启后生效。</div></div>
 
 <div class="card"><h2>固件 OTA</h2><p class="desc">给音箱下发新固件（只许 https 白名单地址）。</p>
 <div id="otajobs"><p class="muted">加载中…</p></div>
@@ -592,7 +595,7 @@ function loadDevices(){
     list.forEach(function(d){
       h += '<tr><td class="mono">' + esc(d.ID || d.id) + '</td><td>' + esc(d.Model || d.model) + '</td><td class="mono">' + esc(d.IP || d.ip) + '</td><td>' + esc(d.Room || d.room || '未认领') + '</td><td>' + ((d.Online || d.online) ? '<span class="pill">在线</span>' : '<span class="pill off">离线</span>') + '</td><td class="mono">' + esc(d.Version || d.version || '–') + '</td><td class="muted">' + esc(d.LastSeen || d.last_seen || '–') + '</td></tr>';
     });
-    el.innerHTML = h + '</table>';
+    el.innerHTML = '<div class="tablewrap">' + h + '</table></div>';
   });
 }
 function loadMusic(){
@@ -663,7 +666,7 @@ function loadOTA(){
     list.forEach(function(jb){
       h += '<tr><td class="mono">' + esc(jb.device_id || jb.DeviceID || '') + '</td><td>' + esc(jb.version || jb.Version || '') + '</td><td>' + esc(jb.status || jb.Status || '') + '</td><td class="muted">' + esc(jb.updated_at || jb.UpdatedAt || '') + '</td></tr>';
     });
-    el.innerHTML = h + '</table>';
+    el.innerHTML = '<div class="tablewrap">' + h + '</table></div>';
   }).catch(function(e){ if(e.message !== '401') document.getElementById('otajobs').innerHTML = '<p class="err">OTA 状态不可用：' + esc(e.message) + '</p>'; });
 }
 document.getElementById('ota-push').onclick = function(){
@@ -678,9 +681,10 @@ function loadFP(){
   }).catch(function(e){ if(e.message !== '401') document.getElementById('fp').textContent = '不可用：' + e.message; });
 }
 // ---- 配置编辑（走 PUT /api/config）----
+var curWake = '';
 function loadCfg(){
   return api('/api/config').then(function(j){
-    if(j.wake_word) document.getElementById('cfg-wake').value = j.wake_word;
+    if(j.wake_word){ document.getElementById('cfg-wake').value = j.wake_word; curWake = j.wake_word; }
     if(j.wake_word_routes && j.wake_word){
       var ag = j.wake_word_routes[j.wake_word];
       if(ag) document.getElementById('cfg-route').value = ag;
@@ -752,9 +756,33 @@ document.getElementById('cfg-save').onclick = function(){
     agents: {qwen: {base_url: document.getElementById('cfg-qwen-url').value.trim(), model: document.getElementById('cfg-qwen-model').value.trim()}}
   };
   api('/api/config', {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(patch)}).then(function(j){
-    msg.textContent = '已保存。' + (j.note ? j.note : '') + ' 改唤醒词的话，记得按上面黄框里的步骤重生成边车关键词并重启 Hub 与边车，否则新唤醒词不会生效。';
-    msg.className = 'ok';
-    loadStatus();
+    var wakeChanged = (wake !== curWake);
+    if(!wakeChanged){
+      msg.textContent = '已保存。' + (j.note ? j.note : '');
+      msg.className = 'ok';
+      loadStatus();
+      return;
+    }
+    // 唤醒词改了：重启边车与 Hub 才能生效（边车启动时按新词重生成
+    // keywords.txt；Hub 启动时按新词建 KWS 客户端）。/api/restart
+    // 先重启边车、再退出 Hub，Docker 会把两个容器都拉起来。
+    msg.textContent = '配置已保存，正在重启边车与 Hub（新唤醒词生效约需 20–30 秒）…';
+    msg.className = 'muted';
+    api('/api/restart', {method:'POST'}).then(function(){
+      curWake = wake;
+      var tries = 0;
+      var timer = setInterval(function(){
+        tries++;
+        api('/api/status').then(function(){
+          clearInterval(timer);
+          msg.textContent = '已重启，新唤醒词“' + wake + '”已生效。';
+          msg.className = 'ok';
+          loadAll();
+        }).catch(function(){
+          if(tries >= 30){ clearInterval(timer); msg.textContent = '重启超时（30 次未连上 Hub），请检查 NAS 上 hub 与 kws-sidecar 容器是否在运行。'; msg.className = 'err'; }
+        });
+      }, 2000);
+    }).catch(function(e){ if(e.message !== '401'){ msg.textContent = '重启失败：' + e.message + '（配置已保存，但新唤醒词未生效；请在 NAS 上 docker compose restart hub kws-sidecar）。'; msg.className = 'err'; } });
   }).catch(function(e){ if(e.message !== '401'){ msg.textContent = '保存失败：' + e.message; msg.className = 'err'; } });
 };
 function loadAll(){
@@ -886,6 +914,94 @@ func mergeJSON(dst, patch map[string]any) map[string]any {
 		dst[k] = v
 	}
 	return dst
+}
+
+// restart 重启边车与 Hub（面板改唤醒词后用）。
+// POST：先调边车 POST /restart（Bearer OPEN_XIAOAI_TOKEN），
+// 边车收到即退出、Docker 重启它，entrypoint 按 config.yaml 里的
+// 新唤醒词重生成 keywords.txt；边车确认后本 Hub 也退出，
+// Docker 重启它（新配置 + 新 KWS 客户端）。
+// 只在边车确认重启后才退出 Hub——边车调不通时回 502、不退出，
+// 避免 Hub 起来了、边车还带着旧词的静默失配。
+// KWS 未启用时直接重启 Hub（不调边车）。
+// 注意：响应先写出再退出（goroutine 里 500ms 后 os.Exit），
+// 否则面板收不到成功响应。
+func (s *Server) restart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只许 POST"})
+		return
+	}
+	// 读 KWS 地址（需要锁：配置可能正被 PUT 改）。
+	lock := s.cfgLock()
+	lock.Lock()
+	kwsEnabled := s.cfg != nil && s.cfg.KWS.Enabled
+	kwsURL := ""
+	if s.cfg != nil {
+		kwsURL = s.cfg.KWS.URL
+	}
+	lock.Unlock()
+
+	if kwsEnabled && kwsURL != "" {
+		restartURL, err := kwsRestartURL(kwsURL)
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "边车地址无法解析: " + err.Error()})
+			return
+		}
+		if err := callSidecarRestart(restartURL, config.Token()); err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "边车重启失败: " + err.Error()})
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "restarting"})
+	// 响应已写出；稍后退出，Docker（restart: unless-stopped）重启本容器。
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		log.Printf("POST /api/restart：退出进程，Docker 重启 Hub")
+		exitFunc(0)
+	}()
+}
+
+// kwsRestartURL 把边车 WS 地址（如 ws://127.0.0.1:10400/v1/kws）
+// 换成 HTTP 重启端点（http://127.0.0.1:10400/restart）。
+func kwsRestartURL(wsURL string) (string, error) {
+	u, err := url.Parse(wsURL)
+	if err != nil {
+		return "", err
+	}
+	switch u.Scheme {
+	case "ws":
+		u.Scheme = "http"
+	case "wss":
+		u.Scheme = "https"
+	default:
+		return "", fmt.Errorf("kws.url 的 scheme 必须是 ws/wss，实际是 %q", u.Scheme)
+	}
+	u.Path = "/restart"
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String(), nil
+}
+
+// callSidecarRestart 调边车 POST /restart（Bearer Token 鉴权）。
+func callSidecarRestart(restartURL, token string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, restartURL, nil)
+	if err != nil {
+		return err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("边车返回 HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // configAPI 读/写 config.yaml。

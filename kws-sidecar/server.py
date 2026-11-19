@@ -366,6 +366,27 @@ class Server:
             return Response(503, "Service Unavailable",
                             Headers([("Content-Type", "application/json")]),
                             body)
+        if request.path == "/restart":
+            # 面板改唤醒词后由 Hub 调：先返回 200，再退出进程，
+            # Docker（restart: unless-stopped）随即重启本容器，
+            # entrypoint 按 config.yaml 里的新唤醒词重生成 keywords.txt。
+            # 只认 POST + Bearer Token（与 hello 的 token 同一机密，
+            # 常数时间比较）；回环绑定，不加 TLS（与 /health 同一安全假设）。
+            if request.method != "POST":
+                return Response(405, "Method Not Allowed",
+                                Headers([("Allow", "POST")]), b"method not allowed")
+            auth = request.headers.get("Authorization", "")
+            got = auth[7:] if auth.startswith("Bearer ") else ""
+            if (self.token is None
+                    or not hmac.compare_digest(got, self.token)):
+                return Response(401, "Unauthorized",
+                                Headers([("Content-Type", "application/json")]),
+                                b'{"error":"unauthorized"}')
+            LOG.warning("restart requested via /restart; exiting so Docker restarts the container")
+            asyncio.get_running_loop().call_later(0.5, os._exit, 0)
+            body = json.dumps({"status": "restarting"}).encode()
+            return Response(200, "OK", Headers([("Content-Type",
+                                                 "application/json")]), body)
         if request.path == "/v1/kws":
             return None  # 继续 WebSocket 握手
         return Response(404, "Not Found", Headers(), b"not found")

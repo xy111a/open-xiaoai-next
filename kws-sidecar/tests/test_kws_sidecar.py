@@ -479,3 +479,48 @@ def test_health_reports_503_when_unhealthy():
     status, body = asyncio.run(get_health(srv))
     assert status == 503
     assert "repeated stream errors" in body["reason"]
+
+
+# ---------------- POST /restart（面板改唤醒词后由 Hub 调）----------------
+
+def test_restart_endpoint():
+    """POST /restart：只认 POST + Bearer Token（与 hello 的 token 同一
+    机密）；通过后回 200 并调度退出（Docker 重启容器，entrypoint 按
+    config.yaml 新词重生成 keywords.txt）。GET 405、缺/错 token 401。
+    os._exit 用 mock 挡住，避免测试进程真的退出。"""
+    import types
+    from unittest.mock import patch
+
+    sys.path.insert(0, str(SIDECAR_DIR))
+    import server as sidecar_server
+
+    token = "test-restart-token-1234567890"
+    srv = sidecar_server.Server(object(), keywords_count=1, token=token)
+
+    async def call(method, headers):
+        req = types.SimpleNamespace(path="/restart", method=method,
+                                    headers=headers)
+        return await srv.process_request(None, req)
+
+    # GET -> 405
+    resp = asyncio.run(call("GET", {}))
+    assert resp.status_code == 405
+    # POST，无 token -> 401
+    resp = asyncio.run(call("POST", {}))
+    assert resp.status_code == 401
+    # POST，错 token -> 401
+    resp = asyncio.run(call("POST", {"Authorization": "Bearer wrong"}))
+    assert resp.status_code == 401
+    # POST，正确 token -> 200，并调度退出（mock 挡住，不真退）
+    exited = []
+
+    async def run_success():
+        with patch.object(sidecar_server.os, "_exit",
+                          side_effect=lambda code: exited.append(code)):
+            resp = await call("POST", {"Authorization": "Bearer " + token})
+            assert resp.status_code == 200
+            assert json.loads(resp.body) == {"status": "restarting"}
+            await asyncio.sleep(0.7)  # 等 0.5s 后调度的退出触发
+
+    asyncio.run(run_success())
+    assert exited == [0]
