@@ -41,8 +41,8 @@
 | 10200 | piper（TTS） | 同上，端口 10200 | 能连通 |
 | 10400 | kws-sidecar（服务端唤醒） | `curl -s -m 5 http://127.0.0.1:10400/health` | 返回 `{"status":"ok","model_loaded":true}`（模型未加载好时 503；模型下载失败容器会报错退出，见故障速查） |
 | 3000 | NeteaseCloudMusicApi | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/` | `200`（只绑 127.0.0.1，NAS 外打不开是正常的；以前 `head -c 200` 的检查 404/500 也算通过，已改成断言 200） |
-| 8080 | Hub Web 面板 | `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' $NAS_DIR/deploy/.env \| cut -d= -f2-); curl -s -m 5 -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8080/api/status` | 返回 JSON，含 `"wake_word":"你好小李"`，如 `{"devices":2,"online":0,...}`（无 Token 时一律 401，不是面板坏了） |
-| 8080 | Hub Web 面板（网易云登录态） | `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' $NAS_DIR/deploy/.env \| cut -d= -f2-); curl -s -m 5 -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8080/api/netease/status` | 返回 200；已登录时 `logged_in:true`，未登录时只警告、去 §5 扫码（404 说明 Hub 二进制还没接该路由，以 Web 面板显示为准，见 MUSIC_FUSION.md“待 Hub 面确认”） |
+| 8081 | Hub Web 面板 | `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' $NAS_DIR/deploy/.env \| cut -d= -f2-); curl -s -m 5 -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8081/api/status` | 返回 JSON，含 `"wake_word":"你好小李"`，如 `{"devices":2,"online":0,...}`（无 Token 时一律 401，不是面板坏了） |
+| 8081 | Hub Web 面板（网易云登录态） | `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' $NAS_DIR/deploy/.env \| cut -d= -f2-); curl -s -m 5 -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8081/api/netease/status` | 返回 200；已登录时 `logged_in:true`，未登录时只警告、去 §5 扫码（404 说明 Hub 二进制还没接该路由，以 Web 面板显示为准，见 MUSIC_FUSION.md“待 Hub 面确认”） |
 | 1704 / 1705 | snapserver（流/控制） | `ss -tln \| grep -E ':1704|:1705'` | 两个端口都在监听 |
 | 4399 | Hub wss（音箱连） | `ss -tln \| grep ':<HUB_PORT>'`（HUB_PORT 部署时定，默认 4399；并行时是 4400） | 在监听（TLS 开启时是 wss） |
 
@@ -50,8 +50,8 @@
 
 | # | 做什么 | 预期结果 |
 |---|---|---|
-| 4.1 | `docker compose logs --tail=50 hub` | 出现 `open-xiaoai-hub 已启动：唤醒词 "你好小李"，监听 :<HUB_PORT>`（HUB_PORT 部署时定，默认 4399）和 `Web 面板：http://localhost:8080`；STT/TTS 连不上时会记 `Wyoming STT/TTS 连接失败`——刚启动时出现一次是正常的，等 whisper/piper 起好后 Hub 会重连（若一直失败，看 3 的端口） |
-| 4.1a | 同上，看 KWS 一行 + `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' $NAS_DIR/deploy/.env \| cut -d= -f2-); curl -s -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8080/api/status` | Hub 日志出现 `KWS 边车健康检查通过: ws://127.0.0.1:10400/v1/kws`；`/api/status` 里 `"kws_status":"ok"`（若是 `"down"`，看 10400 的 `/health` 与 `docker compose logs kws-sidecar`；刚重启边车后 `kws_status` 最多滞后一个 30s 健康检查周期才回 `ok`，唤醒本身恢复是即时的） |
+| 4.1 | `docker compose logs --tail=50 hub` | 出现 `open-xiaoai-hub 已启动：唤醒词 "你好小李"，监听 :<HUB_PORT>`（HUB_PORT 部署时定，默认 4399）和 `Web 面板：http://localhost:8081`；STT/TTS 连不上时会记 `Wyoming STT/TTS 连接失败`——刚启动时出现一次是正常的，等 whisper/piper 起好后 Hub 会重连（若一直失败，看 3 的端口） |
+| 4.1a | 同上，看 KWS 一行 + `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' $NAS_DIR/deploy/.env \| cut -d= -f2-); curl -s -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8081/api/status` | Hub 日志出现 `KWS 边车健康检查通过: ws://127.0.0.1:10400/v1/kws`；`/api/status` 里 `"kws_status":"ok"`（若是 `"down"`，看 10400 的 `/health` 与 `docker compose logs kws-sidecar`；刚重启边车后 `kws_status` 最多滞后一个 30s 健康检查周期才回 `ok`，唤醒本身恢复是即时的） |
 | 4.1b | `docker compose logs kws-sidecar \| tail -20` | 出现 `KWS model ready` / 监听 `ws://127.0.0.1:10400/v1/kws`（compose 传 `KWS_HOST=127.0.0.1`；镜像默认也是 `127.0.0.1`，见 kws-sidecar/README.md“安全假设”）（模型首次下载失败会明确报错退出，`kws-data` 卷里文件不全时重起会重新下载；不要手动往卷里拷模型） |
 | 4.2 | `docker compose logs --tail=30 hub \| grep '设备注册制'` | 应有 `设备注册制：…` 行（P1-44 注册制：白名单为空时 `register` 一律拒绝；配好指纹后音箱发 `register` 才注册。自动发现扫描已删，不要再查“发现/扫描”——旧写法已废弃）（本机冒烟时无真设备，只验证到日志格式；NAS 上有音箱刷好后才会注册） |
 | 4.3 | `docker compose logs --tail=100 \| grep -iE 'fatal|panic'` | 无输出（有则把对应容器日志贴回来） |
@@ -60,13 +60,13 @@
 ## 5. 网易云扫码登录（Hub Web 面板，融合 B，见 README §网易云扫码登录）
 
 > 2026-11-18 融合 B：Music Assistant 已砍，扫码点从 MA 界面（`NAS_IP:8095`）改到 **Hub Web 面板**。8095 端口已不存在，不要再开它。
-> 面板只绑回环（`hub/config.yaml` 里 `web_listen: 127.0.0.1:8080`），浏览器不能直连 `NAS_IP:8080`——先在电脑上建 SSH 隧道再开面板（若 Hub 面改了面板访问方式，以 MUSIC_FUSION.md 为准）。
+> 面板只绑回环（`hub/config.yaml` 里 `web_listen: 127.0.0.1:8081`），浏览器不能直连 `NAS_IP:8081`——先在电脑上建 SSH 隧道再开面板（若 Hub 面改了面板访问方式，以 MUSIC_FUSION.md 为准）。
 
 | # | 做什么 | 预期结果 |
 |---|---|---|
-| 5.0 | 电脑上建隧道：`ssh -L 8080:127.0.0.1:8080 huajun@NAS_IP`（保持该终端不退出），浏览器开 `http://127.0.0.1:8080` | 看到 Hub Web 面板（要输 Web Token 时，用 `deploy/.env` 里的 `OPEN_XIAOAI_WEB_TOKEN`；不要把 Token 发给别人或贴进群聊） |
+| 5.0 | 电脑上建隧道：`ssh -L 8081:127.0.0.1:8081 huajun@NAS_IP`（保持该终端不退出），浏览器开 `http://127.0.0.1:8081` | 看到 Hub Web 面板（要输 Web Token 时，用 `deploy/.env` 里的 `OPEN_XIAOAI_WEB_TOKEN`；不要把 Token 发给别人或贴进群聊） |
 | 5.1 | 面板里进**网易云登录**页，点**生成二维码**（调 `POST /api/netease/login/qr`） | 页面显示二维码（有效期约 2 分钟，过期点重新生成） |
-| 5.2 | 手机网易云音乐 App 扫码，App 内点确认登录（面板后台轮询 `GET /api/netease/login/qr/check?key=K`） | 面板状态变**已登录**；`curl -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8080/api/netease/status` 返回 `logged_in:true` |
+| 5.2 | 手机网易云音乐 App 扫码，App 内点确认登录（面板后台轮询 `GET /api/netease/login/qr/check?key=K`） | 面板状态变**已登录**；`curl -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8081/api/netease/status` 返回 `logged_in:true` |
 | 5.3 | 面板里搜一首歌点播放（先选非 VIP 的），或语音“你好小李，播放周杰伦的青花瓷” | 能出声（Hub → netease-api → MPD → Snapcast → 音箱；音箱未刷好前先在面板确认能播） |
 | 5.4 | Cookie 约 1–2 个月过期后 | 搜歌/播歌报需要登录时，回面板重新扫码即可，不用改配置、不重建容器 |
 
@@ -74,7 +74,7 @@
 
 | # | 做什么 | 预期结果 |
 |---|---|---|
-| 6.1 | `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env \| cut -d= -f2-); curl -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8080/api/devices`（Token 在本机 `deploy/.env` 里；Web 面板只绑 127.0.0.1:8080，须先建好 §5.0 的隧道再调 127.0.0.1:8080，**不要**用 `NAS_IP:8080`——面板不在那个地址监听） | 有音箱刷好并连上后，列表里出现设备且 `Online:true`（没刷机前只有配置里的两台占位，`Online:false` 是正常的） |
+| 6.1 | `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env \| cut -d= -f2-); curl -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8081/api/devices`（Token 在本机 `deploy/.env` 里；Web 面板只绑 127.0.0.1:8081，须先建好 §5.0 的隧道再调 127.0.0.1:8081，**不要**用 `NAS_IP:8081`——面板不在那个地址监听） | 有音箱刷好并连上后，列表里出现设备且 `Online:true`（没刷机前只有配置里的两台占位，`Online:false` 是正常的） |
 | 6.1a | 对音箱说“你好小李”（真人唤醒，VM 联调只验过合成语音） | 只有一台应答；另一台静默；Hub 日志出现 `kws: 设备 … 唤醒 "你好小李"`，`/api/status` 的 `kws_status` 为 `ok`（真人唤醒率 1m/3m ≥95% 仍是 BLOCKED，需真机测） |
 | 6.2 | 语音“你好小李，播放周杰伦的青花瓷” | 3 秒内出声（FR-05 验收线）；歌词/暂停/下一首可用 |
 | 6.3 | 两台音箱都刷好后放同一首歌 | 同组同步播放，延迟差 ≤10ms（关口 3） |
@@ -86,8 +86,8 @@
 | # | 做什么 | 预期结果 |
 |---|---|---|
 | 7.1 | `up` 后：`docker compose exec hub ls /app/hub-data`，再 `docker compose logs hub \| grep "证书指纹"` 记下指纹 | `/app/hub-data` 里有证书文件、`reminders.json`、`memory.json`（没有也先记下实际内容）；指纹是一串十六进制 |
-| 7.2 | 语音认领一台房间（如“你好小李，我在客厅”），或在 Web 面板改一次配置 | 认领后 `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env \| cut -d= -f2-); curl -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8080/api/devices` 里该设备 `Room` 已变（须先建好 §5.0 的隧道；不要用 `NAS_IP:8080`）；NAS 上 `cat $NAS_DIR/hub/config.yaml \| grep -A2 <设备ID>` 能看到新房间 |
-| 7.3 | `docker compose restart hub`，等 10 秒，再查一次指纹与房间：`docker compose logs hub \| grep "证书指纹"`、`WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env \| cut -d= -f2-); curl -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8080/api/devices`（同上，须先建好 §5.0 的隧道） | **指纹与 7.1 记下的一致**（变了说明证书丢了重生成，音箱指纹 pin 会失效）；房间认领还在；`/app/hub-data` 内容还在 |
+| 7.2 | 语音认领一台房间（如“你好小李，我在客厅”），或在 Web 面板改一次配置 | 认领后 `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env \| cut -d= -f2-); curl -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8081/api/devices` 里该设备 `Room` 已变（须先建好 §5.0 的隧道；不要用 `NAS_IP:8081`）；NAS 上 `cat $NAS_DIR/hub/config.yaml \| grep -A2 <设备ID>` 能看到新房间 |
+| 7.3 | `docker compose restart hub`，等 10 秒，再查一次指纹与房间：`docker compose logs hub \| grep "证书指纹"`、`WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env \| cut -d= -f2-); curl -H "Authorization: Bearer $WEB_TOKEN" http://127.0.0.1:8081/api/devices`（同上，须先建好 §5.0 的隧道） | **指纹与 7.1 记下的一致**（变了说明证书丢了重生成，音箱指纹 pin 会失效）；房间认领还在；`/app/hub-data` 内容还在 |
 | 7.4 | 若 7.3 任一项不对 | 停下，把 `docker compose logs hub` 与 `docker compose config` 的输出原样贴回来，不要猜着往下走 |
 
 | 现象 | 含义 |

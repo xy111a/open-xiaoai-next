@@ -21,9 +21,9 @@ wake_word: "你好小李"
 
 # 多唤醒词路由：唤醒词 → Agent 名
 # 2026-11-19 bai 定：对话用本地 Qwen3.5-4B（NAS 上 OVMS，9000/v3，无需 key）。
+# 2026-11-19 bai 定：删掉“你好龙虾”→openclaw 路由（死路由：边车只检测“你好小李”）；openclaw Agent 本身保留作备用。
 wake_word_routes:
   "你好小李": qwen
-  "你好龙虾": openclaw
 
 # 已注册的设备（P2-27/P2-51：空 IP 占位已删——占位键与设备真实 ID
 # 对不上，注册表里会留幽灵行；设备由 register 主动注册写入，
@@ -141,8 +141,8 @@ hub:
   # 延迟补偿（ms，P1-26）：key 为 Snapcast 客户端 ID 或显示名；两房间包起始值客厅 0 / 卧室 +15。
   snapcast_latencies:
     卧室: 15
-  # P0-1：Web 面板只绑回环地址，远程管理走 SSH 隧道（不要改回 ":8080"）。
-  web_listen: "127.0.0.1:8080"
+  # P0-1：Web 面板只绑回环地址，远程管理走 SSH 隧道（不要改回 ":8081"）。
+  web_listen: "127.0.0.1:8081"
   # scan_cidr 为空时自动取本机网段；本地测试可写 "127.0.0.1/32"
   # （P1-44：自动扫描已删除，scan_cidr 保留但不再被使用，
   # 设备改由 WS register 主动注册）。

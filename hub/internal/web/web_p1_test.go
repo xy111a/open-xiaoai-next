@@ -18,7 +18,7 @@ func TestConfigPutMerges(t *testing.T) {
 	// 只改一个字段：其余字段（music_folder、devices）必须原样保留，
 	// 而不是被全量替换清空。
 	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, authedReq(http.MethodPut, "/api/config", []byte(`{"wake_word":"你好龙虾"}`)))
+	s.Handler().ServeHTTP(rec, authedReq(http.MethodPut, "/api/config", []byte(`{"wake_word":"你好小明"}`)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("部分 PUT 应 200，实际 %d: %s", rec.Code, rec.Body.String())
 	}
@@ -30,8 +30,8 @@ func TestConfigPutMerges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.WakeWord != "你好龙虾" {
-		t.Fatalf("PUT 后 wake_word 应为 你好龙虾，实际 %q", reloaded.WakeWord)
+	if reloaded.WakeWord != "你好小明" {
+		t.Fatalf("PUT 后 wake_word 应为 你好小明，实际 %q", reloaded.WakeWord)
 	}
 	if reloaded.MusicFolder != "/volume1/music" {
 		t.Fatalf("PUT 合并后 music_folder 应保留，实际 %q", reloaded.MusicFolder)
@@ -63,14 +63,14 @@ func TestConfigPutUpdatesInPlace(t *testing.T) {
 	// P1-22：PUT 原地更新指针，调用方手里的同一指针应看到新值。
 	cfgBefore := s.cfg
 	rec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, authedReq(http.MethodPut, "/api/config", []byte(`{"wake_word":"你好龙虾"}`)))
+	s.Handler().ServeHTTP(rec, authedReq(http.MethodPut, "/api/config", []byte(`{"wake_word":"你好小明"}`)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PUT 应 200，实际 %d: %s", rec.Code, rec.Body.String())
 	}
 	if s.cfg != cfgBefore {
 		t.Fatal("PUT 不应换指针（原地更新），否则 main.go 的 h.cfg 看不到")
 	}
-	if s.cfg.WakeWord != "你好龙虾" {
+	if s.cfg.WakeWord != "你好小明" {
 		t.Fatalf("同一指针应看到新 wake_word，实际 %q", s.cfg.WakeWord)
 	}
 }

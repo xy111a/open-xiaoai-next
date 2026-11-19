@@ -110,7 +110,7 @@ func TestKWSSaveRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	c := kwsBase(t)
-	c.KWS = KWS{Enabled: true, URL: "ws://kws-sidecar:10400/v1/kws", Keywords: []string{"你好小李", "你好龙虾"}}
+	c.KWS = KWS{Enabled: true, URL: "ws://kws-sidecar:10400/v1/kws", Keywords: []string{"你好小李", "你好小明"}}
 	if err := c.Save(path); err != nil {
 		t.Fatalf("Save 失败: %v", err)
 	}
