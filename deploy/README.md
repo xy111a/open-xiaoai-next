@@ -38,6 +38,21 @@ HUB_CERTS_DIR=<种子目录> ./deploy/preflight.sh       # 证书种子不在默
 
 默认搜索证书种子：`deploy/hub-certs` → `release/flash-kit/hub-certs`（含其上两级 `../release/`、`../../release/`，即闪存套件 `flash-kit/hub-certs/` 的位置）；`client.toml` 同理。`nas-install.sh` 开头已接 preflight 门禁（失败即停，不传文件；紧急绕过：`SKIP_PREFLIGHT=1`）。Mock 测试见 `deploy/test_preflight.sh`（`bash deploy/test_preflight.sh`，假 docker/ss/ping/nc/ssh 垫片，不碰真 NAS/真音箱/真 Docker）。
 
+## 备份与恢复
+
+更新 / 部署日之前先备份，见 `BACKUP.md`：
+
+```bash
+cd deploy
+./backup.sh                                   # 生成 deploy/backups/open-xiaoai-next-backup-*.tar.gz
+./restore.sh backups/open-xiaoai-next-backup-*.tar.gz   # 恢复（默认要输入 YES 确认）
+```
+
+备份含 5 个具名卷 + `hub/config.yaml` + `.env` + compose/snapserver.conf，
+TLS 证书与网易云 Cookie 随 `hub-data` 卷一起备份（manifest 里单独列出）。
+`/volume1/music` 与 Docker 镜像不备份。归档含 Token，妥善保管、不要提交
+（`deploy/backups/` 已在 `.gitignore` 里）。
+
 ## 服务
 
 | 服务 | 镜像 | 端口 | 说明 |
