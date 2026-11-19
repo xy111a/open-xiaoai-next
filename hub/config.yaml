@@ -44,14 +44,57 @@ home_assistant:
   # 默认开；显式写 false 关闭。实体与控制范围见 docs/HA_MEDIA_PLAYER.md。
   # media_player_enabled: true
 
+# 音源顺序（插件式）：primary 先找，找不到/出错落到 fallback。
+# 只能填 netease（网易云直连）或 local（MPD 本地曲库）；fallback
+# 为空表示不兜底。缺省 primary=netease、fallback=local。
+music:
+  primary: netease
+  fallback: local
+
+# 技能插件（示例是占位桩，不要当真服务用）：名字 + 触发词 + HTTP 端点。
+# 语音含触发词（子串匹配）即 POST {"text": "...", "device_id": "..."}
+# 给端点，端点回 {"reply": "..."} 或纯文本，Hub 经 TTS 播出；
+# 技能调用失败/回空时落回 Agent。加新技能只加一条，不改代码。
+# news 这个例子指向本机一个不存在的桩端口（什么都没监听），
+# 只是演示配置形状；接真实技能时把 endpoint 改成真实内网地址。
+# 注意：不要把 endpoint 指向 Intel Hub——技能端点只许内网地址，
+# 且新闻类技能应由专门的技能服务提供，不要直连情报后台。
+skills:
+  - name: news
+    triggers: ["新闻", "今日头条", "热点"]
+    endpoint: "http://127.0.0.1:18080/v1/skill/news"
+    timeout_seconds: 10
+
 # Agent（OpenAI 兼容 /v1/chat/completions）。密钥走环境变量，不要写进文件。
+# 插件式：加一个新 LLM 只需在这里加一条（base_url + model），
+# 再按需配 system_prompt（没配用默认“你是家里的语音管家……”）与
+# api_key_env（读密钥的环境变量名，没配用全局 LLM_API_KEY），不改 Hub 代码。
+# 云端 LLM（DeepSeek / Claude / 云端 Qwen）的 base_url 走 https 时允许公网地址；
+# http 明文只许内网（密钥不能裸奔）。wake_word_routes 里配了哪个 Agent，
+# 对应唤醒词就路由到哪个；没配进路由的 Agent 也可以存在（备用）。
 agents:
   hermes:
     base_url: "http://hermes:8642/v1"
     model: "deepseek-chat"
+    # hermes 用全局 LLM_API_KEY；system_prompt 不写就是默认管家提示词。
+    system_prompt: "你是家里的语音管家，回答简短口语化，一两句话。"
   openclaw:
     base_url: "http://openclaw:18789/v1"
     model: "deepseek-chat"
+  # 云端例子（默认注释掉）：取消注释 + 在 NAS 环境里 export 对应密钥
+  # 再把唤醒词路由指过来即可，不用改代码。注意：只有 OpenAI 兼容
+  # /v1/chat/completions 的端点能直接接进来（DeepSeek、云端 Qwen、
+  # OpenRouter 这类都行）；Claude 原生 API 不是这个协议，要走一个
+  # OpenAI 兼容的网关/代理才能接，不能直接填 api.anthropic.com。
+  # deepseek:
+  #   base_url: "https://api.deepseek.com/v1"
+  #   model: "deepseek-chat"
+  #   api_key_env: "DEEPSEEK_API_KEY"
+  #   system_prompt: "你是家里的语音管家，回答简短口语化，一两句话。"
+  # qwen-cloud:
+  #   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  #   model: "qwen-plus"
+  #   api_key_env: "DASHSCOPE_API_KEY"
 
 # 网易云：NeteaseCloudMusicApi 地址（Hub 直连，MA 已移除；扫码登录走
 # Web 面板 /api/netease/*，cookie 存在 hub-data/netease-cookie.json）。

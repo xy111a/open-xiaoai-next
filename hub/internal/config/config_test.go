@@ -77,11 +77,17 @@ func TestValidateDownstreamURLs(t *testing.T) {
 		c.ApplyDefaults()
 		return c
 	}
-	// 公网 agent → 拒绝。
+	// 公网 agent：https 允许（云端 LLM 的 API 本来就在公网，见
+	// validateAgentURL），http 明文拒绝（密钥会裸奔）。
 	c := base()
-	c.Agents = map[string]Agent{"hermes": {BaseURL: "https://api.example.com/v1", Model: "deepseek-chat"}}
+	c.Agents = map[string]Agent{"deepseek": {BaseURL: "https://api.deepseek.com/v1", Model: "deepseek-chat"}}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("https 公网 agent 应校验通过: %v", err)
+	}
+	c = base()
+	c.Agents = map[string]Agent{"hermes": {BaseURL: "http://203.0.113.1:8642/v1", Model: "deepseek-chat"}}
 	if err := c.Validate(); err == nil {
-		t.Fatal("公网 agent base_url 应校验失败")
+		t.Fatal("http 公网 agent base_url 应校验失败")
 	}
 	// file:// 网易云 → 拒绝。
 	c = base()

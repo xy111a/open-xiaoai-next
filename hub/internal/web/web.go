@@ -338,8 +338,14 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // sensitiveKey 判断 JSON 字段名是否敏感（token/password/secret/key 类）。
+// 例外：以 _env / -env 结尾的是环境变量名（如 agents[].api_key_env），
+// 不是密钥本身——面板 GET 要照常显示，否则用户在面板里看不到、
+// 也改不了 Agent 的密钥变量名。
 func sensitiveKey(k string) bool {
 	lk := strings.ToLower(k)
+	if strings.HasSuffix(lk, "_env") || strings.HasSuffix(lk, "-env") {
+		return false
+	}
 	for _, sub := range []string{"token", "password", "passwd", "secret", "apikey", "api_key", "api-key", "private_key", "privatekey", "credential"} {
 		if strings.Contains(lk, sub) {
 			return true

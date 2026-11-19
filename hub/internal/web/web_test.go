@@ -217,12 +217,19 @@ func TestConfigPutRejectsTLSDowngradeAndPublicURL(t *testing.T) {
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "hub.tls") {
 		t.Fatalf("TLS 降级 PUT 应 400 且提示 hub.tls，实际 %d: %s", rec.Code, rec.Body.String())
 	}
-	// 公网 agent 地址 → 400。
-	public := `{"agents":{"hermes":{"base_url":"https://api.example.com/v1","model":"deepseek-chat"}}}`
+	// 公网 agent 地址：http 明文 → 400；https → 200（插件式 Agent：
+	// 云端 LLM 的 API 本来就在公网，Bearer 密钥走 TLS，见 config.validateAgentURL）。
+	publicHTTP := `{"agents":{"hermes":{"base_url":"http://203.0.113.1:8642/v1","model":"deepseek-chat"}}}`
 	rec = httptest.NewRecorder()
-	s.Handler().ServeHTTP(rec, authedReq(http.MethodPut, "/api/config", []byte(public)))
+	s.Handler().ServeHTTP(rec, authedReq(http.MethodPut, "/api/config", []byte(publicHTTP)))
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("公网下游地址 PUT 应 400，实际 %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("http 公网下游地址 PUT 应 400，实际 %d: %s", rec.Code, rec.Body.String())
+	}
+	publicHTTPS := `{"agents":{"hermes":{"base_url":"https://api.example.com/v1","model":"deepseek-chat"}}}`
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, authedReq(http.MethodPut, "/api/config", []byte(publicHTTPS)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("https 公网 Agent PUT 应 200（云端 LLM 允许），实际 %d: %s", rec.Code, rec.Body.String())
 	}
 	// file:// 网易云 → 400。
 	fileURL := `{"netease":{"api":"file:///etc/passwd"}}`
