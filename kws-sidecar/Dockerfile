@@ -22,13 +22,14 @@ ENV PYTHONUNBUFFERED=1 \
     KWS_PORT=10400 \
     KWS_MODEL_DIR=/data/kws/models
 
-# S-7：apt 包同样钉版本（Debian bookworm，2026-11-18 查
-# deb.debian.org bookworm Packages：curl 7.88.1-10+deb12u15、
-# bzip2 1.0.8-5+b1）。基础镜像更新到新 bookworm 点版本时 apt 版本
-# 可能前移，构建失败即提示更新此处版本（fail loudly，不静默漂移）。
+# S-7：apt 包同样钉版本（Debian trixie；2026-11-20 NAS 实测修正：
+# python:3.12-slim 底座已从 bookworm 漂到 trixie，旧 bookworm 版
+# curl 7.88.1-10+deb12u15、bzip2 1.0.8-5+b1 在 NAS 上构建失败，
+# 改成 trixie 版后构建通过。基础镜像再漂移时 apt 版本可能前移，
+# 构建失败即提示更新此处版本（fail loudly，不静默漂移）。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        curl=7.88.1-10+deb12u15 bzip2=1.0.8-5+b1 \
+        curl=8.14.1-2+deb13u7 bzip2=1.0.8-6 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
