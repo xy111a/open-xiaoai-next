@@ -58,7 +58,7 @@ TLS 证书与网易云 Cookie 随 `hub-data` 卷一起备份（manifest 里单�
 | 服务 | 镜像 | 端口 | 说明 |
 |---|---|---|---|
 | hub | 本地构建（deploy/Dockerfile.hub + 预编译二进制 deploy/hub-linux-amd64） | host | 唯一常驻服务，管仲裁/语音/音乐/HA/OTA |
-| whisper | rhasspy/wyoming-whisper | 10300 | small-int8，中文，beam-size 1 |
+| whisper | 本地构建（deploy/Dockerfile.whisper：底座 rhasspy/wyoming-whisper + funasr） | 10300 | Paraformer-large（funasr/paraformer-zh），中文 |
 | piper | rhasspy/wyoming-piper | 10200 | zh_CN-huayan-medium，流式合成 |
 | kws-sidecar | 本地构建（kws-sidecar/Dockerfile + server.py，模型首次启动下载到 kws-data 卷） | host（10400） | 服务端唤醒检测（sherpa-onnx WenetSpeech，“你好小李”）；Hub 经 ws://127.0.0.1:10400/v1/kws 连它 |
 | snapserver | ivdata/snapserver | host | 多房间同步播放服务端 |

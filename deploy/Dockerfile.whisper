@@ -1,0 +1,28 @@
+# STT：wyoming-faster-whisper + FunASR Paraformer-large
+# （2026-11-21 换模型：Whisper small-int8 短命令 2.82s、CER 16.69% →
+# Paraformer-large 0.389s、CER 7.86%，实测见
+# bench-20261119/funasr-bench-20261120.md；Qwen3-ASR 0.6B 短命令
+# 2.67s 未过 1.5s 验收线，见 qwen3-asr-bench-20261120.md）。
+# 模型不 bake 进镜像：首次启动由 wyoming-whisper 从 HuggingFace
+# 下载 funasr/paraformer-zh（约 850MB）到 /data，持久化在
+# compose 的 whisper-data 卷；首次启动是分钟级，/health 在模型
+# 就绪后才 200，不要按秒级健康检查判死。
+#
+# 版本钉死（P1-4 同款做法）：
+#   - 底座 rhasspy/wyoming-whisper:latest@sha256:3cc01f646c8b149fe47b2a5e8bfaf31866e1bc18faffadb26c9b8be58cbe5703
+#     （2026-11-20 NAS 上实测的 digest，与 compose 原 pin 一致，未漂移；
+#     更新流程：重查 Docker Hub manifest，比对 digest 是否变化，
+#     变化时同步更新本行与 compose 的注释，不要只改 tag 不改 digest）。
+#   - torch 2.6.0+cpu、funasr 1.4.27（bench 构建日志实测装到的版本，
+#     见 funasr-bench-20261120/build.log 的 Successfully installed 行）。
+# 构建坑（bench 实测踩过）：
+#   - pip 加 --break-system-packages（PEP 668）；
+#   - torch 必须用 --extra-index-url（CPU wheel 源），不用 --index-url；
+#   - 包必须装进 /usr/src/.venv（服务入口 docker_run.sh 用那个 venv，
+#     装进系统 python 服务启动时找不到）。
+FROM rhasspy/wyoming-whisper:latest@sha256:3cc01f646c8b149fe47b2a5e8bfaf31866e1bc18faffadb26c9b8be58cbe5703
+
+RUN /usr/src/.venv/bin/python -m pip install --no-cache-dir --break-system-packages \
+        --extra-index-url https://download.pytorch.org/whl/cpu "torch==2.6.0+cpu" \
+    && /usr/src/.venv/bin/python -m pip install --no-cache-dir --break-system-packages \
+        "funasr[knf]==1.4.27"
