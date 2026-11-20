@@ -286,8 +286,10 @@ def test_s7_dockerfile_pins_digest_apt_versions_and_user():
     assert m.group(1) == \
         "5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b", \
         "digest must match the 2026-11-18 Docker Hub API value"
-    assert "curl=7.88.1-10+deb12u15" in text
-    assert "bzip2=1.0.8-5+b1" in text
+    # apt 钉版本跟底座的 Debian 发行版走：2026-11-20 起是 trixie
+    #（python:3.12-slim 从 bookworm 漂到 trixie，见 Dockerfile 注释）。
+    assert "curl=8.14.1-2+deb13u7" in text
+    assert "bzip2=1.0.8-6" in text
     lines = text.splitlines()
     user_line = next(i for i, l in enumerate(lines)
                      if l.strip() == "USER 1000:1000")
