@@ -85,9 +85,9 @@ Whisper / Piper 的端口在 `deploy/docker-compose.yml` 里只绑了
 
 ## 不用改的东西（已确认）
 
-- **Whisper / Piper 容器不用改**：`rhasspy/wyoming-whisper`
- （`--model small-int8 --language zh --beam-size 1`）与
-  `rhasspy/wyoming-piper`（`--voice zh_CN-huayan-medium`）
+- **STT / Piper 容器不用改**：whisper 容器（本地构建，底座
+  `rhasspy/wyoming-whisper`，`--model funasr/paraformer-zh --language zh
+  --stt-library funasr`）与 `rhasspy/wyoming-piper`（`--voice zh_CN-huayan-medium`）
   原生就是 Wyoming 服务；`describe` 返回的 `asr` / `tts`
   信息正是 HA 认服务要的东西。Hub 自己的 STT/TTS 走同一套
   Wyoming 客户端（`hub/internal/wyoming`），已在用。
@@ -100,8 +100,8 @@ Whisper / Piper 的端口在 `deploy/docker-compose.yml` 里只绑了
 | 探针 FAIL 在 | 意思 | 查什么 |
 |---|---|---|
 | `dial` | TCP 都连不上 | `docker ps` 看容器在不在；`docker logs oxn-whisper` / `oxn-piper`；端口是不是还绑着 127.0.0.1:10300/10200（`ss -ltnp \| grep -E '10300\|10200'`） |
-| `describe` | 连上了但不是 Wyoming 协议 / info 里没 asr/tts | 端口是不是被别的服务占了；容器日志里有没有 Wyoming 报错；镜像是不是 `rhasspy/wyoming-whisper` / `rhasspy/wyoming-piper` |
-| `transcribe` | Whisper 拒绝转写 | 容器内存够不够（whisper 限额 4G，small-int8 首次加载模型要几十秒，等容器 healthy 再跑探针）；看 `docker logs oxn-whisper` |
+| `describe` | 连上了但不是 Wyoming 协议 / info 里没 asr/tts | 端口是不是被别的服务占了；容器日志里有没有 Wyoming 报错；镜像是不是 whisper（本地构建）/ `rhasspy/wyoming-piper` |
+| `transcribe` | STT 拒绝转写 | 容器内存够不够（whisper 限额 6G，Paraformer 首次加载模型要几分钟，等容器 healthy 再跑探针）；看 `docker logs oxn-whisper` |
 | `synthesize` | Piper 拒绝合成 | 音色名对不对（应为 `zh_CN-huayan-medium`）；看 `docker logs oxn-piper` |
 
 HA 里加集成时若报“连接失败”而探针是 OK 的：先看上面“Host

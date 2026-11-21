@@ -127,7 +127,7 @@ chmod +x "$FAKEBIN/docker" "$FAKEBIN/ss" "$FAKEBIN/ping" "$FAKEBIN/nc" "$FAKEBIN
 
 # ---------- 假仓库根模板（真证书 + 真配置文件）----------
 mkdir -p "$TEMPLATE/deploy/hub-certs" "$TEMPLATE/hub" "$TEMPLATE/kws-sidecar"
-cp "$REPO_ROOT/deploy/docker-compose.yml" "$REPO_ROOT/deploy/Dockerfile.hub" "$TEMPLATE/deploy/"
+cp "$REPO_ROOT/deploy/docker-compose.yml" "$REPO_ROOT/deploy/Dockerfile.hub" "$REPO_ROOT/deploy/Dockerfile.whisper" "$TEMPLATE/deploy/"
 cp "$REPO_ROOT/kws-sidecar/Dockerfile" "$TEMPLATE/kws-sidecar/"
 cp "$REPO_ROOT/hub/config.yaml" "$TEMPLATE/hub/"
 touch "$TEMPLATE/deploy/hub-linux-amd64"
@@ -152,10 +152,12 @@ tls = true
 hub_ca_fingerprint = "$FP"
 EOF
 
-# 全部 7 个镜像 ref（5 个 compose image + 2 个 Dockerfile FROM），供假 docker 用。
+# 全部 7 个镜像 ref（4 个 compose image + 3 个 Dockerfile FROM），供假 docker 用。
+# whisper 服务 2026-11-21 起是本地构建（compose 里无 image: 行），它的底座
+# rhasspy/wyoming-whisper 由 Dockerfile.whisper 的 FROM 行收进来。
 ALL_IMAGES="$(grep -E '^[[:space:]]*image:[[:space:]]*' "$TEMPLATE/deploy/docker-compose.yml" \
   | sed -e 's/^[[:space:]]*image:[[:space:]]*//' -e 's/[[:space:]]*#.*//' -e 's/[[:space:]]*$//'; \
-  grep -E '^FROM[[:space:]]' "$TEMPLATE/deploy/Dockerfile.hub" "$TEMPLATE/kws-sidecar/Dockerfile" | awk '{print $2}')"
+  grep -E '^FROM[[:space:]]' "$TEMPLATE/deploy/Dockerfile.hub" "$TEMPLATE/kws-sidecar/Dockerfile" "$TEMPLATE/deploy/Dockerfile.whisper" | awk '{print $2}')"
 WHISPER_IMG="$(printf '%s' "$ALL_IMAGES" | grep 'wyoming-whisper' | head -1)"
 
 # ---------- 用例脚手架 ----------
@@ -273,7 +275,11 @@ note "11. 镜像本地缺失且仓库拉不到"
 reset_case
 export FAKE_IMAGES_PRESENT="$(printf '%s' "$ALL_IMAGES" | grep -v 'wyoming-whisper')"
 export FAKE_MANIFEST_OK=0
-run_case "image-missing-unpullable" 1 "镜像缺失且仓库里找不到：$WHISPER_IMG"
+# 只断言失败文案前缀，不钉具体镜像名：preflight 在第一个缺失镜像处即
+# fail；2026-11-21 换模型后 whisper 底座从 compose image: 行移到
+# Dockerfile.whisper 的 FROM 行，检查顺序里第一个缺失的是 piper。
+# whisper 底座仍在检查清单里，由用例 12 的“仓库可拉取：$WHISPER_IMG”覆盖。
+run_case "image-missing-unpullable" 1 "镜像缺失且仓库里找不到："
 
 note "12. 镜像本地缺失但仓库可拉（应通过）"
 reset_case

@@ -54,6 +54,7 @@ COMPOSE_FILE="$ROOT/deploy/docker-compose.yml"
 CONFIG_FILE="$ROOT/hub/config.yaml"
 HUB_DOCKERFILE="$ROOT/deploy/Dockerfile.hub"
 KWS_DOCKERFILE="$ROOT/kws-sidecar/Dockerfile"
+WHISPER_DOCKERFILE="$ROOT/deploy/Dockerfile.whisper"
 CERTS_DIR_OVERRIDE="${HUB_CERTS_DIR:-}"
 CLIENT_TOML_OVERRIDE="${CLIENT_TOML:-}"
 SPEAKER_IP_OVERRIDE="${SPEAKER_IP:-}"
@@ -312,11 +313,11 @@ check_ports() {
 }
 
 # ================= 4. 镜像 =================
-# compose 里的 image: 行 + 两个 Dockerfile 的 FROM 行。
+# compose 里的 image: 行 + 三个 Dockerfile 的 FROM 行。
 required_images() {
   grep -E '^[[:space:]]*image:[[:space:]]*' "$COMPOSE_FILE" 2>/dev/null \
     | sed -e 's/^[[:space:]]*image:[[:space:]]*//' -e 's/[[:space:]]*#.*//' -e 's/[[:space:]]*$//'
-  for df in "$HUB_DOCKERFILE" "$KWS_DOCKERFILE"; do
+  for df in "$HUB_DOCKERFILE" "$KWS_DOCKERFILE" "$WHISPER_DOCKERFILE"; do
     [ -f "$df" ] || continue
     grep -E '^FROM[[:space:]]' "$df" 2>/dev/null | awk '{print $2}'
   done
@@ -336,6 +337,11 @@ check_images() {
     [ -f "$f" ] \
       || fail "$name" "缺 $f（kws-sidecar 是本地构建，缺了 up 会失败）" "确认 kws-sidecar/ 构建源文件都在仓库里"
   done
+  # whisper 也是本地构建（2026-11-21 换 Paraformer）：Dockerfile.whisper
+  # 缺了 up 会失败；底座 rhasspy/wyoming-whisper 由上面的 required_images
+  # 经 FROM 行收进镜像检查。
+  [ -f "$WHISPER_DOCKERFILE" ] \
+    || fail "$name" "缺 deploy/Dockerfile.whisper（whisper 是本地构建，缺了 up 会失败）" "确认 deploy/Dockerfile.whisper 在仓库里"
   local img manifest_out
   while IFS= read -r img; do
     [ -n "$img" ] || continue
@@ -362,7 +368,7 @@ check_images() {
   done <<EOF
 $(required_images)
 EOF
-  pass "$name" "构建输入齐全（Dockerfile.hub + hub-linux-amd64 + kws-sidecar 源文件）；其余镜像本地已有或仓库可拉取"
+  pass "$name" "构建输入齐全（Dockerfile.hub + hub-linux-amd64 + kws-sidecar 源文件 + Dockerfile.whisper）；其余镜像本地已有或仓库可拉取"
 }
 
 # ================= 5. 证书种子 =================

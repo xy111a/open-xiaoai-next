@@ -421,9 +421,39 @@ func (r *Router) EmergencyActive(deviceID string) bool {
 	return ok
 }
 
+// normalizeSTTText 是 STT 文本进意图解析前的归一化
+// （2026-11-21 换 FunASR Paraformer-large 后补）：
+//  1. 同音容错：FunASR 常把唤醒词“小李”听成“小丽”（17 条里 11–12 条
+//     首跑）、把“播放”听成“播芳/波放”——先统一换回来。
+//  2. 剥离句首唤醒词：转写文本带唤醒词时（会话内重复唤醒、或将来
+//     管线改动），“你好小李播放…”仍对不上 ^播放 这类锚定正则——
+//     剥掉前缀再进各路正则。生产管线会话开后才喂音频，正常转写
+//     本来就不带唤醒词，这一步是兜底，不改正常路径。
+//     Paraformer 不输出标点，Whisper 带标点：剥离时顺带清掉前缀后
+//     的 ，、 与空格，两种都覆盖。
+//
+// 只做文本归一化：不改任何路由逻辑、不碰“你好龙虾”的回归测试
+// （kws_test.go 的 TestUnknownKeywordFiltered 仍在，删掉的路由
+// 不会从这里漏回来）。
+// wakeWordPrefixRe 剥离句首唤醒词：FunASR 不输出标点（“你好小李播放…”）、
+// Whisper 带标点（“你好，小李，播放…”）——“你好”与“小李”之间、
+// 唤醒词之后都可能有 ，、 或空格。只剥句首：句中出现“小李”不动。
+var wakeWordPrefixRe = regexp.MustCompile(`^(?:你好[，、, ]*)?小李[，、, ]*`)
+
+func normalizeSTTText(text string) string {
+	text = strings.NewReplacer(
+		"小丽", "小李",
+		"播芳", "播放",
+		"波放", "播放",
+	).Replace(text)
+	text = strings.TrimSpace(text)
+	text = wakeWordPrefixRe.ReplaceAllString(text, "")
+	return strings.TrimSpace(text)
+}
+
 // Route 路由一条识别文本，返回要播报的回复文本。
 func (r *Router) Route(ctx context.Context, deviceID, text string) (string, error) {
-	text = strings.TrimSpace(text)
+	text = normalizeSTTText(text)
 	if text == "" {
 		return "", nil
 	}

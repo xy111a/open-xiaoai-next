@@ -18,7 +18,7 @@ go build -o hub ./cmd/hub
 | `internal/config` | config.yaml 的结构与加载 | Phase 0 已定 |
 | `internal/discovery` | mDNS/ARP 扫描找音箱 IP + 型号，不用手填 IP | Phase 1 |
 | `internal/arbitration` | 250ms 窗口比 RMS 信号强度，响的回，静的静默 | Phase 2 |
-| `internal/voice` | VAD → faster-whisper → Agent → Piper，流式 | Phase 1–3 |
+| `internal/voice` | VAD → FunASR Paraformer-large → Agent → Piper，流式 | Phase 1–3 |
 | `internal/music` | Snapcast 分组 + 延迟校准，音源网易云；跟随播放（follow-me，见 `followme.go`）：在 B 房间喊唤醒词，音乐从 A 房间跟过来 | Phase 2 |
 | `internal/ha` | HA WebSocket：查状态、调服务、读场景 | Phase 1 |
 | `internal/ota` | Client/Hub 远程升级，失败回滚 boot1 | Phase 4 |
@@ -28,7 +28,7 @@ go build -o hub ./cmd/hub
 | 端口 | 用途 |
 |---|---|
 | 4399 | wss，接 Client（Token 鉴权；原项目裸奔端口，本项目必须加密 + 鉴权） |
-| 10300 | Wyoming STT（faster-whisper，small-int8，zh） |
+| 10300 | Wyoming STT（FunASR Paraformer-large，zh） |
 | 10200 | Wyoming TTS（Piper） |
 | 1883 | MQTT（设备注册表 + HA 发现） |
 | 9092 | HTTP API（播放文本/音频/TTS、唤醒、打断、状态查询，抄 coderzc bridge 的接口） |

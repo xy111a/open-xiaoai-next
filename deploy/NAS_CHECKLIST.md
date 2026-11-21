@@ -30,8 +30,8 @@
 
 | # | 做什么 | 预期结果 |
 |---|---|---|
-| 2.1 | `NAS_SSH=huajun@NAS_IP NAS_DIR=/volume4/docker/open-xiaoai-next HUB_PORT=4399 ./deploy/nas-install.sh up`，或手工：`cd $NAS_DIR/deploy && docker compose pull && docker compose up -d`（HUB_PORT 与 1.1 保持一致） | `pull` 5 个镜像都成功（见镜像核实表；`binaryify/netease_cloud_music_api` 是修正后的官方镜像；hub 与 kws-sidecar 是本地构建，不拉取；mosquitto、Music Assistant 已删，不再拉取）；`up -d` 无报错 |
-| 2.2 | 等 15 秒（Whisper 首次要下载 small-int8 模型，约 500MB 左右；kws-sidecar 首次还要下载约 5.6MB 唤醒模型到 `kws-data` 卷，`docker compose ps` 里它会晚一点变健康），再 `docker compose ps` | 7 个容器状态全是 `Up`：oxn-hub / oxn-whisper / oxn-piper / oxn-kws-sidecar / oxn-snapserver / oxn-mpd / oxn-netease-api |
+| 2.1 | `NAS_SSH=huajun@NAS_IP NAS_DIR=/volume4/docker/open-xiaoai-next HUB_PORT=4399 ./deploy/nas-install.sh up`，或手工：`cd $NAS_DIR/deploy && docker compose pull && docker compose up -d`（HUB_PORT 与 1.1 保持一致） | `pull` 4 个镜像都成功（见镜像核实表；`binaryify/netease_cloud_music_api` 是修正后的官方镜像；hub、kws-sidecar 与 whisper 是本地构建，不拉取；mosquitto、Music Assistant 已删，不再拉取）；`up -d` 无报错 |
+| 2.2 | 等 3 分钟（whisper 首次要下载 funasr/paraformer-zh 模型，约 850MB，分钟级；kws-sidecar 首次还要下载约 5.6MB 唤醒模型到 `kws-data` 卷，`docker compose ps` 里它会晚一点变健康），再 `docker compose ps` | 7 个容器状态全是 `Up`：oxn-hub / oxn-whisper / oxn-piper / oxn-kws-sidecar / oxn-snapserver / oxn-mpd / oxn-netease-api |
 
 ## 3. 端口检查（NAS 上跑）
 
@@ -130,7 +130,7 @@ one-shot、只 `compose up` 全新卷也能起来（SC-P2-12 半修的回归项�
 
 | 镜像 | 结果 | 依据 |
 |---|---|---|
-| rhasspy/wyoming-whisper:latest | 存在 | Docker Hub 页面可打开，latest 标签，455.1 MB，2 个月前更新 |
+| rhasspy/wyoming-whisper:latest | 存在（whisper 底座） | 2026-11-21 起 whisper 本地构建（deploy/Dockerfile.whisper），底座仍是该镜像；Docker Hub 页面可打开，latest 标签，455.1 MB |
 | rhasspy/wyoming-piper:latest | 存在 | Docker Hub 页面可打开 |
 | ivdata/snapserver:latest | 存在 | Docker Hub 页面可打开 |
 | vimagick/mpd:latest | 存在 | Docker Hub 页面可打开 |

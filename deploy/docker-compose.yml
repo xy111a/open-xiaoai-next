@@ -80,16 +80,22 @@ services:
       - piper
       - kws-sidecar
 
-  # STT：faster-whisper，small-int8，中文；NAS i5-1235U 上 3 秒命令约 0.8–1.2 秒
+  # STT：FunASR Paraformer-large（2026-11-21 换模型，见 deploy/Dockerfile.whisper）：
+  # NAS i5-1235U 上短命令 0.389s、CER 7.86%（Whisper small-int8 是 2.82s、16.69%，
+  # 实测见 bench-20261119/funasr-bench-20261120.md）。本地构建：底座
+  # rhasspy/wyoming-whisper + 一层 funasr；模型首次启动从 HF 下载约 850MB
+  # 到 whisper-data 卷，是分钟级，/health 在模型就绪后才 200。
   # P1-4：Wyoming 协议无鉴权，只绑 127.0.0.1——Hub 走 host 网络，本机回环可达，
   # 局域网其他机器连不上。
   whisper:
-    image: rhasspy/wyoming-whisper:latest@sha256:3cc01f646c8b149fe47b2a5e8bfaf31866e1bc18faffadb26c9b8be58cbe5703
+    build:
+      context: .
+      dockerfile: Dockerfile.whisper
     container_name: oxn-whisper
     restart: unless-stopped
     cap_drop:
       - ALL
-    command: --model small-int8 --language zh --beam-size 1
+    command: --model funasr/paraformer-zh --language zh --stt-library funasr
     ports:
       - "127.0.0.1:10300:10300"
     environment:
@@ -97,8 +103,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 4G
+          cpus: "4.0"
+          memory: 6G
     volumes:
       - whisper-data:/data
 

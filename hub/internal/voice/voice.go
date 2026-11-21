@@ -1,6 +1,6 @@
 // Package voice 是语音管线：VAD → 流式 STT → 路由 → 流式 TTS。
 //
-// 链路：Client Opus 音频 → Hub 解码 → faster-whisper（Wyoming :10300，small-int8，zh）
+// 链路：Client Opus 音频 → Hub 解码 → FunASR Paraformer-large（Wyoming :10300，zh）
 //
 //	→ 文本 → 路由：家电命令先走 HA 本地意图（<1s，不经过 LLM）；
 //	  音乐走 Music Assistant；闲聊/复杂问答走 Agent（OpenAI 兼容，首字 ≤800ms）

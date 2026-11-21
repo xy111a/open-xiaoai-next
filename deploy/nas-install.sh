@@ -273,20 +273,26 @@ $SSH "sed -i 's#http://netease-api:3000#http://127.0.0.1:3000#' $NAS_DIR/hub/con
 info "4. docker compose pull + up"
 $SSH "cd $NAS_DIR/deploy && docker compose pull" \
   && ok "镜像拉取完成" || bad "镜像拉取失败（看是哪一个镜像报错；netease-api 已改为 binaryify/netease_cloud_music_api）"
-# P1-4：先构建 hub 与 kws-sidecar（两者都是 build:，pull 拉不到），
+# P1-4：先构建 hub、kws-sidecar 与 whisper（三者都是 build:，pull 拉不到），
 # 再做卷属主迁移——已存在的数据卷属主还是 root（旧版容器以 root 跑过），
 # 新版容器以 uid 1000 运行会写不进卷。up 之前用 root 一次性 chown
 # 两个具名卷的挂载点（只改属主，不动数据；首次部署卷是空的，这一步
 # 是空操作；新卷的首次 copy-up 由 Dockerfile 里的 mkdir + chown 负责）。
-$SSH "cd $NAS_DIR/deploy && docker compose build hub kws-sidecar" \
-  && ok "Hub 与 kws-sidecar 镜像已构建" || { bad "构建 hub/kws-sidecar 镜像失败"; exit 1; }
+$SSH "cd $NAS_DIR/deploy && docker compose build hub kws-sidecar whisper" \
+  && ok "Hub、kws-sidecar 与 whisper 镜像已构建" || { bad "构建 hub/kws-sidecar/whisper 镜像失败"; exit 1; }
 $SSH "cd $NAS_DIR/deploy && docker compose run --rm --user root --no-deps --entrypoint /bin/chown hub -R 1000:1000 /app/hub-data" \
   && ok "hub-data 卷属主已设为 1000:1000" || { bad "hub-data 卷 chown 失败"; exit 1; }
 $SSH "cd $NAS_DIR/deploy && docker compose run --rm --user root --no-deps --entrypoint /bin/chown kws-sidecar -R 1000:1000 /data/kws/models" \
   && ok "kws models 卷属主已设为 1000:1000" || { bad "kws models 卷 chown 失败"; exit 1; }
 $SSH "cd $NAS_DIR/deploy && docker compose up -d" \
   && ok "docker compose up -d 已执行" || { bad "up 失败，把报错贴回来"; exit 1; }
-sleep 15   # 等 Whisper 首次加载模型、Hub 启动
+# 只等 15 秒让各容器完成启动——这一步不等 whisper 的模型：
+# whisper 首次启动要下载 funasr/paraformer-zh（约 850MB，分钟级，
+# 见 NAS_CHECKLIST.md §2.2“等 3 分钟”），下载在容器后台进行；
+# 服务端启动即绑 10300 端口（NAS 实测：空数据卷首启 5 秒内端口
+# 已通，Ready 日志在模型加载完后才出），所以下面的 Up 计数与
+# 端口检查在下载进行中也能通过；15 秒只是启动沉降，不是模型就绪等待。
+sleep 15
 
 # P2-24：带 Web Token 的检查不用本地拼命令——token 经本地 shell 拼进
 # `$SSH "…"` 会被远端 shell 再解析一次，token 里的特殊字符会破环命令，
