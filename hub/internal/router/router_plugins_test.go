@@ -139,12 +139,13 @@ func TestPluginIntegrationSkillAgentMusic(t *testing.T) {
 	}
 
 	// 3. 点歌主路失败 → 本地兜底播出，MPD 收到播本地文件的命令。
+	// 快路径：兜底播出成功不播报确认，回复应为空。
 	reply, err = r.Route(ctx, "lx06-1", "播放青花瓷")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(reply, "正在播放本地版周杰伦的青花瓷") {
-		t.Fatalf("主路失败时应兜底播本地版，实际 %q", reply)
+	if reply != "" {
+		t.Fatalf("快路径下主路失败兜底播出成功应回空回复，实际 %q", reply)
 	}
 	joined := strings.Join(mpdFake.commands(), "\n")
 	if !strings.Contains(joined, "add 青花瓷.mp3") {

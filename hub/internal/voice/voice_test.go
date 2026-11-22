@@ -3,6 +3,7 @@ package voice
 import (
 	"context"
 	"math"
+	"sync"
 	"testing"
 	"time"
 
@@ -171,5 +172,46 @@ func TestPipelineSilenceOnlyNoAnswer(t *testing.T) {
 		t.Fatal("纯静音不应触发回答")
 	case <-time.After(200 * time.Millisecond):
 		// P1-29：回答异步，等 200ms 确认确实没触发（不是没来得及）。
+	}
+}
+
+// countingTTS 记录 Synthesize 调用次数（空回复应完全不调 TTS）。
+type countingTTS struct {
+	mu    sync.Mutex
+	calls int
+	pcm   []byte
+}
+
+func (f *countingTTS) Synthesize(text, voice string) ([]byte, error) {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	return f.pcm, nil
+}
+
+func (f *countingTTS) Calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+// Router 回空回复时管线应直接结束：不调 TTS、不触发 onReply
+// （点歌快路径依赖此行为：播出成功不播报确认语）。
+func TestPipelineEmptyReplySkipsTTS(t *testing.T) {
+	replied := make(chan [][]byte, 1)
+	tts := &countingTTS{pcm: make([]byte, 640)}
+	p := New(&fakeSTT{text: "播放青花瓷"}, tts, &fakeRouter{reply: ""}, "v",
+		func(deviceID string, frames [][]byte) { replied <- frames })
+	// 直接调 answer：同步跑完 STT→Router→（空回复，跳过 TTS）。
+	if err := p.answer(context.Background(), "lx06-1", []int16{1, 2, 3}); err != nil {
+		t.Fatalf("空回复时 answer 应返回 nil，实际: %v", err)
+	}
+	if got := tts.Calls(); got != 0 {
+		t.Fatalf("空回复时 TTS 不应被调用，实际 %d 次", got)
+	}
+	select {
+	case <-replied:
+		t.Fatal("空回复时不应触发 onReply")
+	default:
 	}
 }

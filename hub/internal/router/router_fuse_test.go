@@ -110,8 +110,9 @@ func TestMusicDirectOrderAndFallbackToLocal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(reply, "正在播放本地版周杰伦的青花瓷") {
-		t.Fatalf("直连失败应兜底播本地版，实际 %q", reply)
+	// 快路径：兜底播出成功不播报确认，回复应为空；播出本身用 MPD 命令与当前曲断言。
+	if reply != "" {
+		t.Fatalf("快路径下兜底播出成功应回空回复，实际 %q", reply)
 	}
 	// 调用顺序：先搜歌，再取地址（失败），再本地搜文件、播本地文件。
 	if len(paths) < 2 || paths[0] != "/search" || paths[1] != "/song/url/v1" {
@@ -144,8 +145,13 @@ func TestMusicSearchFailureFallsBackToLocal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(reply, "正在播放本地版青花瓷") {
-		t.Fatalf("搜歌失败也应兜底播本地版，实际 %q", reply)
+	// 快路径：搜歌失败兜底播出成功不播报确认，回复应为空；兜底是否真播出用 MPD 命令断言。
+	if reply != "" {
+		t.Fatalf("快路径下搜歌失败兜底播出成功应回空回复，实际 %q", reply)
+	}
+	joined := strings.Join(mpdFake.commands(), "\n")
+	if !strings.Contains(joined, "add 青花瓷.mp3") {
+		t.Fatalf("兜底应播本地文件，MPD 实际收到: %v", mpdFake.commands())
 	}
 }
 

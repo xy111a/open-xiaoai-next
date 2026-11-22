@@ -81,8 +81,9 @@ func TestRouterRecordsMusicLatency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(reply, "正在播放周杰伦的青花瓷") {
-		t.Fatalf("直连点歌回复不对: %q", reply)
+	// 快路径：点歌成功回空回复（music_ms 的断言在下面，不受影响）。
+	if reply != "" {
+		t.Fatalf("快路径下直连点歌成功应回空回复，实际 %q", reply)
 	}
 	if _, ok := inter.Stages[observability.StageMusic]; !ok {
 		t.Fatalf("点歌成功应记 music_ms，实际 %v", inter.Stages)

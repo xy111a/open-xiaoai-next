@@ -152,8 +152,9 @@ func TestMainStyleDepsMusicIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(reply, "正在播放周杰伦的青花瓷") {
-		t.Fatalf("main 同款 Deps 下点歌应走通，实际 %q", reply)
+	// 快路径：点歌成功回空回复；Snapcast 接线断言在下面，不受影响。
+	if reply != "" {
+		t.Fatalf("main 同款 Deps 下点歌成功应回空回复（快路径），实际 %q", reply)
 	}
 	// Snapcast 接线：应调过延迟校准与分组切流。
 	deadline := time.Now().Add(2 * time.Second)
@@ -210,8 +211,9 @@ func TestMainStyleDepsMusicDirectAppliesSnapcast(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(reply, "正在播放周杰伦的青花瓷") {
-		t.Fatalf("补接 MPD 后直连点歌应走通，实际 %q", reply)
+	// 快路径：补接后点歌成功回空回复；Snapcast 接线断言在下面，不受影响。
+	if reply != "" {
+		t.Fatalf("补接 MPD 后直连点歌成功应回空回复（快路径），实际 %q", reply)
 	}
 	if !snapFake.saw("Client.SetLatency") || !snapFake.saw("Group.SetStream") {
 		t.Fatalf("直连点歌成功后也应调 Snapcast 延迟/切流，实际收到: %v", snapFake.methods)

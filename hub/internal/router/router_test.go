@@ -466,8 +466,9 @@ func TestMusicDirect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(reply, "正在播放周杰伦的青花瓷") {
-		t.Fatalf("直连点歌回复不对: %q", reply)
+	// 快路径：直连点歌成功回空回复；MPD 命令断言在下面，不受影响。
+	if reply != "" {
+		t.Fatalf("快路径下直连点歌成功应回空回复，实际 %q", reply)
 	}
 	if got := mpdLn.commands(); len(got) != 3 || got[0] != "clear" || got[1] != "add http://music.example.com/12345.mp3" || got[2] != "play" {
 		t.Fatalf("MPD 应收到 clear/add/play，实际 %v", got)
@@ -496,8 +497,9 @@ func TestMusicFallbackNeteaseMPD(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(reply, "正在播放周杰伦的青花瓷") {
-		t.Fatalf("降级点歌回复不对: %q", reply)
+	// 快路径：降级点歌成功回空回复；MPD 命令断言在下面，不受影响。
+	if reply != "" {
+		t.Fatalf("快路径下降级点歌成功应回空回复，实际 %q", reply)
 	}
 	if got := mpdLn.commands(); len(got) != 3 || got[1] != "add http://music.example.com/12345.mp3" {
 		t.Fatalf("MPD 应收到 clear/add/play，实际 %v", got)
