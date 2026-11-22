@@ -83,15 +83,20 @@ func TestRouteSTTNormalizationMusic(t *testing.T) {
 
 	// FunASR 实测转写：唤醒词听成“小丽” + “播放”听成“播芳”，
 	// 归一化后应正常点歌，搜歌关键词里不能残留错字。
+	// 快路径：点歌成功回空回复；是否真播出用搜歌关键词与 MPD 命令断言。
 	reply, err := r.Route(ctx, "lx06-1", "你好小丽播芳陈奕迅的孤勇者")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(reply, "正在播放") {
-		t.Fatalf("归一化后应点歌成功，实际 %q", reply)
+	if reply != "" {
+		t.Fatalf("归一化后点歌成功应回空回复（快路径），实际 %q", reply)
 	}
 	if len(queries) != 1 || queries[0] != "陈奕迅的孤勇者" {
 		t.Fatalf("搜歌关键词应为“陈奕迅的孤勇者”，实际 %v", queries)
+	}
+	joined := strings.Join(mpdFake.commands(), "\n")
+	if !strings.Contains(joined, "add http://music.example.com/12345.mp3") {
+		t.Fatalf("归一化后点歌应让 MPD 播直链，实际 %v", mpdFake.commands())
 	}
 
 	// “波放”同理。
@@ -100,8 +105,8 @@ func TestRouteSTTNormalizationMusic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(reply, "正在播放") {
-		t.Fatalf("“波放”归一化后应点歌成功，实际 %q", reply)
+	if reply != "" {
+		t.Fatalf("“波放”归一化后点歌成功应回空回复（快路径），实际 %q", reply)
 	}
 	if len(queries) != 1 || queries[0] != "一首轻音乐" {
 		t.Fatalf("搜歌关键词应为“一首轻音乐”，实际 %v", queries)

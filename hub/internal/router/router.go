@@ -13,7 +13,8 @@
 //  5. 音乐（FR-05）：“播放周杰伦的青花瓷” → 音源链（主路网易云，
 //     找不到/出错落到 MPD 本地曲库）→ MPD 播；直连失败 → 本地兜底 →
 //     明说放不了。“暂停/继续/下一首/上一首/歌词”走 MPD 队列 +
-//     Hub 内存里的当前曲。
+//     Hub 内存里的当前曲。点歌快路径：播出成功返回空回复（语音管线
+//     收到 "" 直接跳过 TTS，不播“正在播放…”确认语）；失败仍明说。
 //  6. 家电（FR-06）：“关客厅灯” → 查 HA 实体别名表 → 先查状态再调服务；“灯开着吗”只查不调
 //  7. 技能插件：文本含某技能的触发词 → POST 给技能端点，
 //     回的文本直接播报；技能调用失败/回空时落到 8（不谎报成功）。
@@ -996,13 +997,13 @@ func (r *Router) noteMusicPlayed(deviceID string, start time.Time) {
 	r.Latency.RecordMusic(deviceID, time.Since(start))
 }
 
-// musicSlowFallback 是点歌超时后的本地兜底（H-1）：Router 只有一个回复
-// 通道，语音管线把返回的回复整句 TTS 播出，所以“网易云有点慢，先试本地”
-// 这句播报就落在回复句首，再接本地结果，不另起播报通道。
+// musicSlowFallback 是点歌超时后的本地兜底（H-1）：兜底播出成功时
+// 返回空回复（点歌快路径：歌已在播，不再播报“网易云有点慢，先试本地”）；
+// 本地也没有/没配好时才返回报错回复（会播报，不静默）。
 func (r *Router) musicSlowFallback(ctx context.Context, deviceID, query string, start time.Time) (string, bool, error) {
-	if reply, ok := r.playLocalOnly(ctx, query); ok {
+	if _, ok := r.playLocalOnly(ctx, query); ok {
 		r.noteMusicPlayed(deviceID, start)
-		return "网易云有点慢，先试本地，" + reply, true, nil
+		return "", true, nil
 	}
 	if !r.localMusicAvailable() {
 		return "网易云有点慢，本地曲库还没配好，先换一首试试？", true, nil
@@ -1017,6 +1018,13 @@ func (r *Router) musicSlowFallback(ctx context.Context, deviceID, query string, 
 //  3. 本地也没有 → 明确回复放不了（不静默失败、不落到 Agent 闲聊）。
 //
 // 搜歌本身失败时也先试本地兜底，再明说。
+//
+// 点歌快路径：playRe 命中且播出成功时返回空回复——voice 管线收到 ""
+// 直接跳过 TTS，不再合成“正在播放…”确认语；歌已在 MPD 起播，
+// music_ms 照记。失败仍返回原有报错回复（会播报）。
+// 注意：本分支本来就不调大模型（确认语是模板回复），快路径省的是
+// TTS 合成与播报，不是 LLM 调用；“首声压到 3 秒上下”是推算，
+// 部署日上机实测才能确认。
 func (r *Router) music(ctx context.Context, deviceID, text string) (string, bool, error) {
 	// 播放控制先于点歌：MPD 未接时明说，不要落到 Agent。
 	if pauseRe.MatchString(text) {
@@ -1083,9 +1091,9 @@ func (r *Router) music(ctx context.Context, deviceID, text string) (string, bool
 		if !r.localMusicAvailable() {
 			return "这首歌暂时放不了（网易云没有可播地址，本地曲库还没配好），换一首试试？", true, nil
 		}
-		if reply, ok := r.playLocalOnly(ctx, query); ok {
+		if _, ok := r.playLocalOnly(ctx, query); ok {
 			r.noteMusicPlayed(deviceID, musicStart)
-			return reply, true, nil
+			return "", true, nil
 		}
 		if errors.Is(err, music.ErrNoPlayable) {
 			return "这首歌暂时放不了（网易云没有可播地址，本地曲库里也没有），换一首试试？", true, nil
@@ -1095,14 +1103,15 @@ func (r *Router) music(ctx context.Context, deviceID, text string) (string, bool
 	if len(playables) == 0 {
 		return "没搜到“" + query + "”，换个歌名试试？", true, nil
 	}
-	if reply, ok := r.playPlayables(ctx, playables, srcName); ok {
-		// 超时后链里本地音源兜底成功：回复句首补一句“网易云有点慢”，
-		// 与 musicSlowFallback 的播报口径一致。
+	if _, ok := r.playPlayables(ctx, playables, srcName); ok {
+		// 快路径：播出成功即返回空回复（超时后本地兜底成功也不再补
+		// “网易云有点慢”播报）。music_ms 记录口径不动：超时后本地
+		// 兜底成功这条路本来就不记 music_ms（原代码提前返回），保持原样。
 		if srcName == "local" && errors.Is(musicCtx.Err(), context.DeadlineExceeded) {
-			return "网易云有点慢，先试本地，" + reply, true, nil
+			return "", true, nil
 		}
 		r.noteMusicPlayed(deviceID, musicStart)
-		return reply, true, nil
+		return "", true, nil
 	}
 	// 搜到了但播不起来（MPD 拒了）：先看播放器在不在，再试本地兜底。
 	r.depsMu.RLock()
@@ -1111,9 +1120,9 @@ func (r *Router) music(ctx context.Context, deviceID, text string) (string, bool
 	if mpd == nil {
 		return "音乐服务没接好（播放器未配置）。", true, nil
 	}
-	if reply, ok := r.playLocalOnly(ctx, query); ok {
+	if _, ok := r.playLocalOnly(ctx, query); ok {
 		r.noteMusicPlayed(deviceID, musicStart)
-		return reply, true, nil
+		return "", true, nil
 	}
 	if !r.localMusicAvailable() {
 		return "这首歌暂时放不了（音源有歌但播不起来，本地曲库还没配好），换一首试试？", true, nil

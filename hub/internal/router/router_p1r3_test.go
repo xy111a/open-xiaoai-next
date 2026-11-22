@@ -1,8 +1,8 @@
 package router
 
 // 第三轮审计 P1 回归测试（H-1）：点歌的网易云阶段（Search + SongURL）
-// 有总预算（默认 8s），3 首歌的 SongURL 并行取；超时即先播报
-// 「网易云有点慢，先试本地」再走本地兜底，不再静默拖 60–90s。
+// 有总预算（默认 8s），3 首歌的 SongURL 并行取；超时即直接走本地兜底
+// 播出（快路径：不再播报「网易云有点慢，先试本地」），不再静默拖 60–90s。
 
 import (
 	"context"
@@ -71,8 +71,8 @@ func TestMusicBudgetDefaultIs8s(t *testing.T) {
 }
 
 // TestMusicSearchTimeoutFallsBackToLocal：搜歌阶段被预算掐断时，
-// 点歌应在预算量级内返回（而不是等 15s 单次超时），回复句首播报
-// 「网易云有点慢，先试本地」，并兜底播出本地版。
+// 点歌应在预算量级内返回（而不是等 15s 单次超时），直接兜底播出本地版
+// （快路径：不再播报「网易云有点慢，先试本地」，回复为空）。
 func TestMusicSearchTimeoutFallsBackToLocal(t *testing.T) {
 	deps, _, _, _ := testDeps(t)
 	var starts []time.Time
@@ -95,16 +95,19 @@ func TestMusicSearchTimeoutFallsBackToLocal(t *testing.T) {
 	if elapsed > 1500*time.Millisecond {
 		t.Fatalf("搜歌超时后应在预算量级内转本地兜底，实际耗时 %s", elapsed)
 	}
-	if !strings.Contains(reply, "网易云有点慢，先试本地") {
-		t.Fatalf("超时回复应先播报「网易云有点慢，先试本地」，实际 %q", reply)
+	// 快路径：超时后本地兜底播出成功不播报，回复应为空；
+	// 兜底是否真播出用 MPD 命令断言。
+	if reply != "" {
+		t.Fatalf("快路径下超时兜底播出成功应回空回复，实际 %q", reply)
 	}
-	if !strings.Contains(reply, "正在播放本地版青花瓷") {
-		t.Fatalf("超时后应兜底播本地版，实际 %q", reply)
+	joined := strings.Join(mpdFake.commands(), "\n")
+	if !strings.Contains(joined, "add 青花瓷.mp3") {
+		t.Fatalf("超时后应兜底播本地文件，MPD 实际收到: %v", mpdFake.commands())
 	}
 }
 
 // TestMusicSongURLTimeoutFallsBackToLocal：搜歌成功、取地址阶段被预算
-// 掐断时，同样先播报再试本地（覆盖 fetchSongURLs 的超时分支）。
+// 掐断时，同样直接兜底播本地（快路径，不播报），覆盖 fetchSongURLs 的超时分支。
 func TestMusicSongURLTimeoutFallsBackToLocal(t *testing.T) {
 	deps, _, _, _ := testDeps(t)
 	var starts []time.Time
@@ -127,11 +130,14 @@ func TestMusicSongURLTimeoutFallsBackToLocal(t *testing.T) {
 	if elapsed > 1500*time.Millisecond {
 		t.Fatalf("取地址超时后应在预算量级内转本地兜底，实际耗时 %s", elapsed)
 	}
-	if !strings.Contains(reply, "网易云有点慢，先试本地") {
-		t.Fatalf("超时回复应先播报「网易云有点慢，先试本地」，实际 %q", reply)
+	// 快路径：超时后本地兜底播出成功不播报，回复应为空；
+	// 兜底是否真播出用 MPD 命令断言。
+	if reply != "" {
+		t.Fatalf("快路径下超时兜底播出成功应回空回复，实际 %q", reply)
 	}
-	if !strings.Contains(reply, "正在播放本地版青花瓷") {
-		t.Fatalf("超时后应兜底播本地版，实际 %q", reply)
+	joined := strings.Join(mpdFake.commands(), "\n")
+	if !strings.Contains(joined, "add 青花瓷.mp3") {
+		t.Fatalf("超时后应兜底播本地文件，MPD 实际收到: %v", mpdFake.commands())
 	}
 }
 
@@ -166,8 +172,12 @@ func TestMusicSongURLParallel(t *testing.T) {
 	if elapsed > 1500*time.Millisecond {
 		t.Fatalf("并行取地址应约等于单次延迟，实际耗时 %s", elapsed)
 	}
-	if !strings.Contains(reply, "第二首") {
-		t.Fatalf("第一首无地址时应播第二首，实际 %q", reply)
+	// 快路径：播出成功回空回复；播的是第几首用当前曲断言。
+	if reply != "" {
+		t.Fatalf("快路径下播出成功应回空回复，实际 %q", reply)
+	}
+	if song, _, ok := r.CurrentTrack(); !ok || song.Name != "第二首" {
+		t.Fatalf("第一首无地址时应播第二首，实际 %+v ok=%v", song, ok)
 	}
 	joined := strings.Join(mpdFake.commands(), "\n")
 	if !strings.Contains(joined, "add http://music.example.com/22.mp3") {
