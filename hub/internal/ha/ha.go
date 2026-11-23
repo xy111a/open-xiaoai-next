@@ -198,8 +198,14 @@ func (c *Client) SubscribeEvents(eventType string, handler func(event map[string
 	return nil
 }
 
-// call 发一条请求并等 result。
+// call 发一条请求并等 result（10s 超时）。
 func (c *Client) call(msgType string, extra map[string]any) (json.RawMessage, error) {
+	return c.callWithTimeout(msgType, extra, 10*time.Second)
+}
+
+// callWithTimeout 发一条请求并等 result，超时可配。
+// 读回验证（ReadState）用 2s 短超时：HA 挂了时快失败，不拖语音回复。
+func (c *Client) callWithTimeout(msgType string, extra map[string]any, timeout time.Duration) (json.RawMessage, error) {
 	c.mu.Lock()
 	c.seq++
 	id := c.seq
@@ -227,7 +233,7 @@ func (c *Client) call(msgType string, extra map[string]any) (json.RawMessage, er
 			return nil, fmt.Errorf("ha: 调用失败")
 		}
 		return r.Result, nil
-	case <-time.After(10 * time.Second):
+	case <-time.After(timeout):
 		c.mu.Lock()
 		delete(c.pending, id)
 		c.mu.Unlock()
@@ -321,4 +327,123 @@ func (c *Client) FireEvent(eventType string, data map[string]any) error {
 		"event_data": data,
 	})
 	return err
+}
+
+// ---- 读回验证（2026-11-23，设计思路借鉴 home-mate 的 tool/home.rs
+// set_entity，独立重新实现，未复制其代码）----
+//
+// CallService 成功只表示 HA 接受了请求（service_accepted ≠ confirmed）。
+// 调服务后必须读回状态比对，才知道设备是不是真的动了。三种结果严格区分：
+//   - 确认成功：读回与目标一致；
+//   - 读回不一致：读到了，但状态没变（设备没执行、HA 没下发）；
+//   - 读不到状态：实体不存在或 HA 故障——不谎称失败（动作可能已发生，
+//     只是没法确认），也不谎称成功。
+//
+// 本客户端是 WebSocket，没有 REST /api/states/{entity}：读回走 get_states
+// 全量再过滤，等价于 home-mate 的 GET /api/states/{entity}，只是传输层不同。
+
+const (
+	// ReadbackAttempts 是读回验证的最多读取次数。
+	ReadbackAttempts = 3
+	// ReadbackInterval 是两次读取之间的间隔（状态下发需要一点时间）。
+	ReadbackInterval = 150 * time.Millisecond
+	// ReadbackTimeout 是每次读取的超时（HA 挂了时快失败，不拖语音回复）。
+	ReadbackTimeout = 2 * time.Second
+)
+
+// ReadbackOutcome 是一次读回验证的结果。
+type ReadbackOutcome int
+
+const (
+	// ReadbackConfirmed 读回与目标一致（或场景状态已变化）。
+	ReadbackConfirmed ReadbackOutcome = iota
+	// ReadbackMismatch 读到了状态，但与目标不一致。
+	ReadbackMismatch
+	// ReadbackUnknown 读不到状态（实体不存在、HA 故障或超时）。
+	ReadbackUnknown
+)
+
+// ReadState 读一个实体的当前 state（2s 超时；实体不存在时返回错误）。
+func (c *Client) ReadState(entityID string) (string, error) {
+	raw, err := c.callWithTimeout("get_states", nil, ReadbackTimeout)
+	if err != nil {
+		return "", err
+	}
+	var states []State
+	if err := json.Unmarshal(raw, &states); err != nil {
+		return "", err
+	}
+	for _, s := range states {
+		if s.EntityID == entityID {
+			return s.State, nil
+		}
+	}
+	return "", fmt.Errorf("ha: 实体 %s 不存在", entityID)
+}
+
+// VerifyState 读回验证：最多读 ReadbackAttempts 次、间隔 ReadbackInterval，
+// 比对目标 state。第一次读到目标即确认；读到但 3 次都不符即不一致；
+// 读不到（实体不存在/HA 故障/超时）即未知——不等读完 3 次，HA 不可达时
+// 重试没有意义，立刻返回。
+func (c *Client) VerifyState(entityID, want string) ReadbackOutcome {
+	return c.VerifyStatePred(entityID, func(state string) bool { return state == want })
+}
+
+// VerifyStatePred 读回验证的判定函数版：不是所有 domain 的 state 都能用
+// 精确字符串比对——climate 开着时 state 是运行模式（heat/cool/auto…）
+// 而不是 "on"，cover 开着时是 "open"/"opening"。调用方按 domain 给判定，
+// 重试/超时语义与 VerifyState 完全相同。
+func (c *Client) VerifyStatePred(entityID string, want func(state string) bool) ReadbackOutcome {
+	for i := 0; i < ReadbackAttempts; i++ {
+		state, err := c.ReadState(entityID)
+		if err != nil {
+			return ReadbackUnknown
+		}
+		if want(state) {
+			return ReadbackConfirmed
+		}
+		if i < ReadbackAttempts-1 {
+			time.Sleep(ReadbackInterval)
+		}
+	}
+	return ReadbackMismatch
+}
+
+// VerifyStateChanged 场景类读回验证：读到状态与调用前不同即确认
+// （HA 场景实体的 state 是上次触发时间，触发后即变化）。
+// 3 次都相同即不一致；读不到即未知。
+func (c *Client) VerifyStateChanged(entityID, before string) ReadbackOutcome {
+	for i := 0; i < ReadbackAttempts; i++ {
+		state, err := c.ReadState(entityID)
+		if err != nil {
+			return ReadbackUnknown
+		}
+		if state != before {
+			return ReadbackConfirmed
+		}
+		if i < ReadbackAttempts-1 {
+			time.Sleep(ReadbackInterval)
+		}
+	}
+	return ReadbackMismatch
+}
+
+// CallServiceWithReadback 调服务并读回验证：调服务失败时返回错误
+// （outcome 为 ReadbackUnknown）；调服务成功时返回读回结果。
+// 调用方按 outcome 组织回复，禁止把“HA 接受了”说成“设备动了”。
+func (c *Client) CallServiceWithReadback(domain, service, entityID, want string) (ReadbackOutcome, error) {
+	if err := c.CallService(domain, service, entityID); err != nil {
+		return ReadbackUnknown, err
+	}
+	return c.VerifyState(entityID, want), nil
+}
+
+// CallServiceWithReadbackPred 是 CallServiceWithReadback 的判定函数版，
+// 供 state 不能精确比对的 domain 用（climate/cover，见 router 的
+// haControlTarget）。重试/超时语义与 CallServiceWithReadback 相同。
+func (c *Client) CallServiceWithReadbackPred(domain, service, entityID string, want func(state string) bool) (ReadbackOutcome, error) {
+	if err := c.CallService(domain, service, entityID); err != nil {
+		return ReadbackUnknown, err
+	}
+	return c.VerifyStatePred(entityID, want), nil
 }

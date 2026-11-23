@@ -921,6 +921,17 @@ func main() {
 				h.speakText(deviceID, text)
 			}
 		},
+		// StopAudio 晚绑定闭包：撤退词“停”由此停掉客户端正在播的
+		// TTS/播报（SendInterrupt，与 OnWake 的打断同款命令）；
+		// 调用时再读 h.server（server 为 nil 只在单测里出现，
+		// 此时什么都不做）。音乐另由 Router.MusicPause 停 MPD。
+		StopAudio: func(deviceID string) {
+			if h.server != nil {
+				if c, ok := h.server.Conn(deviceID); ok {
+					_ = c.SendInterrupt()
+				}
+			}
+		},
 		RoomClaim: h.OnRoomClaim,
 		RoomOfDevice: func(deviceID string) string {
 			if d, ok := reg.Get(deviceID); ok {

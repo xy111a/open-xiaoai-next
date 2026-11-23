@@ -21,12 +21,13 @@ func TestArbitrate(t *testing.T) {
 	if w := Arbitrate(nil); w != "" {
 		t.Fatalf("空事件应返回 \"\"，实际 %q", w)
 	}
-	// 同分先到者赢（> 不是 >=）。
+	// 同分同时间戳：响度分不出、时间也分不出 → TieBreak 按固定设备序
+	// （lx06-1 < oh2p-1 字典序），永不静默。
 	if w := Arbitrate([]WakeEvent{
 		{DeviceID: "lx06-1", RMSdB: -20},
 		{DeviceID: "oh2p-1", RMSdB: -20},
 	}); w != "lx06-1" {
-		t.Fatalf("同分应先到者赢，实际 %q", w)
+		t.Fatalf("同分同时间戳应按设备序选 lx06-1，实际 %q", w)
 	}
 }
 
