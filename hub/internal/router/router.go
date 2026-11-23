@@ -4,6 +4,8 @@
 //  1. 紧急呼叫（FR-15）：“救命”“打 120”“叫救护车” → 立即通知 + 进入待确认状态：
 //     可语音“取消呼叫”撤销；60s 无人取消则自动清理（待确认窗口）；
 //     同一设备重复触发不重复 Notify（不同设备各自独立）。
+//     1a. 撤退词（2026-11-23）：“停”“别说了”等 → 本地立即切断声音
+//     （MPD 暂停 + interrupt 停 TTS 播报），不进 LLM、不进仲裁、不播报。
 //  2. 对讲（P1-15）：“呼叫卧室”“全屋广播” → 触发 intercom 会话；
 //     留言式对讲：“叫一下客厅，吃饭了” → TTS 后播到目标房间
 //     （见 intercom_message.go；未知房间/同房间时在发起方明说）；
@@ -87,6 +89,13 @@ type Deps struct {
 	// 留言式对讲无分隔符时按它切分房间与消息、区分“已知但离线”
 	// 与“未知房间”两种报错。为 nil 时当作没有已知房间。
 	KnownRooms func() []string
+	// StopAudio 切断某设备正在播的声音（撤退词快路径用）：main.go 接
+	// SendInterrupt（停客户端正在播的 TTS/播报帧）；音乐另由
+	// Router.MusicPause 停 MPD。为 nil 时只停音乐，不断 TTS。
+	// 注意：这里不调 pipeline.Cancel——撤退词本身正跑在一条 answer
+	// 里，Cancel 只会取消自己的上下文；已发出的 TTS 帧只能靠
+	// interrupt 在客户端侧停住。
+	StopAudio func(deviceID string)
 	// Speak 把一段文本 TTS 后播到指定设备（留言式对讲用）：
 	// 生产由 main.go 接 h.speakText（经 playFrames 走统一播放协议
 	// start_play → Opus 帧 → stop_play）；为 nil 时留言式对讲分支
@@ -461,6 +470,9 @@ func (r *Router) Route(ctx context.Context, deviceID, text string) (string, erro
 	if reply, done := r.emergency(ctx, deviceID, text); done {
 		return reply, nil
 	}
+	if reply, done := r.retreat(ctx, deviceID, text); done {
+		return reply, nil
+	}
 	if reply, done := r.intercomMessage(ctx, deviceID, text); done {
 		return reply, nil
 	}
@@ -544,6 +556,39 @@ func (r *Router) skillRoute(ctx context.Context, deviceID, text string) (string,
 		return "", false, nil
 	}
 	return reply, true, nil
+}
+
+// ---- 1a. 撤退词本地快路径（2026-11-23，设计思路借鉴 home-mate
+// 的撤退词本地快路径，独立重新实现，未复制其代码）----
+
+// retreatRe 是撤退词表：整句就是这些词才命中（锚定全句，
+// “停车”“停一下，我想想”这类带更多内容的句子不命中，不误伤闲聊）。
+var retreatRe = regexp.MustCompile(`^(?:停|停止|停下|别说了|别播了|不要说了)\s*$`)
+
+// retreat 处理撤退词：本地立即切断声音——先停 MPD 音乐，再经
+// StopAudio 停客户端正在播的 TTS/播报帧；不进 LLM、不进仲裁、
+// 不播报确认语（返回空回复，语音管线收到 "" 直接跳过 TTS）。
+// 无声可停时同样静默返回，不多说一句话。
+// 覆盖范围：唤醒后说的撤退词，以及 20s 连续对话会话内不用再唤醒
+// 说的撤退词。无唤醒词的撤退（边车关键词）不在本次范围：边车是
+// 单关键词设计（kws-sidecar/scripts/regen-keywords.sh 一次只生成
+// 一个唤醒词，只有“你好小李”有已验证 token 行），加“停止”需改
+// 边车脚本 + 入口 + Hub 过滤 + 部署验证，且“停止”是常用词、
+// 误触发风险未测——列为后续项，见 DECISIONS.md。
+// 时效：三步全是本机操作（MPD 暂停 + 一次 interrupt 发送），
+// 正常在 300ms 内完成；上一句回答仍在合成/发送中时，新结算会被
+// 语音管线丢弃（voice.settle 的 inFlight 保护），那时靠唤醒词打断。
+func (r *Router) retreat(ctx context.Context, deviceID, text string) (string, bool) {
+	if !retreatRe.MatchString(text) {
+		return "", false
+	}
+	// MPD 未接时 Pause 报错也无妨：撤退的本意就是“别出声”，无声可停
+	// 时同样静默。
+	_ = r.MusicPause(ctx)
+	if r.deps.StopAudio != nil {
+		r.deps.StopAudio(deviceID)
+	}
+	return "", true
 }
 
 // ---- 1. 紧急呼叫（FR-15）----
@@ -876,11 +921,15 @@ var recallRe = regexp.MustCompile(`^(你还记得|你记得|我说过|我让你�
 var homeRe = regexp.MustCompile(`我回来了|我到家了`)
 
 // allowedVoiceDomain 是语音可直接控制的 domain 白名单（P2-49）：
-// 灯/插座/空调/窗帘四类；门锁/燃气/热水器等高风险 domain 不在内。
+// 灯/插座/空调/窗帘/风扇/输入布尔六类；门锁/燃气/热水器等高风险 domain 不在内。
 // 家电命令与回家场景共用同一张表，场景不再是 allowlist 的旁路。
+// 2026-11-23：原表是 light/switch/climate/cover，home-mate 的表是
+// light/switch/fan/input_boolean/cover——合并两张表：climate 保留
+// （卧室空调就是 climate，去掉会断语音控空调），fan 与 input_boolean
+// 是新增的安全域（都不是锁/燃气类），与现有行为兼容。
 func allowedVoiceDomain(domain string) bool {
 	switch domain {
-	case "light", "switch", "climate", "cover":
+	case "light", "switch", "climate", "cover", "fan", "input_boolean":
 		return true
 	}
 	return false
@@ -927,10 +976,21 @@ func (r *Router) sceneMemory(ctx context.Context, deviceID, text string) (string
 			}
 		}
 		// “我回来了”跑 HA 场景 scene.coming_home（需在 HA 里建好）。
+		// 2026-11-23：调服务后读回验证——场景实体的 state 是上次触发
+		// 时间，触发后即变化；3 次都相同即没生效，读不到即没法确认，
+		// 都不明说成功（旧代码调服务成功就直接说“开好了”）。
+		before, _ := r.ha().GetEntityState("scene.coming_home")
 		if err := r.ha().CallService("scene", "turn_on", "scene.coming_home"); err != nil {
 			return "想帮你开回家场景，但 HA 里没有 scene.coming_home。", true, nil
 		}
-		return "欢迎回来，灯和空调都按你的习惯开好了。", true, nil
+		switch r.ha().VerifyStateChanged("scene.coming_home", before) {
+		case ha.ReadbackConfirmed:
+			return "欢迎回来，灯和空调都按你的习惯开好了。", true, nil
+		case ha.ReadbackMismatch:
+			return "回家场景发了，但读回来看场景没有触发，可能没生效，请检查一下 HA。", true, nil
+		default:
+			return "回家场景发了，但读不回场景的状态，没法确认有没有真的触发。", true, nil
+		}
 	}
 	return "", false, nil
 }
@@ -1451,8 +1511,29 @@ func (r *Router) homeAssistant(ctx context.Context, deviceID, text string) (stri
 			return alias + "已经是" + map[bool]string{true: "开着", false: "关着"}[turnOn] + "的了。", true, nil
 		}
 	}
-	if err := haClient.CallService(domain, service, entityID); err != nil {
+	// 2026-11-23：调服务后读回验证——CallService 成功只表示 HA 接受了
+	// 请求，读回状态与目标一致才算真的动了；不一致/读不到都要如实说，
+	// 不谎报成功（旧代码调服务成功就直接说“开了/关了”）。
+	want := "off"
+	if turnOn {
+		want = "on"
+	}
+	outcome, err := haClient.CallServiceWithReadback(domain, service, entityID, want)
+	if err != nil {
 		return "", true, err
 	}
-	return alias + verb + "。", true, nil
+	switch outcome {
+	case ha.ReadbackConfirmed:
+		return alias + verb + "。", true, nil
+	case ha.ReadbackMismatch:
+		if turnOn {
+			return alias + "好像没开（发了指令，但读回来看还是关着的），可能没生效，请检查一下设备。", true, nil
+		}
+		return alias + "好像没关（发了指令，但读回来看还是开着的），可能没生效，请检查一下设备。", true, nil
+	default:
+		if turnOn {
+			return "已经发了开" + alias + "的指令，但读不回它的状态，没法确认有没有真的开。", true, nil
+		}
+		return "已经发了关" + alias + "的指令，但读不回它的状态，没法确认有没有真的关。", true, nil
+	}
 }

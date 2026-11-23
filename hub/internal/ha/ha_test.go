@@ -20,6 +20,16 @@ type fakeHA struct {
 	fired   []string         // 收到的 fire_event 类型
 	states  map[string]string
 	conn    *websocket.Conn
+	// stubborn 为真时 call_service 只记录、不改状态（读回不一致测试用）。
+	stubborn bool
+	// slowGetStates 让 get_states 回复前拖延（超时测试用）。
+	slowGetStates time.Duration
+	// flipAfterReads/flipEntity/flipTo：第几次 get_states 后把指定实体
+	// 翻成目标状态（读回重试测试用；0 表示不翻转）。
+	flipAfterReads int
+	flipEntity     string
+	flipTo         string
+	getStatesCount int
 }
 
 // writeJSON 是本替身唯一的写入口（持 writeMu），防并发写 panic。
@@ -75,8 +85,18 @@ func (f *fakeHA) handle(msg map[string]any) {
 	}
 	switch msg["type"] {
 	case "get_states":
-		var out []map[string]any
 		f.mu.Lock()
+		f.getStatesCount++
+		if f.flipAfterReads > 0 && f.getStatesCount >= f.flipAfterReads && f.flipEntity != "" {
+			f.states[f.flipEntity] = f.flipTo
+		}
+		delay := f.slowGetStates
+		f.mu.Unlock()
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		f.mu.Lock()
+		var out []map[string]any
 		for eid, st := range f.states {
 			out = append(out, map[string]any{"entity_id": eid, "state": st})
 		}
@@ -85,16 +105,18 @@ func (f *fakeHA) handle(msg map[string]any) {
 	case "call_service":
 		f.mu.Lock()
 		f.calls = append(f.calls, msg)
-		// 真改状态：turn_on → on，turn_off → off。
+		// 真改状态：turn_on → on，turn_off → off；stubborn 时只记录不改。
 		eid, _ := msg["target"].(map[string]any)["entity_id"].(string)
 		if eid == "" {
 			eid, _ = msg["entity_id"].(string)
 		}
-		switch msg["service"] {
-		case "turn_on":
-			f.states[eid] = "on"
-		case "turn_off":
-			f.states[eid] = "off"
+		if !f.stubborn {
+			switch msg["service"] {
+			case "turn_on":
+				f.states[eid] = "on"
+			case "turn_off":
+				f.states[eid] = "off"
+			}
 		}
 		f.mu.Unlock()
 		reply([]any{})

@@ -103,6 +103,8 @@ type fakeHA struct {
 	// attributes.entity_id 列出场景内含的实体）。
 	attrs map[string]map[string]any
 	calls []string // "domain/service/entity_id"
+	// stubborn 为真时 call_service 只记录、不改状态（读回不一致测试用）。
+	stubborn bool
 }
 
 func startFakeHA(t *testing.T) (*fakeHA, *ha.Client) {
@@ -143,10 +145,12 @@ func startFakeHA(t *testing.T) (*fakeHA, *ha.Client) {
 				f.mu.Lock()
 				eid, _ := msg["target"].(map[string]any)["entity_id"].(string)
 				f.calls = append(f.calls, msg["domain"].(string)+"/"+msg["service"].(string)+"/"+eid)
-				if msg["service"] == "turn_on" {
-					f.states[eid] = "on"
-				} else if msg["service"] == "turn_off" {
-					f.states[eid] = "off"
+				if !f.stubborn {
+					if msg["service"] == "turn_on" {
+						f.states[eid] = "on"
+					} else if msg["service"] == "turn_off" {
+						f.states[eid] = "off"
+					}
 				}
 				f.mu.Unlock()
 				_ = c.WriteJSON(map[string]any{"id": int(id), "type": "result", "success": true, "result": []any{}})
