@@ -373,12 +373,9 @@ func (h *hubHandler) OnAudioFrame(deviceID string, data []byte) {
 		return
 	}
 	if err := h.pipeline.FramePCM(context.Background(), deviceID, pcm); err != nil {
+		// P0-3：FramePCM 只返回同步错误——settle 的异步回答错误走
+		// Pipeline.OnError 播报，不经过这里；只记日志。
 		log.Printf("voice frame: %v", err)
-		// P1-2：STT/TTS 不可用或管线繁忙时，播一句降级回复而不是静默。
-		// speakText 内部会在 TTS 为 nil 时只记日志，不 panic。
-		if isVoiceServiceError(err) && h.speakText != nil {
-			h.speakText(deviceID, "语音服务暂时没连上，请稍后再试")
-		}
 	}
 }
 
@@ -408,26 +405,12 @@ func (h *hubHandler) OnKWSWake(ev kws.WakeEvent) {
 	h.OnWake(ev.DeviceID, transport.Wake{WakeWord: ev.Keyword, RMSdB: rmsdB, TsMs: ev.TimestampMs})
 }
 
-// isVoiceServiceError 判断语音错误是否属于“下游服务不可用”类（P1-2 降级
-// 回复只针对这类错误；识别/路由等普通错误不重复播报）。
-func isVoiceServiceError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "STT 不可用") ||
-		strings.Contains(msg, "TTS 不可用") ||
-		strings.Contains(msg, "语音管线繁忙")
-}
-
 func (h *hubHandler) OnAudioEnd(deviceID string) {
 	// 对讲会话结束。
 	h.intercom.End(deviceID)
 	if err := h.pipeline.End(context.Background(), deviceID); err != nil {
+		// P0-3：与 OnAudioFrame 同理，异步回答错误走 Pipeline.OnError。
 		log.Printf("voice end: %v", err)
-		if isVoiceServiceError(err) && h.speakText != nil {
-			h.speakText(deviceID, "语音服务暂时没连上，请稍后再试")
-		}
 	}
 }
 
@@ -446,22 +429,49 @@ func (h *hubHandler) OnRoomClaim(deviceID string, room string) {
 		}
 		return
 	}
+	// 记下认领前的旧房间：保存失败回滚时恢复它（而不是直接清空）。
+	prevRoom := ""
+	if d, ok := h.reg.Get(deviceID); ok {
+		prevRoom = d.Room
+	}
 	if !h.reg.SetRoom(deviceID, room) {
 		return
 	}
 	// 写回 config.yaml 持久化。P1-32：Save 失败必须记日志，不许吞掉
 	//（只读挂载下房间认领重启后会丢失，操作员要能从日志看到）。
+	// P0-2：Save 失败时不要回 room_ok——用户会以为认领成功，重启后
+	// 认领丢失；改回 room_reject，并回滚本次认领的内存状态（注册表
+	// 与配置里的设备条目），免得之后一次无关保存把这次被拒的认领
+	// 又写进磁盘。
 	// P1-22：与 Web PUT 共用 cfgMu（P1-23 的唯一临时文件只防写坏，
 	// 不防两边同时写丢字段），持锁期间写配置 + 落盘。
 	if h.cfgMu != nil {
 		h.cfgMu.Lock()
 		defer h.cfgMu.Unlock()
 	}
+	// M1（PR #17 审查）：覆盖前先快照旧条目——换房间认领失败时要恢复
+	// 旧条目，而不是直接删掉它（否则之后一次无关保存会把旧房间
+	// 的认领也落盘丢掉）。
+	prevDev, hadPrev := h.cfg.Devices[deviceID]
 	h.cfg.Devices[deviceID] = config.Device{
 		Model: mustModel(h.reg, deviceID), IP: mustIP(h.reg, deviceID), Room: room,
 	}
 	if err := h.cfg.Save(h.cfgPath); err != nil {
-		log.Printf("房间认领保存失败（重启后认领会丢失）: %v", err)
+		log.Printf("房间认领保存失败: %v", err)
+		if hadPrev {
+			h.cfg.Devices[deviceID] = prevDev
+		} else {
+			delete(h.cfg.Devices, deviceID)
+		}
+		if prevRoom != "" {
+			h.reg.SetRoom(deviceID, prevRoom)
+		} else {
+			h.reg.ClearRoom(deviceID)
+		}
+		if c, ok := h.server.Conn(deviceID); ok {
+			_ = c.SendJSON(map[string]string{"type": "room_reject", "reason": "保存失败，请重试"})
+		}
+		return
 	}
 	if c, ok := h.server.Conn(deviceID); ok {
 		_ = c.SendJSON(map[string]string{"type": "room_ok", "room": room})
@@ -675,6 +685,16 @@ func main() {
 	// 仍用短 Token "secret"，放进去会破坏它们。
 	if err := transport.ValidateToken(token); err != nil {
 		log.Fatalf("OPEN_XIAOAI_TOKEN 无效: %v", err)
+	}
+	// H3：Web Token 与 Client Token 同款校验（空/<16 位/弱值即 Fatal），
+	// 且两者必须不同（相同即 Web 泄露等于 4399 泄露）。只放在生产启动处，
+	// 不放进 transport.New/Serve（测试用短 Token 不受影响）。
+	webToken := os.Getenv("OPEN_XIAOAI_WEB_TOKEN")
+	if err := transport.ValidateTokenNamed(webToken, "OPEN_XIAOAI_WEB_TOKEN"); err != nil {
+		log.Fatalf("OPEN_XIAOAI_WEB_TOKEN 无效: %v", err)
+	}
+	if webToken == token {
+		log.Fatalf("OPEN_XIAOAI_WEB_TOKEN 与 OPEN_XIAOAI_TOKEN 相同（两个 Token 必须不同，否则 Web 泄露即等于 4399 泄露）")
 	}
 	// P2-4：数据目录 0700（旧代码 0755，同 NAS 多用户可列目录）；
 	// 已有的数据文件（提醒/记忆含用户语音原文）在启动时收紧到 0600。
@@ -965,9 +985,17 @@ func main() {
 	// OTA/对讲扫荡）收到 done 后退出，不再靠 time.Tick
 	// 泄漏到进程结束。
 	done := make(chan struct{})
+	// P1-9（2026-11-23 审查）：后台 goroutine 的退出等待——close(done)
+	// 后主流程先 bgWG.Wait() 再关客户端；否则看门狗正写 haClient /
+	// mpdClient / snapClient 时主流程直接读并 Close() 是数据竞争。
+	// 覆盖全部四个听 done 的 goroutine（看门狗、媒体上报、会话清扫、
+	// OTA/对讲扫荡）；KWS 事件循环不听 done（随 kwsClient.Close() 结束），不在此列。
+	var bgWG sync.WaitGroup
 
 	var watcher *alerts.Watcher
+	bgWG.Add(1)
 	go func() {
+		defer bgWG.Done()
 		// P2-53：time.Tick 改 NewTicker + done 退出。
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -1044,7 +1072,9 @@ func main() {
 	// 本轮（只记 debug 级日志，不刷屏）；上报失败只记日志，
 	// 下一轮重试，绝不影响 Hub 主流程。退出时随 done 通道停。
 	if mediaReporter != nil {
+		bgWG.Add(1)
 		go func() {
+			defer bgWG.Done()
 			syncMediaPlayers := func() {
 				st, cur, err := rt.PlaybackStatus(context.Background())
 				if err != nil {
@@ -1090,7 +1120,11 @@ func main() {
 	// 可观测性：语音管线记 KWS/STT/TTS 分段耗时（见 voice.Pipeline.Latency）。
 	h.pipeline.Latency = latencyRec
 	// 提醒到点：KindAction 是定时动作（走 Route 执行命令），其余是播报。
-	remStore.SetOnFire(func(r reminders.Reminder) {
+	// P1-12：onFire 返回 error——KindAction 执行失败（Route 报错/
+	// 无在线设备）时 Store 保留提醒并 1 分钟后重试一次，不再静默丢失；
+	// 播报类无在线设备时同样返回 error；TTS 内部失败仍是 best-effort
+	// （speakText 内记日志），Store 层不据此重试。
+	remStore.SetOnFire(func(r reminders.Reminder) error {
 		if r.Kind == reminders.KindAction {
 			// P1-41：定时动作——把 Text 当命令走一遍 Route 执行，
 			// 回复播报到对应房间的全部设备（P2-27：旧代码只取
@@ -1108,20 +1142,18 @@ func main() {
 				}
 			}
 			if len(targets) == 0 {
-				log.Printf("定时动作无在线设备，跳过：%s", r.Text)
-				return
+				return fmt.Errorf("定时动作无在线设备，跳过：%s", r.Text)
 			}
 			reply, err := rt.Route(context.Background(), targets[0], r.Text)
 			if err != nil {
-				log.Printf("定时动作执行失败（%s）: %v", r.Text, err)
-				return
+				return fmt.Errorf("定时动作执行失败（%s）: %w", r.Text, err)
 			}
 			if reply != "" && h.speakText != nil {
 				for _, devID := range targets {
 					h.speakText(devID, reply)
 				}
 			}
-			return
+			return nil
 		}
 		text := "提醒你" + r.Text
 		if r.Room != "" {
@@ -1130,14 +1162,18 @@ func main() {
 				for _, d := range devs {
 					h.speakText(d.ID, text)
 				}
-				return
+				return nil
 			}
+		}
+		if len(reg.Online()) == 0 {
+			return fmt.Errorf("播报提醒无在线设备：%s", r.Text)
 		}
 		for _, d := range reg.Online() {
 			if h.speakText != nil {
 				h.speakText(d.ID, text)
 			}
 		}
+		return nil
 	})
 	remStore.Start()
 	// speakText：经 Pipeline 的 TTS 合成后发给设备（提醒/主动播报共用）。
@@ -1193,18 +1229,35 @@ func main() {
 		h.playFrames(deviceID, frames)
 	}
 
+	// P0-3：异步回答失败时播一句区分性回复。以前 settle 的后台 goroutine
+	// 里 answer 出错只记日志，用户说完话后毫无声音；现在经 onError 按
+	// 错误类型播报（LLM/HA/提醒/STT/TTS/繁忙/超时，见 voice.ErrorReply）。
+	// speakText 晚绑定，回调里调用时再读字段；取消（新唤醒打断）与空回复
+	// 不经过 onError，不会误播。
+	h.pipeline.SetOnError(func(deviceID string, err error) {
+		if h.speakText != nil {
+			h.speakText(deviceID, voice.ErrorReply(err))
+		}
+	})
+
 	// 仲裁：窗口关闭后走 h.onArbitrationResult——赢家开会话 + 发
 	// wake_win，输家发 wake_lose（P1-13：赢家已断线时按 RMS 降序试
 	// losers 补位；都掉线则本轮无人回；无会话的输家回 Idle）。
 	// 跟随播放钩子在 onArbitrationResult 末尾（赢家确定后调
 	// h.router.FollowMeOnWake，见该方法）。
 	h.arbiter = arbitration.New(arbitration.Window, h.onArbitrationResult)
-	go h.sweepSessions(done)
+	bgWG.Add(1)
+	go func() {
+		defer bgWG.Done()
+		h.sweepSessions(done)
+	}()
 
 	// P1-9/P1-15：每 10s 扫一次——OTA 超时任务标失败（pushing 超 10 分钟
 	// 或 verifying 超 30s）、对讲超时会话挂断。
 	// P2-53：time.Tick 改 NewTicker + done 退出。
+	bgWG.Add(1)
 	go func() {
+		defer bgWG.Done()
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -1343,8 +1396,11 @@ func main() {
 	webSrv := webServer.NewHTTPServer()
 	go func() {
 		log.Printf("Web 面板：http://%s", webSrv.Addr)
+		// P1-3（2026-11-23 审查）：面板监听失败即拒绝启动（Fatal），
+		// 不要只记一行日志继续跑——面板起不来时部署检查应立刻发现，
+		// 而不是等用户发现面板打不开。Shutdown 引起的 ErrServerClosed 除外。
 		if err := webSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("Web 面板退出: %v", err)
+			log.Fatalf("Web 面板启动失败: %v", err)
 		}
 	}()
 
@@ -1379,6 +1435,8 @@ func main() {
 	// 先停后台 goroutine（看门狗/清扫/扫荡），再停各客户端；
 	// 提醒存储最后 Stop（落盘正在进行的提醒）。
 	close(done)
+	// P1-9：等后台 goroutine 全部退出再关客户端（见 bgWG 声明处注释）。
+	bgWG.Wait()
 	if remStore != nil {
 		remStore.Stop()
 	}

@@ -178,14 +178,21 @@ var weakTokens = map[string]bool{
 // 注意：New() 刻意不调它——单元测试与本地联调用短 Token，生产启动
 // 必须经 ValidateToken 把关。
 func ValidateToken(token string) error {
+	return ValidateTokenNamed(token, "OPEN_XIAOAI_TOKEN")
+}
+
+// ValidateTokenNamed 与 ValidateToken 同规则，只把错误里的名字换成
+// 调用方给的变量名（H3：Web Token 校验复用同一规则，但报错要指名
+// OPEN_XIAOAI_WEB_TOKEN，不能写成 OPEN_XIAOAI_TOKEN）。
+func ValidateTokenNamed(token, name string) error {
 	if token == "" {
-		return fmt.Errorf("OPEN_XIAOAI_TOKEN 为空（Client 鉴权必须）；生成一个：openssl rand -hex 16")
+		return fmt.Errorf("%s 为空（鉴权必须）；生成一个：openssl rand -hex 16", name)
 	}
 	if len(token) < 16 {
-		return fmt.Errorf("OPEN_XIAOAI_TOKEN 太短（%d 位，至少 16 位）；生成一个：openssl rand -hex 16", len(token))
+		return fmt.Errorf("%s 太短（%d 位，至少 16 位）；生成一个：openssl rand -hex 16", name, len(token))
 	}
 	if weakTokens[strings.ToLower(strings.TrimSpace(token))] {
-		return fmt.Errorf("OPEN_XIAOAI_TOKEN 是公开/常见弱值；生成一个：openssl rand -hex 16")
+		return fmt.Errorf("%s 是公开/常见弱值；生成一个：openssl rand -hex 16", name)
 	}
 	return nil
 }

@@ -76,15 +76,25 @@ services:
       # 原来挂 /app/data 没人用，容器重建后提醒/记忆/TLS 证书全丢。
       - hub-data:/app/hub-data
     depends_on:
-      - whisper
-      - piper
-      - kws-sidecar
+      # P1-4（2026-11-23 审查）：长语法 + condition: service_healthy——
+      # Hub 只有在 whisper/piper/kws-sidecar 都健康后才启动，不再只等容器
+      # 起来就冲（whisper 模型加载要分钟级，起来≠能用）。
+      whisper:
+        condition: service_healthy
+      piper:
+        condition: service_healthy
+      kws-sidecar:
+        condition: service_healthy
 
   # STT：FunASR Paraformer-large（2026-11-21 换模型，见 deploy/Dockerfile.whisper）：
   # NAS i5-1235U 上短命令 0.389s、CER 7.86%（Whisper small-int8 是 2.82s、16.69%，
   # 实测见 bench-20261119/funasr-bench-20261120.md）。本地构建：底座
   # rhasspy/wyoming-whisper + 一层 funasr；模型首次启动从 HF 下载约 850MB
-  # 到 whisper-data 卷，是分钟级，/health 在模型就绪后才 200。
+  # 到 whisper-data 卷，是分钟级。
+  # P1-4（2026-11-23 审查 + NAS 实测）：Wyoming 协议无 HTTP /health；
+  # 服务端只在模型加载完、打 Ready 日志后才绑 10300 端口（NAS 实测镜像
+  # 源码 __main__.py:317 先 load_transcriber()，:336-337 打 Ready 后才
+  # server.run()），所以 TCP 探活即就绪探活——旧注释“5 秒内端口已通”是错的。
   # P1-4：Wyoming 协议无鉴权，只绑 127.0.0.1——Hub 走 host 网络，本机回环可达，
   # 局域网其他机器连不上。
   whisper:
@@ -107,6 +117,15 @@ services:
           memory: 6G
     volumes:
       - whisper-data:/data
+    # P1-4：TCP 探活（/usr/bin/python3 是镜像里实测的 python 路径，见
+    # 2026-11-23 NAS 验证；whisper/piper 镜像里无 nc/wget/curl）。
+    # start_period 600s：首次启动要下载约 850MB 模型，是分钟级。
+    healthcheck:
+      test: ["CMD", "/usr/bin/python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 10300), timeout=5).close()"]
+      interval: 30s
+      timeout: 10s
+      start_period: 600s
+      retries: 3
 
   # TTS：Piper，中文音色；流式合成
   # P1-4：同 whisper，只绑 127.0.0.1。
@@ -128,6 +147,14 @@ services:
           memory: 1G
     volumes:
       - piper-data:/data
+    # P1-4：TCP 探活（与 whisper 同款；piper 镜像里同样只有 /usr/bin/python3，
+    # 无 nc/wget/curl）。start_period 180s：音色模型小，加载是秒~分钟级。
+    healthcheck:
+      test: ["CMD", "/usr/bin/python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 10200), timeout=5).close()"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
 
   # KWS 边车：服务端唤醒检测（sherpa-onnx WenetSpeech，“你好小李”）。
   # 音箱只采音，Hub 解码 Opus 后把 16kHz PCM 发到 ws://127.0.0.1:10400/v1/kws。
@@ -256,6 +283,14 @@ services:
         limits:
           cpus: "0.5"
           memory: 512M
+    # P1-4：HTTP 探活（netease 镜像里有 /usr/bin/wget、node，无 curl；
+    # 2026-11-23 NAS 实测：/ 返回 200，wget 探活形式 exit 0）。
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
 
 volumes:
   hub-data:

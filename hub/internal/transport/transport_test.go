@@ -222,6 +222,25 @@ func TestValidateToken(t *testing.T) {
 	}
 }
 
+// H3：ValidateTokenNamed 与 ValidateToken 同规则，但报错指名调用方给的变量名。
+func TestValidateTokenNamed(t *testing.T) {
+	if err := ValidateTokenNamed("0123456789abcdef0123456789abcdef", "OPEN_XIAOAI_WEB_TOKEN"); err != nil {
+		t.Fatalf("强 Token 应通过：%v", err)
+	}
+	for _, w := range []string{"", "short", "secret"} {
+		err := ValidateTokenNamed(w, "OPEN_XIAOAI_WEB_TOKEN")
+		if err == nil {
+			t.Fatalf("弱 Token %q 应被拒绝", w)
+		}
+		if !strings.Contains(err.Error(), "OPEN_XIAOAI_WEB_TOKEN") {
+			t.Fatalf("错误应指名 OPEN_XIAOAI_WEB_TOKEN，实际：%v", err)
+		}
+		if strings.Contains(err.Error(), "OPEN_XIAOAI_TOKEN 为空") || strings.Contains(err.Error(), "OPEN_XIAOAI_TOKEN 太短") || strings.Contains(err.Error(), "OPEN_XIAOAI_TOKEN 是公开") {
+			t.Fatalf("错误不应写成 OPEN_XIAOAI_TOKEN，实际：%v", err)
+		}
+	}
+}
+
 func TestTokenEqual(t *testing.T) {
 	if !tokenEqual("abc", "abc") {
 		t.Fatal("相同 Token 应相等")

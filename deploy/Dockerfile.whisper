@@ -5,8 +5,11 @@
 # 2.67s 未过 1.5s 验收线，见 qwen3-asr-bench-20261120.md）。
 # 模型不 bake 进镜像：首次启动由 wyoming-whisper 从 HuggingFace
 # 下载 funasr/paraformer-zh（约 850MB）到 /data，持久化在
-# compose 的 whisper-data 卷；首次启动是分钟级，/health 在模型
-# 就绪后才 200，不要按秒级健康检查判死。
+# compose 的 whisper-data 卷；首次启动是分钟级。Wyoming 协议无
+# HTTP /health；服务端只在模型加载完、打 Ready 日志后才绑 10300
+# 端口（NAS 实测镜像源码 __main__.py:317/336-337），TCP 探活即就绪
+# 探活——compose 里 whisper 的 healthcheck 就是 TCP 探活，不要按
+# 秒级健康检查判死。
 #
 # 版本钉死（P1-4 同款做法）：
 #   - 底座 rhasspy/wyoming-whisper:latest@sha256:3cc01f646c8b149fe47b2a5e8bfaf31866e1bc18faffadb26c9b8be58cbe5703

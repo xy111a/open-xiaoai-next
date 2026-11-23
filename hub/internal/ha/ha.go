@@ -365,20 +365,36 @@ const (
 
 // ReadState 读一个实体的当前 state（2s 超时；实体不存在时返回错误）。
 func (c *Client) ReadState(entityID string) (string, error) {
-	raw, err := c.callWithTimeout("get_states", nil, ReadbackTimeout)
+	st, err := c.readEntityTimeout(entityID, ReadbackTimeout)
 	if err != nil {
 		return "", err
 	}
+	return st.State, nil
+}
+
+// ReadEntity 读一个实体的完整状态（含 attributes，P1-15 查 climate
+// 温度用），2s 超时；实体不存在时返回错误。
+func (c *Client) ReadEntity(entityID string) (State, error) {
+	return c.readEntityTimeout(entityID, ReadbackTimeout)
+}
+
+// readEntityTimeout 读一个实体的完整状态（ReadState/ReadEntity 共用）：
+// get_states 全量再过滤（见包头注释：WS 客户端没有 REST 单实体接口）。
+func (c *Client) readEntityTimeout(entityID string, timeout time.Duration) (State, error) {
+	raw, err := c.callWithTimeout("get_states", nil, timeout)
+	if err != nil {
+		return State{}, err
+	}
 	var states []State
 	if err := json.Unmarshal(raw, &states); err != nil {
-		return "", err
+		return State{}, err
 	}
 	for _, s := range states {
 		if s.EntityID == entityID {
-			return s.State, nil
+			return s, nil
 		}
 	}
-	return "", fmt.Errorf("ha: 实体 %s 不存在", entityID)
+	return State{}, fmt.Errorf("ha: 实体 %s 不存在", entityID)
 }
 
 // VerifyState 读回验证：最多读 ReadbackAttempts 次、间隔 ReadbackInterval，
@@ -394,12 +410,30 @@ func (c *Client) VerifyState(entityID, want string) ReadbackOutcome {
 // 而不是 "on"，cover 开着时是 "open"/"opening"。调用方按 domain 给判定，
 // 重试/超时语义与 VerifyState 完全相同。
 func (c *Client) VerifyStatePred(entityID string, want func(state string) bool) ReadbackOutcome {
+	return c.verifyStatePredDeadline(entityID, want, time.Time{})
+}
+
+// verifyStatePredDeadline 是 VerifyStatePred 的带截止时间版：
+// deadline 为零值时不限时（与 VerifyStatePred 完全相同）；否则每次读取
+// 的超时取 min(ReadbackTimeout, 剩余时间），预算耗尽时返回 Unknown
+// （没读完，没法确认——不是 Mismatch：Mismatch 只在 3 次都读到且都不符时返回）。
+func (c *Client) verifyStatePredDeadline(entityID string, want func(state string) bool, deadline time.Time) ReadbackOutcome {
 	for i := 0; i < ReadbackAttempts; i++ {
-		state, err := c.ReadState(entityID)
+		timeout := ReadbackTimeout
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return ReadbackUnknown
+			}
+			if remaining < timeout {
+				timeout = remaining
+			}
+		}
+		state, err := c.readEntityTimeout(entityID, timeout)
 		if err != nil {
 			return ReadbackUnknown
 		}
-		if want(state) {
+		if want(state.State) {
 			return ReadbackConfirmed
 		}
 		if i < ReadbackAttempts-1 {
@@ -446,4 +480,32 @@ func (c *Client) CallServiceWithReadbackPred(domain, service, entityID string, w
 		return ReadbackUnknown, err
 	}
 	return c.VerifyStatePred(entityID, want), nil
+}
+
+// callServiceTimeout 调一个服务（超时可配；CallService 是 10s 默认版）。
+func (c *Client) callServiceTimeout(domain, service, entityID string, timeout time.Duration) error {
+	_, err := c.callWithTimeout("call_service", map[string]any{
+		"domain":  domain,
+		"service": service,
+		"target":  map[string]any{"entity_id": entityID},
+	}, timeout)
+	return err
+}
+
+// CallServiceWithReadbackPredBudget 是 CallServiceWithReadbackPred 的
+// 总预算版（P1-7，2026-11-23 审查）：调服务 + 读回验证全程不超过 budget。
+// 预算对半分：调服务最多占一半，读回验证占剩下的一半（截止时间控制）。
+// 预算耗尽时读回返回 Unknown（调了服务但没读完，没法确认），调用方按
+// Unknown 回复，不谎报成功也不谎报失败。VerifyStatePred 首次读错即回
+// Unknown 的语义保持不动（见 verifyStatePredDeadline）。budget 应为正数。
+func (c *Client) CallServiceWithReadbackPredBudget(domain, service, entityID string, want func(state string) bool, budget time.Duration) (ReadbackOutcome, error) {
+	deadline := time.Now().Add(budget)
+	serviceTimeout := budget / 2
+	if serviceTimeout < time.Second {
+		serviceTimeout = time.Second
+	}
+	if err := c.callServiceTimeout(domain, service, entityID, serviceTimeout); err != nil {
+		return ReadbackUnknown, err
+	}
+	return c.verifyStatePredDeadline(entityID, want, deadline), nil
 }

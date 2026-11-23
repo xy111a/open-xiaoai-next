@@ -119,10 +119,11 @@ func certNeedsRenew(cert *x509.Certificate, now time.Time) bool {
 
 // backupDamaged 把损坏/过期证书与私钥改名备份（不直接删，
 // 指纹变了要能找回旧证书比对），返回备份路径。
-func backupDamaged(certPath, keyPath string) {
+func backupDamaged(certPath, keyPath string) string {
 	stamp := time.Now().Format("20060102-150405")
 	_ = os.Rename(certPath, certPath+".bak."+stamp)
 	_ = os.Rename(keyPath, keyPath+".bak."+stamp)
+	return certPath + ".bak." + stamp
 }
 
 // LoadOrCreate 读现有证书，不存在则生成一对新的（2 年有效期，P2-1）。
@@ -243,19 +244,26 @@ func caPaths(dataDir string) CAPaths {
 }
 
 // LoadOrCreateCA 读现有 CA，不存在则生成一个新的自签 CA（10 年有效期）。
+// H2：任一 CA 文件已存在但成对解析失败 = 损坏，先备份再明确报错拒绝启动，
+// 不再静默重建（重建会废掉全部客户端证书与指纹 pin，事后无从找回旧 CA 比对）。
+// H1：两文件都不存在时才是首次启动，生成全新 CA 并记一条醒目 warn 日志
+// （含新指纹与有效期）；部署应以 gen-certs.sh 预生成并先拷入 hub-data/tls，
+// 单一 CA 来源由部署清单保证（见 release/flash-kit/CHECKLIST.md）。
 func LoadOrCreateCA(dataDir string) (*CA, error) {
 	p := caPaths(dataDir)
 	if err := os.MkdirAll(filepath.Dir(p.Cert), 0700); err != nil {
 		return nil, err
 	}
-	if certPEM, err := os.ReadFile(p.Cert); err == nil {
-		if keyPEM, err := os.ReadFile(p.Key); err == nil {
-			ca, err := parseCA(certPEM, keyPEM)
-			if err == nil {
-				return ca, nil
-			}
-			// 现有 CA 文件损坏：继续往下重新生成。
+	certPEM, certErr := os.ReadFile(p.Cert)
+	keyPEM, keyErr := os.ReadFile(p.Key)
+	if certErr == nil || keyErr == nil {
+		ca, err := parseCA(certPEM, keyPEM)
+		if err == nil {
+			return ca, nil
 		}
+		bak := backupDamaged(p.Cert, p.Key)
+		log.Printf("tlscert: CA 文件损坏（%v），已备份到 %s；拒绝自动重建", err, bak)
+		return nil, fmt.Errorf("CA 文件损坏（%v），已备份到 %s；请恢复备份或按部署清单重建 CA（不要直接删卷重建，旧 CA 签发的客户端证书会失效）", err, bak)
 	}
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -279,8 +287,8 @@ func LoadOrCreateCA(dataDir string) (*CA, error) {
 	if err != nil {
 		return nil, err
 	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
 	// P2-4：CA 证书也 0600（旧代码 0644）。
 	if err := os.WriteFile(p.Cert, certPEM, 0600); err != nil {
 		return nil, err
@@ -288,7 +296,15 @@ func LoadOrCreateCA(dataDir string) (*CA, error) {
 	if err := os.WriteFile(p.Key, keyPEM, 0600); err != nil {
 		return nil, err
 	}
-	return parseCA(certPEM, keyPEM)
+	ca, err := parseCA(certPEM, keyPEM)
+	if err != nil {
+		return nil, err
+	}
+	// H1：全新 CA 生成是全断事件（旧 CA 签发的所有客户端证书失效，
+	// client.toml 的 hub_ca_fingerprint 必须同步），记醒目 warn 日志。
+	fp, _ := Fingerprint(certPEM)
+	log.Printf("警告：tlscert: hub-data/tls 下无可用 CA，已生成全新 CA（指纹：%s，有效期至 %s）；旧 CA 签发的客户端证书已失效，需重发客户端证书并同步 client.toml 的 hub_ca_fingerprint", fp, ca.Cert.NotAfter.Format("2006-01-02"))
+	return ca, nil
 }
 
 // parseCA 解析 CA 证书 + 私钥，并校验两者匹配、证书确为 CA。
@@ -459,5 +475,9 @@ func LoadOrCreateMTLS(dataDir string) (tls.Certificate, *x509.CertPool, string, 
 	if _, _, err := ca.IssueClientCert(dataDir, "open-xiaoai-client"); err != nil {
 		return tls.Certificate{}, nil, "", err
 	}
+	// H1：启动日志输出 CA 指纹与有效期（部署清单门禁：与 client.toml、
+	// flash-kit 的 hub_ca_fingerprint 三方比对）。
+	caFP, _ := Fingerprint(ca.CertPEM)
+	log.Printf("tlscert: CA 指纹：%s，有效期至 %s", caFP, ca.Cert.NotAfter.Format("2006-01-02"))
 	return serverCert, ca.Pool(), fp, nil
 }

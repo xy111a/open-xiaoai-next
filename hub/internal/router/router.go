@@ -39,6 +39,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/huajun/open-xiaoai-next/hub/internal/agent"
 	"github.com/huajun/open-xiaoai-next/hub/internal/ha"
@@ -511,8 +512,9 @@ var retreatRe = regexp.MustCompile(`^(?:停|停止|停下|别说了|别播了|�
 // 边车脚本 + 入口 + Hub 过滤 + 部署验证，且“停止”是常用词、
 // 误触发风险未测——列为后续项，见 DECISIONS.md。
 // 时效：三步全是本机操作（MPD 暂停 + 一次 interrupt 发送），
-// 正常在 300ms 内完成；上一句回答仍在合成/发送中时，新结算会被
-// 语音管线丢弃（voice.settle 的 inFlight 保护），那时靠唤醒词打断。
+// 正常在 300ms 内完成；上一句回答仍在合成中时，新结算先由语音管线
+// 判撤退词（voice.settle 的 P1-14：命中即 Cancel 在途回答并重新结算），
+// 不再直接丢弃。
 func (r *Router) retreat(ctx context.Context, deviceID, text string) (string, bool) {
 	if !retreatRe.MatchString(text) {
 		return "", false
@@ -534,6 +536,9 @@ var (
 	broadcastRe    = regexp.MustCompile(`^(?:全屋广播|广播一下|广播)\s*(.*)$`)
 	roomClaimRe    = regexp.MustCompile(`^我(?:现在)?在(.+?)\s*$`)
 	roomHereRe     = regexp.MustCompile(`^我在这里\s*$`)
+	// roomClaimConfirmRe 是确认式认领（P1-13）：“确认，我在书房”——
+	// 用户按提示确认新房间后直接写入（见 roomClaim）。
+	roomClaimConfirmRe = regexp.MustCompile(`^确认，我在(.+?)\s*$`)
 )
 
 // intercomCall 处理语音对讲触发（P1-15）：
@@ -585,6 +590,10 @@ func (r *Router) intercomCall(_ context.Context, deviceID, text string) (string,
 // “我在客厅” → RoomClaim(deviceID, "客厅")；
 // “我在这里” → 已知房间时确认，未知时请用户说房间。
 // RoomClaim 未配时不生效，命令落到 Agent。
+// P1-13（2026-11-23 审查）：旧正则 `^我(?:现在)?在(.+?)$` 什么都认，
+// “我在客厅吃饭”“我在看电视”都会把“客厅吃饭”“看电视”写进注册表。
+// 现在只接受已知房间（KnownRooms）或 2~4 字的房间名；未知房间名不直接
+// 写入，改为向用户确认（用户按提示说“确认，我在X”即写入）。
 func (r *Router) roomClaim(_ context.Context, deviceID, text string) (string, bool) {
 	if roomHereRe.MatchString(text) {
 		room := ""
@@ -596,11 +605,24 @@ func (r *Router) roomClaim(_ context.Context, deviceID, text string) (string, bo
 		}
 		return "你在哪间房？说“我在客厅”我就记住了。", true
 	}
+	// 确认式认领：用户按提示说“确认，我在X”时直接写入（已向用户确认过
+	// 是新房间）；未知的新房间名同样只接受 2~4 字。
+	if m := roomClaimConfirmRe.FindStringSubmatch(text); m != nil {
+		room := normalizeRoomName(m[1])
+		if room == "" || !validNewRoomName(room) {
+			return "", false
+		}
+		if err := registry.ValidateRoomName(room); err != nil {
+			return "这个房间名记不下来，换个短一点的名字，比如“客厅”。", true
+		}
+		if r.deps.RoomClaim == nil {
+			return "", false
+		}
+		r.deps.RoomClaim(deviceID, room)
+		return "好的，记住了，你在" + room + "。", true
+	}
 	if m := roomClaimRe.FindStringSubmatch(text); m != nil {
-		room := strings.TrimSpace(m[1])
-		room = strings.TrimSuffix(room, "房间")
-		room = strings.TrimSuffix(room, "里")
-		room = strings.TrimSpace(room)
+		room := normalizeRoomName(m[1])
 		if room == "" {
 			return "", false
 		}
@@ -612,10 +634,60 @@ func (r *Router) roomClaim(_ context.Context, deviceID, text string) (string, bo
 		if r.deps.RoomClaim == nil {
 			return "", false
 		}
+		known := r.knownRooms()
+		if len(known) > 0 {
+			if containsRoom(known, room) {
+				r.deps.RoomClaim(deviceID, room)
+				return "好的，你在" + room + "了。", true
+			}
+			// 以已知房间开头又带多余内容（“我在客厅吃饭”）不是认领，
+			// 落到 Agent/其它分支，不要错写注册表。
+			for _, k := range known {
+				if k != "" && strings.HasPrefix(room, k) {
+					return "", false
+				}
+			}
+			// 未知房间名：不直接写入，改为向用户确认。用户按提示说
+			// “确认，我在X”即写入（见上）；2~4 字以外也不问，直接落到其它分支。
+			if !validNewRoomName(room) {
+				return "", false
+			}
+			return "我还没记过“" + room + "”这个房间，是新房间吗？是的话再说一次“确认，我在" + room + "”。", true
+		}
+		// 没配 KnownRooms（未接注册表）时退回旧规则：2~4 字名直接认领。
+		if !validNewRoomName(room) {
+			return "", false
+		}
 		r.deps.RoomClaim(deviceID, room)
 		return "好的，你在" + room + "了。", true
 	}
 	return "", false
+}
+
+// normalizeRoomName 去房间名首尾空白与“房间/里”后缀（认领两路共用）。
+func normalizeRoomName(s string) string {
+	room := strings.TrimSpace(s)
+	room = strings.TrimSuffix(room, "房间")
+	room = strings.TrimSuffix(room, "里")
+	return strings.TrimSpace(room)
+}
+
+// validNewRoomName 报告一个未知房间名是否可接受：2~4 字。
+// 已知房间（在 KnownRooms 里）不受此限——注册表里的长名（如“主卧卫生间”）
+// 仍可认领；这条只卡未知的新名字，防“客厅吃饭”“看电视”这类动词短语写进去。
+func validNewRoomName(room string) bool {
+	n := utf8.RuneCountInString(room)
+	return n >= 2 && n <= 4
+}
+
+// containsRoom 报告 rooms 里是否含 room（精确匹配）。
+func containsRoom(rooms []string, room string) bool {
+	for _, k := range rooms {
+		if k == room {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- 3. 提醒（FR-14）----
@@ -730,10 +802,17 @@ func (r *Router) timedAction(deviceID, room, text string) (string, bool, error) 
 		return "时间得大于 0，比如“2 小时后关灯”。", true, nil
 	}
 	// 目标没带房间名时补当前房间（“关灯”→“关客厅灯”），让 homeAssistant
-	// 能命中别名表；已带房间名或无房间时原样。
+	// 能命中别名表；目标已含任意已知房间时原样（P1-12：旧代码只比当前
+	// 房间，“2 小时后关卧室灯”在客厅说会拼成“关客厅卧室灯”，别名表
+	// 查不到，触发时静默无事）。
 	cmd := action + target
-	if room != "" && !strings.Contains(target, room) {
+	if room != "" && !strings.Contains(target, room) && !r.targetHasKnownRoom(target) {
 		cmd = action + room + target
+	}
+	// P1-12：建提醒前校验拼好的命令能在别名表命中——拼不出的别名
+	// （如“关客厅卧室灯”）当场拒绝并明说，不等触发时静默失败。
+	if _, ok := r.resolveHomeAlias(cmd); !ok {
+		return "没找到“" + strings.TrimPrefix(cmd, action) + "”这个设备，定时动作没记上；换个设备名再说一次。", true, nil
 	}
 	next := time.Now().Add(time.Duration(amount) * unit)
 	if _, err := r.deps.Reminders.Add(reminders.Reminder{
@@ -746,6 +825,34 @@ func (r *Router) timedAction(deviceID, room, text string) (string, bool, error) 
 		unitName = "分钟"
 	}
 	return fmt.Sprintf("记下了，%d %s后帮你%s。", amount, unitName, cmd), true, nil
+}
+
+// targetHasKnownRoom 报告目标里是否含任意已知房间（KnownRooms）。
+func (r *Router) targetHasKnownRoom(target string) bool {
+	for _, room := range r.knownRooms() {
+		if room != "" && strings.Contains(target, room) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveHomeAlias 把“开/关 + 别名”命令解析成 HA 实体（与 homeAssistant
+// 的前缀匹配同一套顺序）：命中返回 entityID，否则 ("", false)。
+// 定时动作建提醒前用它校验拼好的命令；别名表里没有的命令不等触发时再失败。
+func (r *Router) resolveHomeAlias(cmd string) (string, bool) {
+	var alias string
+	for _, prefix := range []string{"打开", "关掉", "开启", "关闭", "开", "关"} {
+		if strings.HasPrefix(cmd, prefix) {
+			alias = strings.TrimSpace(strings.TrimPrefix(cmd, prefix))
+			break
+		}
+	}
+	if alias == "" {
+		return "", false
+	}
+	entityID, ok := r.entities[alias]
+	return entityID, ok
 }
 
 // ---- 4. 场景/记忆（FR-09）----
@@ -854,6 +961,15 @@ func (r *Router) musicBudget() time.Duration {
 	return defaultMusicBudget
 }
 
+// totalMusicBudget 取整条点歌的总预算（P1-11，2026-11-23 审查）：
+// 主路预算 + 4s 兜底（默认 8s + 4s = 12s）。主路 Search 用 musicCtx，
+// 本地兜底各步用 totalCtx——每步开始前都先看总预算还剩多少，到了就
+// 不再开新操作。MPD 单条命令最长 5s，预算只能卡在决策点上，
+// 不能掐断已在途的命令；最坏仍可能超一点，但不再是 8s + 25s 的叠加。
+func (r *Router) totalMusicBudget() time.Duration {
+	return r.musicBudget() + 4*time.Second
+}
+
 // musicChain 取点歌用的音源链：Deps.MusicSources 优先（测试注入假音源用）；
 // 否则按 MusicOrder 从当前 Netease/MPD 快照现建——MPD 看门狗热换后
 // 下次点歌自动用新连接，不用重启 Hub。
@@ -894,10 +1010,17 @@ func (r *Router) noteMusicPlayed(deviceID string, start time.Time) {
 // musicSlowFallback 是点歌超时后的本地兜底（H-1）：兜底播出成功时
 // 返回空回复（点歌快路径：歌已在播，不再播报“网易云有点慢，先试本地”）；
 // 本地也没有/没配好时才返回报错回复（会播报，不静默）。
-func (r *Router) musicSlowFallback(ctx context.Context, deviceID, query string, start time.Time) (string, bool, error) {
-	if _, ok := r.playLocalOnly(ctx, query); ok {
-		r.noteMusicPlayed(deviceID, start)
-		return "", true, nil
+// chain 是主路那条音源链：本地音源已在链里失败过时不再重试（P1-11），
+// 否则 SearchFile 两轮又白跑一遍。
+func (r *Router) musicSlowFallback(ctx context.Context, deviceID, query string, start time.Time, chain *music.Chain) (string, bool, error) {
+	// P1-11：本地音源已在主路链里失败过就不再单独重试本地。
+	if chain == nil || !chain.Failed("local") {
+		if _, ok := r.playLocalOnly(ctx, query); ok {
+			r.noteMusicPlayed(deviceID, start)
+			return "", true, nil
+		}
+	} else {
+		log.Printf("music: 点歌 %q 超时，本地音源已在主路链里失败过，不再重试本地", query)
 	}
 	if !r.localMusicAvailable() {
 		return "网易云有点慢，本地曲库还没配好，先换一首试试？", true, nil
@@ -970,8 +1093,14 @@ func (r *Router) music(ctx context.Context, deviceID, text string) (string, bool
 	}
 	// H-1：点歌的主路阶段（Search + SongURL）单独设总预算
 	// （默认 8s），不沿用语音管线 120s 的总超时；预算一到即取消在途
-	// 请求、转本地兜底。本地兜底（playLocalOnly）与 MPD 播放仍用原 ctx。
-	musicCtx, cancel := context.WithTimeout(ctx, r.musicBudget())
+	// 请求、转本地兜底。
+	// P1-11：整条点歌（含本地兜底）另设总预算 totalCtx（默认 12s）——
+	// 兜底各步（本地搜索、MPD 试播）都用它，每步开始前先看预算还剩多少，
+	// 到了就不再开新操作，不再出现“主路 8s + 本地两轮搜索 10s + 试播 15s”
+	// 的叠加。MPD 单条命令最长 5s，预算只能卡在决策点上，不能掐断已在途的命令。
+	totalCtx, totalCancel := context.WithTimeout(ctx, r.totalMusicBudget())
+	defer totalCancel()
+	musicCtx, cancel := context.WithTimeout(totalCtx, r.musicBudget())
 	defer cancel()
 	playables, srcName, err := chain.Search(musicCtx, query, 3)
 	if err != nil {
@@ -979,15 +1108,21 @@ func (r *Router) music(ctx context.Context, deviceID, text string) (string, bool
 		// 不等满 15s 单次超时、更不等串行 3 首的最坏 60–90s。
 		if errors.Is(musicCtx.Err(), context.DeadlineExceeded) {
 			log.Printf("music: 点歌 %q 超时（预算 %s），先试本地兜底", query, r.musicBudget())
-			return r.musicSlowFallback(ctx, deviceID, query, musicStart)
+			return r.musicSlowFallback(totalCtx, deviceID, query, musicStart, chain)
 		}
 		log.Printf("music: 点歌 %q 各音源都失败（%v），走本地兜底", query, err)
 		if !r.localMusicAvailable() {
 			return "这首歌暂时放不了（网易云没有可播地址，本地曲库还没配好），换一首试试？", true, nil
 		}
-		if _, ok := r.playLocalOnly(ctx, query); ok {
-			r.noteMusicPlayed(deviceID, musicStart)
-			return "", true, nil
+		// P1-11：本地音源已在链里失败过就不再单独重试——
+		// chain.Search 已跑过本地（SearchFile 两轮），再调一次只是重复拖时间。
+		if !chain.Failed("local") {
+			if _, ok := r.playLocalOnly(totalCtx, query); ok {
+				r.noteMusicPlayed(deviceID, musicStart)
+				return "", true, nil
+			}
+		} else {
+			log.Printf("music: 点歌 %q 各音源都失败，本地音源已在链里失败过，不再重试本地", query)
 		}
 		if errors.Is(err, music.ErrNoPlayable) {
 			return "这首歌暂时放不了（网易云没有可播地址，本地曲库里也没有），换一首试试？", true, nil
@@ -997,7 +1132,7 @@ func (r *Router) music(ctx context.Context, deviceID, text string) (string, bool
 	if len(playables) == 0 {
 		return "没搜到“" + query + "”，换个歌名试试？", true, nil
 	}
-	if _, ok := r.playPlayables(ctx, playables, srcName); ok {
+	if _, ok := r.playPlayables(totalCtx, playables, srcName); ok {
 		// 快路径：播出成功即返回空回复（超时后本地兜底成功也不再补
 		// “网易云有点慢”播报）。music_ms 记录口径不动：超时后本地
 		// 兜底成功这条路本来就不记 music_ms（原代码提前返回），保持原样。
@@ -1014,7 +1149,7 @@ func (r *Router) music(ctx context.Context, deviceID, text string) (string, bool
 	if mpd == nil {
 		return "音乐服务没接好（播放器未配置）。", true, nil
 	}
-	if _, ok := r.playLocalOnly(ctx, query); ok {
+	if _, ok := r.playLocalOnly(totalCtx, query); ok {
 		r.noteMusicPlayed(deviceID, musicStart)
 		return "", true, nil
 	}
@@ -1028,6 +1163,10 @@ func (r *Router) music(ctx context.Context, deviceID, text string) (string, bool
 // 返回 (回复, 是否播出)：本地曲库没配好、搜不到、播失败都返回 false，
 // 由调用方按 localMusicAvailable() 组织明确回复。
 func (r *Router) playLocalOnly(ctx context.Context, query string) (string, bool) {
+	// P1-11：总预算已到就不开本地搜索（调用方传 totalCtx 时生效）。
+	if err := ctx.Err(); err != nil {
+		return "", false
+	}
 	if !r.localMusicAvailable() {
 		return "", false
 	}
@@ -1050,6 +1189,11 @@ func (r *Router) playPlayables(ctx context.Context, playables []music.Playable, 
 		return "", false
 	}
 	for _, p := range playables {
+		// P1-11：总预算已到就停止试播（调用方传 totalCtx 时生效）。
+		if err := ctx.Err(); err != nil {
+			log.Printf("music: 点歌总预算已到，停止试播")
+			return "", false
+		}
 		var err error
 		switch {
 		case p.File != "":
@@ -1260,6 +1404,12 @@ func truncateLyric(lyric string) string {
 
 // ---- 6. 家电（FR-06）----
 
+// haServiceBudget 是家电命令“调服务 + 读回验证”的总预算（P1-7，
+// 2026-11-23 审查）：预查（ReadState 2s）+ 这里 6s，单条命令最坏约 8s。
+// 旧代码预查 10s + 调服务 10s + 读回 6s，最坏约 26s。5s 的总预算
+// 不够一次 3 轮读回（每轮 2s），6s 是留给读回至少两轮的下限。
+const haServiceBudget = 6 * time.Second
+
 // homeQueryRe 是查询类命令（P1-42）：“灯开着吗”“客厅多少度”只查不调。
 var homeQueryRe = regexp.MustCompile(`^(.+?)(开着吗|关着吗|开着还是关着|多少度|温度是多少|现在多少度)$`)
 
@@ -1297,6 +1447,41 @@ func haControlTarget(domain string, turnOn bool) (service string, isTarget func(
 	}
 }
 
+// climateTemperature 从 climate 实体属性读温度（P1-15）：
+// 优先 current_temperature（当前室温），其次 temperature（目标温度）。
+// 返回（温度文本，是否当前室温）；都没有或不是数字时返回（"", false），
+// 调用方明说“查不到温度”，不要拿 state 拼“度”。
+func climateTemperature(attrs map[string]any) (string, bool) {
+	for i, key := range []string{"current_temperature", "temperature"} {
+		v, ok := attrs[key]
+		if !ok {
+			continue
+		}
+		f, ok := attrFloat(v)
+		if !ok {
+			continue
+		}
+		return strconv.FormatFloat(f, 'f', -1, 64), i == 0
+	}
+	return "", false
+}
+
+// attrFloat 把 HA 属性值转成 float64（JSON 数字解出来是 float64；
+// 测试假数据可能用 int/int64）。字符串等其它类型返回 false。
+func attrFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	}
+	return 0, false
+}
+
 // homeAssistant 处理“开/关 + 别名”命令。先查 HA 状态再调服务，不编数字。
 func (r *Router) homeAssistant(ctx context.Context, deviceID, text string) (string, bool, error) {
 	haClient := r.ha()
@@ -1310,18 +1495,40 @@ func (r *Router) homeAssistant(ctx context.Context, deviceID, text string) (stri
 		if !ok {
 			return "", false, nil
 		}
-		state, err := haClient.GetEntityState(entityID)
+		// P1-15：读完整实体（含 attributes，查温度用；2s 超时）。
+		// 旧代码 GetEntityState 只回 state，查“多少度”时拿 state
+		// 拼“度”——climate 的 state 是运行模式（heat），拼出来是
+		// “卧室空调现在 heat 度”。
+		ent, err := haClient.ReadEntity(entityID)
 		if err != nil {
 			return "查不到" + alias + "的状态，先不操作，请检查 HA 连接。", true, nil
 		}
+		state := ent.State
 		if strings.Contains(m[2], "度") {
-			return alias + "现在 " + state + " 度。", true, nil
+			temp, isCurrent := climateTemperature(ent.Attributes)
+			if temp != "" {
+				if isCurrent {
+					return alias + "现在 " + temp + " 度。", true, nil
+				}
+				return alias + "设的是 " + temp + " 度。", true, nil
+			}
+			return alias + "查不到温度，请检查一下设备。", true, nil
 		}
-		switch state {
-		case "on":
+		// P1-15：开/关判定复用 haControlTarget 的 isTarget——climate
+		// 开着时 state 是运行模式（heat/cool…）不是 "on"，cover 开着
+		// 是 "open"/"opening"；直接吐 state 会说“现在的状态是 heat”。
+		domain := strings.SplitN(entityID, ".", 2)[0]
+		_, isOn := haControlTarget(domain, true)
+		_, isOff := haControlTarget(domain, false)
+		switch {
+		case isOn(state):
 			return alias + "开着呢。", true, nil
-		case "off":
+		case isOff(state):
 			return alias + "关着呢。", true, nil
+		case domain == "cover" && state == "opening":
+			return alias + "正在打开。", true, nil
+		case domain == "cover" && state == "closing":
+			return alias + "正在关闭。", true, nil
 		default:
 			return alias + "现在的状态是" + state + "。", true, nil
 		}
@@ -1369,7 +1576,10 @@ func (r *Router) homeAssistant(ctx context.Context, deviceID, text string) (stri
 	// P1-42：查状态出错时不再跳过比较直接调服务——先不操作，等查得到再说。
 	// 幂等预查与读回验证用同一套 isTarget（见 haControlTarget），否则
 	// 空调已开着（state=heat）也会被放过、重复调服务再报 mismatch。
-	state, err := haClient.GetEntityState(entityID)
+	// P1-7：预查用 2s 短超时的 ReadState（与读回一致）；旧代码
+	// GetEntityState 是 10s——预查 10s + 调服务 10s + 读回 6s，
+	// 单条家电命令最坏约 26s。
+	state, err := haClient.ReadState(entityID)
 	if err != nil {
 		return "查不到" + alias + "的状态，先不操作，请检查 HA 连接。", true, nil
 	}
@@ -1379,7 +1589,10 @@ func (r *Router) homeAssistant(ctx context.Context, deviceID, text string) (stri
 	// 2026-11-23：调服务后读回验证——CallService 成功只表示 HA 接受了
 	// 请求，读回状态与目标一致才算真的动了；不一致/读不到都要如实说，
 	// 不谎报成功（旧代码调服务成功就直接说“开了/关了”）。
-	outcome, err := haClient.CallServiceWithReadbackPred(domain, service, entityID, isTarget)
+	// P1-7：调服务 + 读回验证共用 haServiceBudget 总预算——预查 2s +
+	// 这里 6s，单条家电命令最坏约 8s；预算耗尽按 Unknown 回复
+	// （“发了指令但读不回状态”），不让用户等 26s。
+	outcome, err := haClient.CallServiceWithReadbackPredBudget(domain, service, entityID, isTarget, haServiceBudget)
 	if err != nil {
 		return "", true, err
 	}

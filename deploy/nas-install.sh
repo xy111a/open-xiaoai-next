@@ -146,6 +146,9 @@ else
   bad "缺 deploy/.env（先 cp deploy/.env.example deploy/.env 再填）"
 fi
 [ "$FAIL" -gt 0 ] && { echo "本机预检查有 FAIL，先修好再继续。"; exit 1; }
+# M5：deploy/.env 含 4 个 Token，默认 umask 下是 0644（同机其他用户可读），
+# 预检查通过后收紧到 0600；NAS 上那份在传文件后同样收紧（见 §2）。
+chmod 600 deploy/.env && ok "deploy/.env 权限已收紧到 600" || echo "WARN: chmod 600 deploy/.env 失败（请手动收紧）"
 
 # ---------- 1. NAS 连通与环境检查 ----------
 info "1. NAS 连通与环境检查"
@@ -180,6 +183,8 @@ $SSH "mkdir -p $NAS_DIR/deploy $NAS_DIR/hub" \
 $SCP deploy/docker-compose.yml deploy/Dockerfile.hub deploy/hub-linux-amd64 \
       deploy/snapserver.conf deploy/mpd.conf deploy/.env "$NAS_SSH:$NAS_DIR/deploy/" \
   && ok "部署文件已传到 $NAS_DIR/deploy/" || { bad "scp 传部署文件失败"; exit 1; }
+# M5：NAS 上那份 .env 同样收紧到 0600（含 4 个 Token）。
+$SSH "chmod 600 $NAS_DIR/deploy/.env" && ok "NAS 上 deploy/.env 权限已收紧到 600" || echo "WARN: NAS 上 chmod 600 deploy/.env 失败（请手动收紧）"
 # P2-55：kws-sidecar 的构建上下文不在 deploy/ 里——compose 里它是
 # build: ../kws-sidecar，且无 image:，只传 deploy/ 的话 NAS 上
 # docker compose up 会因构建上下文缺失而失败。只传构建所需文件
@@ -250,6 +255,10 @@ $SSH "sed -i 's#http://netease-api:3000#http://127.0.0.1:3000#' $NAS_DIR/hub/con
   sed -i \"s#http://openclaw:18789#http://$NAS_IP:18789#\" $NAS_DIR/hub/config.yaml
   sed -i 's#/volume1/music#/volume1/Music#' $NAS_DIR/hub/config.yaml
   sed -i 's#listen: \":4399\"#listen: \":'$HUB_PORT'\"#' $NAS_DIR/hub/config.yaml
+  # P2-23（2026-11-23 审查）：web_listen 也改写——面板绑 NAS 内网 IP:8081
+  #（种子 config.yaml 里是 192.168.88.247:8081；旧副本若是 127.0.0.1:8081
+  # 或别的 IP，面板在局域网就打不开）。任意旧值都改成 $NAS_IP:8081 并断言。
+  sed -i 's#web_listen: \"[^\"]*\"#web_listen: \"'$NAS_IP':8081\"#' $NAS_DIR/hub/config.yaml
   sed -i '/^[[:space:]]*music_assistant:/d' $NAS_DIR/hub/config.yaml
   grep -q 'http://127.0.0.1:3000' $NAS_DIR/hub/config.yaml \
     && grep -q 'ws://127.0.0.1:10400' $NAS_DIR/hub/config.yaml \
@@ -258,11 +267,12 @@ $SSH "sed -i 's#http://netease-api:3000#http://127.0.0.1:3000#' $NAS_DIR/hub/con
     && grep -q \"http://$NAS_IP:18789/v1\" $NAS_DIR/hub/config.yaml \
     && grep -q 'music_folder: /volume1/Music' $NAS_DIR/hub/config.yaml \
     && grep -q \"listen: \\\":$HUB_PORT\\\"\" $NAS_DIR/hub/config.yaml \
+    && grep -q \"web_listen: \\\"$NAS_IP:8081\\\"\" $NAS_DIR/hub/config.yaml \
     && grep -q '$CLIENT_CERT_FINGERPRINT' $NAS_DIR/hub/config.yaml \
     && ! grep -q 'music_assistant:' $NAS_DIR/hub/config.yaml \
     && grep -E 'api:|url:|kws:|  url:' $NAS_DIR/hub/config.yaml" \
-  && ok "config.yaml 已改：netease.api 走 127.0.0.1:3000，kws 走 ws://127.0.0.1:10400/v1/kws，HA 走 $NAS_IP:8123，agents 走 $NAS_IP:8642 / $NAS_IP:18789，music_folder 是 /volume1/Music，Hub listen 是 :$HUB_PORT，discovery_fingerprints 含客户端证书指纹 97c1ed53…（以上改写均已断言；已废弃的 music_assistant 行如有也已删——新 Hub 读到该行会直接拒绝启动）" \
-  || bad "config.yaml 调整失败（sed 后断言不通过：HA/agents/music_folder/listen/指纹白名单任一改写未生效，或 music_assistant 行没删掉，见上）"
+  && ok "config.yaml 已改：netease.api 走 127.0.0.1:3000，kws 走 ws://127.0.0.1:10400/v1/kws，HA 走 $NAS_IP:8123，agents 走 $NAS_IP:8642 / $NAS_IP:18789，music_folder 是 /volume1/Music，Hub listen 是 :$HUB_PORT，web_listen 是 $NAS_IP:8081，discovery_fingerprints 含客户端证书指纹 97c1ed53…（以上改写均已断言；已废弃的 music_assistant 行如有也已删——新 Hub 读到该行会直接拒绝启动）" \
+  || bad "config.yaml 调整失败（sed 后断言不通过：HA/agents/music_folder/listen/web_listen/指纹白名单任一改写未生效，或 music_assistant 行没删掉，见上）"
 
 [ "$DO_UP" != "up" ] && {
   echo; echo "文件已传好，未执行 up。如需启动：NAS_SSH=$NAS_SSH $0 up"
@@ -270,9 +280,37 @@ $SSH "sed -i 's#http://netease-api:3000#http://127.0.0.1:3000#' $NAS_DIR/hub/con
 }
 
 # ---------- 4. 拉镜像并启动 ----------
-info "4. docker compose pull + up"
-$SSH "cd $NAS_DIR/deploy && docker compose pull" \
-  && ok "镜像拉取完成" || bad "镜像拉取失败（看是哪一个镜像报错；netease-api 已改为 binaryify/netease_cloud_music_api）"
+info "4. 拉镜像（按 tag 拉 + digest 比对）并启动"
+# P1-5（2026-11-23 审查 + NAS 实测）：NAS Docker 29.6.2 pull-by-digest
+# 有 bug——按 digest 拉到的镜像存在但无 tag，`docker images` 看不到，
+# compose 也认不出它（2026-11-23 用 hello-world 实测：pull-by-digest
+# 报 Downloaded newer image，但 docker images 里没有，inspect 按 digest
+# 才找得到，RepoTags 为空）。所以这里不再 `docker compose pull`（它对
+# 带 digest 的 image 行就是 pull-by-digest），改为逐镜像按 tag 拉取，
+# 再用 `docker image inspect` 比对 RepoDigest，不一致即 FAIL。
+# compose 里的 digest 钉死值本身不改——比对用的就是 compose 里的值。
+_pinned="$(grep -E '^[[:space:]]*image:[[:space:]]*[^[:space:]]+@sha256:[0-9a-f]{64}' deploy/docker-compose.yml | sed -E 's/^[[:space:]]*image:[[:space:]]*//')"
+[ -n "$_pinned" ] || { bad "compose 里找不到带 digest 钉死的 image 行"; exit 1; }
+while IFS= read -r _img; do
+  [ -n "$_img" ] || continue
+  [[ "$_img" =~ ^[A-Za-z0-9./:_-]+@sha256:[0-9a-f]{64}$ ]] \
+    || { bad "compose 里的 image 行格式不对，无法安全比对 digest：$_img"; exit 1; }
+  _repo_tag="${_img%@sha256:*}"
+  _repo="${_repo_tag%:*}"
+  _digest="sha256:${_img##*@sha256:}"
+  _pull_out="$($SSH "docker pull $_repo_tag" 2>&1)" \
+    || { bad "拉取镜像失败：$_repo_tag"; echo "$_pull_out"; exit 1; }
+  ok "镜像已拉取 $_repo_tag"
+  _got="$($SSH "docker image inspect --format '{{index .RepoDigests 0}}' $_repo_tag" 2>/dev/null || true)"
+  if [ "$_got" = "$_repo@$_digest" ]; then
+    ok "digest 一致 $_repo_tag ($_digest)"
+  else
+    bad "digest 不一致：$_repo_tag 拉到的是 ${_got:-无}，compose 钉的是 $_repo@$_digest（镜像可能被换过，停下来查）"
+    exit 1
+  fi
+done <<EOF
+$_pinned
+EOF
 # P1-4：先构建 hub、kws-sidecar 与 whisper（三者都是 build:，pull 拉不到），
 # 再做卷属主迁移——已存在的数据卷属主还是 root（旧版容器以 root 跑过），
 # 新版容器以 uid 1000 运行会写不进卷。up 之前用 root 一次性 chown
@@ -286,27 +324,48 @@ $SSH "cd $NAS_DIR/deploy && docker compose run --rm --user root --no-deps --entr
   && ok "kws models 卷属主已设为 1000:1000" || { bad "kws models 卷 chown 失败"; exit 1; }
 $SSH "cd $NAS_DIR/deploy && docker compose up -d" \
   && ok "docker compose up -d 已执行" || { bad "up 失败，把报错贴回来"; exit 1; }
-# 只等 15 秒让各容器完成启动——这一步不等 whisper 的模型：
-# whisper 首次启动要下载 funasr/paraformer-zh（约 850MB，分钟级，
-# 见 NAS_CHECKLIST.md §2.2“等 3 分钟”），下载在容器后台进行；
-# 服务端启动即绑 10300 端口（NAS 实测：空数据卷首启 5 秒内端口
-# 已通，Ready 日志在模型加载完后才出），所以下面的 Up 计数与
-# 端口检查在下载进行中也能通过；15 秒只是启动沉降，不是模型就绪等待。
-sleep 15
+# P1-4（2026-11-23 审查 + NAS 实测）：等 whisper/piper/netease-api
+# 健康检查变 healthy，最多 600s，超时即 FAIL。旧注释“空数据卷首启
+# 5 秒内端口已通”是错的：whisper 的 Wyoming 服务只在模型加载完、
+# 打 Ready 日志后才绑 10300 端口（NAS 实测镜像源码 __main__.py:317
+# 先 load_transcriber()，:336-337 打 Ready 后才 server.run()），所以
+# 只 sleep 15 等不到模型——首次启动下载约 850MB 模型是分钟级。
+# compose 已给三者加 healthcheck（whisper/piper TCP 探活、netease-api
+# wget 探活），healthy 即就绪；Hub 的 depends_on service_healthy 也会
+# 在 up 时先等它们（up 本身会等），这里是第二道防线：healthcheck 被
+# 改掉或容器中途变 unhealthy 时仍能明确 FAIL，而不是在后面的端口
+# 检查里含糊地挂掉。
+info "等 whisper/piper/netease-api 健康（最多 600s）"
+_deadline=$((SECONDS + 600))
+_healthy=0
+while [ "$SECONDS" -lt "$_deadline" ]; do
+  _n="$($SSH "docker inspect --format '{{.State.Health.Status}}' oxn-whisper oxn-piper oxn-netease-api 2>/dev/null | grep -c '^healthy$'" 2>/dev/null || true)"
+  if [ "$_n" = "3" ]; then
+    _healthy=1
+    break
+  fi
+  sleep 5
+done
+if [ "$_healthy" = "1" ]; then
+  ok "whisper/piper/netease-api 健康检查都已 healthy（whisper 模型加载完成）"
+else
+  bad "600s 内 whisper/piper/netease-api 未全部 healthy（看 docker compose ps 与各容器日志；whisper 首次启动下载约 850MB 模型，超时多半是下载失败或 HF 不通）"
+fi
 
 # P2-24：带 Web Token 的检查不用本地拼命令——token 经本地 shell 拼进
 # `$SSH "…"` 会被远端 shell 再解析一次，token 里的特殊字符会破环命令，
 # 且 token 会出现在本机进程参数里。remote_curl_api 把检查脚本用带引号
-# 的 heredoc（不展开）喂给 NAS 端 bash -s，NAS_DIR 与 API 路径作 $1/$2
-# 传进去；token 在 NAS 端从已传过去的 deploy/.env 里读（与
+# 的 heredoc（不展开）喂给 NAS 端 bash -s，NAS_DIR、API 路径与 NAS_IP
+# 作 $1/$2/$3 传进去；token 在 NAS 端从已传过去的 deploy/.env 里读（与
 # NAS_CHECKLIST.md §3 的写法一致）。本机只收到响应体 + HTTP 码，不
 # 打印 token、不把 token 写进日志。
-# 2026-11-19：面板改绑 NAS 内网 IP，健康检查改调 192.168.88.247:8081
-#（此前 127.0.0.1:8081 已不监听）。
+# 2026-11-19：面板改绑 NAS 内网 IP，健康检查改调 NAS_IP:8081
+#（此前 127.0.0.1:8081 已不监听）。P2-23（2026-11-23 审查）：IP 不再
+# 硬编码 192.168.88.247，由调用方传 $NAS_IP 作 $3（见 §0 的 NAS_IP 校验）。
 remote_curl_api() { # $1=API 路径，如 /api/status
-  $SSH "bash -s -- $NAS_DIR $1" <<'REMOTE_EOF'
+  $SSH "bash -s -- $NAS_DIR $1 $NAS_IP" <<'REMOTE_EOF'
 tok="$(grep -E '^OPEN_XIAOAI_WEB_TOKEN=' "$1/deploy/.env" | cut -d= -f2-)"
-curl -s -m 5 -w ' %{http_code}' -H "Authorization: Bearer $tok" "http://192.168.88.247:8081$2"
+curl -s -m 5 -w ' %{http_code}' -H "Authorization: Bearer $tok" "http://$3:8081$2"
 REMOTE_EOF
 }
 

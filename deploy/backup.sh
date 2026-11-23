@@ -257,6 +257,8 @@ info "4. 打总包：$ARCHIVE"
   || die "打包前校验失败：staging 内文件 SHA256 不符（磁盘或打包过程出错；删掉重跑）"
 tar -czf "$ARCHIVE" -C "$STAGE" . \
   || die "写备份归档失败：$ARCHIVE（磁盘满了？df -h 看看）"
+# M6：归档含全部机密（Token + Cookie + TLS 私钥），收紧到 0600。
+chmod 600 "$ARCHIVE" || die "备份归档权限收紧失败：$ARCHIVE"
 
 # 校验：gzip 完整 + 归档里有 manifest + SHA256SUMS 的每个成员都在。
 gzip -t "$ARCHIVE" || die "备份校验失败：$ARCHIVE 不是有效的 gzip（写入中断；删掉重跑）"

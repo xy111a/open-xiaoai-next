@@ -4,7 +4,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/url"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -416,6 +419,19 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("kws.keywords 里有空唤醒词")
 			}
 		}
+		// P1-1（2026-11-23 审查）：wake_word 必须在 kws.keywords 里——
+		// 否则 Hub 拿“你好小李”唤醒、边车却只检测 keywords 里的词，
+		// 唤醒永远触发不了，且启动时没有任何报错。比对时两边都去首尾空白。
+		found := false
+		for _, kw := range c.KWS.Keywords {
+			if strings.TrimSpace(kw) == strings.TrimSpace(c.WakeWord) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("wake_word %q 不在 kws.keywords 里（kws.enabled=true 时唤醒词必须与边车关键词一致，边车只检测 keywords 里的词）", c.WakeWord)
+		}
 		// N-P2-10 / S-14：边车指纹须是 64 位 hex（大小写不限，SHA-256），
 		// 否则配了也认不出；归一化与 kws 包共用 NormalizeFingerprintHex。
 		if c.KWS.Fingerprint != "" {
@@ -766,7 +782,40 @@ func (c *Config) Save(path string) error {
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
+		if errors.Is(err, syscall.EBUSY) || errors.Is(err, syscall.EXDEV) {
+			// P0-2：bind-mount 单文件上 rename 被内核拒绝（EBUSY；跨设备时
+			// EXDEV）——compose 把 config.yaml 单文件挂进容器，改名到挂载点
+			// 必然失败。改走直接写原文件（写后 fsync 文件与目录）；写同一
+			// 文件内容，不经过改名所以不断电损坏原文件的前提不变，只是
+			// 不再原子——记日志说明走了非原子路径。
+			log.Printf("config: rename 到 %s 失败（%v），改走直接写原文件", path, err)
+			if ferr := writeFileSync(path, b, 0600); ferr != nil {
+				return ferr
+			}
+			return nil
+		}
 		return err
+	}
+	return nil
+}
+
+// writeFileSync 直接写文件并 fsync 文件与所在目录（Save 的 rename 回退
+// 路径用；正常路径仍走临时文件 + 改名，保持原子性）。
+func writeFileSync(path string, b []byte, perm os.FileMode) error {
+	if err := os.WriteFile(path, b, perm); err != nil {
+		return err
+	}
+	// WriteFile 只在新建时用 perm，已存在的文件权限不变——显式收紧。
+	if err := os.Chmod(path, perm); err != nil {
+		return err
+	}
+	if f, err := os.Open(path); err == nil {
+		_ = f.Sync()
+		_ = f.Close()
+	}
+	if d, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	return nil
 }

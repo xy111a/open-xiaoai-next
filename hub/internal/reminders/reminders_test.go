@@ -34,7 +34,7 @@ func TestNextDaily(t *testing.T) {
 func TestOnceFiresAndDeletes(t *testing.T) {
 	dir := t.TempDir()
 	fired := make(chan Reminder, 10)
-	s := New(filepath.Join(dir, "r.json"), func(r Reminder) { fired <- r })
+	s := New(filepath.Join(dir, "r.json"), func(r Reminder) error { fired <- r; return nil })
 	id, err := s.Add(Reminder{Kind: KindOnce, Text: "吃药", Next: time.Now().Add(-time.Second)})
 	if err != nil {
 		t.Fatal(err)
@@ -48,6 +48,11 @@ func TestOnceFiresAndDeletes(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("一次性提醒应触发一次，未收到回调")
+	}
+	// P1-12：删除在 onFire 返回后异步发生，等删除完成（2s 内）。
+	deadline := time.Now().Add(2 * time.Second)
+	for len(s.List()) != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
 	}
 	if len(s.List()) != 0 {
 		t.Fatal("一次性提醒触发后应删除")
@@ -65,7 +70,7 @@ func TestOnceFiresAndDeletes(t *testing.T) {
 func TestDailyReschedules(t *testing.T) {
 	dir := t.TempDir()
 	fired := make(chan struct{}, 10)
-	s := New(filepath.Join(dir, "r.json"), func(r Reminder) { fired <- struct{}{} })
+	s := New(filepath.Join(dir, "r.json"), func(r Reminder) error { fired <- struct{}{}; return nil })
 	now := time.Now()
 	if _, err := s.Add(Reminder{Kind: KindDaily, Text: "吃药", At: "08:00", Next: now.Add(-time.Second)}); err != nil {
 		t.Fatal(err)
@@ -89,7 +94,7 @@ func TestDailyReschedules(t *testing.T) {
 func TestIntervalAdvances(t *testing.T) {
 	dir := t.TempDir()
 	fired := make(chan struct{}, 10)
-	s := New(filepath.Join(dir, "r.json"), func(r Reminder) { fired <- struct{}{} })
+	s := New(filepath.Join(dir, "r.json"), func(r Reminder) error { fired <- struct{}{}; return nil })
 	now := time.Now()
 	if _, err := s.Add(Reminder{Kind: KindInterval, Text: "喝水", Every: 30, Next: now.Add(-time.Second)}); err != nil {
 		t.Fatal(err)
@@ -137,7 +142,7 @@ func TestCancelByTextAndPersistence(t *testing.T) {
 func TestStartTicker(t *testing.T) {
 	dir := t.TempDir()
 	fired := make(chan struct{}, 1)
-	s := New(filepath.Join(dir, "r.json"), func(r Reminder) { fired <- struct{}{} })
+	s := New(filepath.Join(dir, "r.json"), func(r Reminder) error { fired <- struct{}{}; return nil })
 	if _, err := s.Add(Reminder{Kind: KindInterval, Text: "喝水", Every: 1, Next: time.Now().Add(2 * time.Second)}); err != nil {
 		t.Fatal(err)
 	}

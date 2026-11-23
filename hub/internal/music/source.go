@@ -148,6 +148,10 @@ func (s *LocalSource) Search(ctx context.Context, query string, limit int) ([]Pl
 		if strings.TrimSpace(term) == "" || len(out) >= limit {
 			continue
 		}
+		// P1-11：总预算到了就停，不再开第二轮 SearchFile（每轮最多 5s）。
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		files, err := s.mpd.SearchFile(term)
 		if err != nil {
 			return nil, err
@@ -202,6 +206,20 @@ func splitArtistTrack(query string) (artist, track string) {
 // 空 Chain 的 Search 返回空 slice + nil error（调用方按“没配音源”处理）。
 type Chain struct {
 	sources []Source
+	// mu 保护 failed：Chain 可能被多路语音并发复用（测试注入的
+	// MusicSources 是共享实例），failed 的读写须串行化。
+	mu sync.Mutex
+	// failed 是最近一次 Search 里出错的音源名（P1-11，2026-11-23 审查）：
+	// 调用方据此判断某音源是否已经试过、失败了——失败过的音源不要再
+	// 单独重试（本地音源 SearchFile 一轮最多 5s，重复调就是重复拖时间）。
+	failed map[string]bool
+}
+
+// Failed 报告 name 音源在最近一次 Search 里是否出错过。
+func (c *Chain) Failed(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.failed[name]
 }
 
 // NewChain 按给定顺序建链（调用方按 config music.primary/fallback 排）。
@@ -220,13 +238,27 @@ func (c *Chain) Len() int { return len(c.sources) }
 
 // Search 按顺序试每个音源，返回第一个有结果的音源的可播歌
 // 与它的名字；都找不到返回空 slice + nil error；都出错返回最后一个错误。
-// 单个音源出错只记日志、不中断整条链。
+// 单个音源出错只记日志、不中断整条链；出错的音源名记进 failed，
+// 供调用方判断某音源是否已试过（P1-11）。ctx 已过期时不再开新音源
+// 的搜索——本地音源的 SearchFile 不接 ctx，过期了也会跑满两轮。
 func (c *Chain) Search(ctx context.Context, query string, limit int) ([]Playable, string, error) {
+	c.mu.Lock()
+	c.failed = map[string]bool{}
+	c.mu.Unlock()
 	var lastErr error
 	for _, s := range c.sources {
+		if err := ctx.Err(); err != nil {
+			if lastErr == nil {
+				lastErr = err
+			}
+			break
+		}
 		got, err := s.Search(ctx, query, limit)
 		if err != nil {
 			log.Printf("music: 音源 %s 搜索 %q 失败，试下一个: %v", s.Name(), query, err)
+			c.mu.Lock()
+			c.failed[s.Name()] = true
+			c.mu.Unlock()
 			lastErr = err
 			continue
 		}

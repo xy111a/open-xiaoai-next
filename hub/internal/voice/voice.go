@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -88,8 +90,15 @@ type Pipeline struct {
 	utterances map[string]*utterance
 	onReply    func(deviceID string, opusFrames [][]byte)
 
+	// onError 是 answer 失败时的回调（P0-3）：settle 的后台 goroutine 里
+	// answer 出错时调用；main 接 speakText 播一句区分性回复。
+	// 为 nil 时不调用。回调里不要再调本管线的 Frame/End/answer
+	//（speakText 直接走 TTS，不经过管线，不会递归）。
+	onError func(deviceID string, err error)
+
 	// inFlight 是每设备正在回答的在途记录（P1-29 + 打断后续）：
-	// 同一设备上一句还没答完时新结算直接丢弃（只记日志），不让回答
+	// 同一设备上一句还没答完时新结算先判撤退词（P1-14：是撤退词就
+	// Cancel 在途回答并重新结算，不是则丢弃、只记日志），不让回答
 	// 在后台无限排队；Cancel 用它找到并取消在途回答的 ctx。
 	inFlight map[string]*flight
 
@@ -126,6 +135,61 @@ func New(stt STT, tts TTS, router Router, voice string, onReply func(deviceID st
 	}
 }
 
+// SetOnError 设 answer 失败时的回调（P0-3）；为 nil 表示不播报。
+// main 在 speakText 赋值后接上，回调里读 h.speakText（晚绑定）。
+func (p *Pipeline) SetOnError(fn func(deviceID string, err error)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.onError = fn
+}
+
+// callOnError 调 onError 回调（未设则什么都不做）；回调在锁外执行，
+// 不让回调里的播报反过来阻塞管线。
+func (p *Pipeline) callOnError(deviceID string, err error) {
+	p.mu.Lock()
+	fn := p.onError
+	p.mu.Unlock()
+	if fn != nil {
+		fn(deviceID, err)
+	}
+}
+
+// errAnswerTimeout 是回答总超时（120s）的哨兵错误：settle 里 answer
+// 超时也走 errAnswerCancelled，用它区分“超时”和“用户打断”。
+var errAnswerTimeout = errors.New("voice: 回答超时")
+
+// ErrorReply 把一次回答失败翻成一句播给用户的区分性回复（P0-3）。
+// 分类只看下游包的错误文本标记
+// （Wyoming 的 STT/TTS 错误自带“STT/TTS 不可用”前缀，HA 错误以
+// “ha: ”开头，Agent 错误含 “agent”，提醒错误含“提醒”）。
+// 空回复不经过这里（answer 返回 nil，不调 onError）。
+func ErrorReply(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "STT 不可用"):
+		return "语音识别没连上，请稍后再试"
+	case strings.Contains(msg, "TTS 不可用"):
+		return "语音合成没连上，请稍后再试"
+	case strings.Contains(msg, "语音管线繁忙"):
+		return "我现在有点忙，请稍后再试"
+	case strings.Contains(msg, "agent"):
+		return "大脑没连上，请稍后再试"
+	case strings.Contains(msg, "ha:"):
+		return "家电没控制住，请稍后再试"
+	case strings.Contains(msg, "提醒"):
+		return "提醒没记上，请再说一遍"
+	case strings.Contains(msg, "MPD"), strings.Contains(msg, "音乐"), strings.Contains(msg, "网易云"):
+		return "音乐没放出来，请稍后再试"
+	case strings.Contains(msg, "超时"):
+		return "想得太久了，请再说一遍"
+	default:
+		return "语音服务暂时没连上，请稍后再试"
+	}
+}
+
 // Discard 丢弃某设备的未结算 utterance（P1-28：OnDisconnect 调，
 // 断线后半句话不再残留，下次重连不被旧音频污染）。已在回答中的
 // inFlight 不受影响（由 answerTimeout 兜底）。
@@ -149,14 +213,23 @@ func (p *Pipeline) Cancel(deviceID string) {
 	}
 }
 
+// retreatRe 是撤退词表（P1-14：与 router.retreatRe 同步，改词表时两边
+// 一起改）：整句就是这些词才命中，“停车”“停一下，我想想”不命中。
+var retreatRe = regexp.MustCompile(`^(?:停|停止|停下|别说了|别播了|不要说了)\s*$`)
+
 // settle 异步结算一句话（P1-29）：FramePCM/End 只把 PCM 交出来就返回，
 // 回答（STT→Router→TTS→编码）在后台 goroutine 跑，不再阻塞 transport
-// 读循环；带 120s 超时 ctx；同一设备上一句未答完时新结算直接丢弃。
+// 读循环；带 120s 超时 ctx；同一设备上一句未答完时新结算先判撤退词
+// （P1-14：是撤退词就 Cancel 在途回答并重新结算，不是则丢弃）。
 func (p *Pipeline) settle(ctx context.Context, deviceID string, pcm []int16) error {
 	p.mu.Lock()
 	if _, ok := p.inFlight[deviceID]; ok {
 		p.mu.Unlock()
-		log.Printf("voice: 设备 %s 上一句还没答完，本句丢弃", deviceID)
+		// P1-14：上一句还在合成中，本句不能直接丢——可能是撤退词
+		// （“停”）：异步转写一次判撤退词（不阻塞 transport 读循环），
+		// 命中即 Cancel 在途回答并重新结算本句（见 maybeRetreat）。
+		log.Printf("voice: 设备 %s 上一句还没答完，本句先判撤退词", deviceID)
+		go p.maybeRetreat(ctx, deviceID, pcm)
 		return nil
 	}
 	p.genSeq++
@@ -176,14 +249,71 @@ func (p *Pipeline) settle(ctx context.Context, deviceID string, pcm []int16) err
 			p.mu.Unlock()
 		}()
 		if err := p.answer(ctx, deviceID, pcm); err != nil {
+			// P0-3：以前这里只记日志，用户说完话后毫无声音，分不清是
+			// 没听清还是系统挂了；现在经 onError 播一句区分性回复。
+			// 只有 err != nil 才播报：空回复（撤退词、点歌快路径）走
+			// answer 返回 nil，不经过这里，保持静默。
 			if errors.Is(err, errAnswerCancelled) || errors.Is(err, context.Canceled) {
-				log.Printf("voice: 设备 %s 回答已取消（新唤醒打断）", deviceID)
+				// 120s 总超时也走 errAnswerCancelled：用 ctx 区分——
+				// DeadlineExceeded 是超时（故障，要播报），Canceled 是
+				// 用户打断（正常，静默）。defer 的 cancel() 在本分支
+				// 之后才跑，此时的 ctx.Err() 反映真实原因。
+				if ctx.Err() == context.DeadlineExceeded {
+					log.Printf("voice: 设备 %s 回答超时（120s 未回）", deviceID)
+					p.callOnError(deviceID, errAnswerTimeout)
+				} else {
+					log.Printf("voice: 设备 %s 回答已取消（新唤醒打断）", deviceID)
+				}
+			} else if ctx.Err() == context.DeadlineExceeded {
+				// 超时后才返回的原始错误（如 Route 的 DeadlineExceeded）：
+				// 同样按超时播报，不按原始错误分类。
+				log.Printf("voice: 设备 %s 回答超时（120s 未回）: %v", deviceID, err)
+				p.callOnError(deviceID, errAnswerTimeout)
 			} else {
 				log.Printf("voice: 设备 %s 回答失败: %v", deviceID, err)
+				p.callOnError(deviceID, err)
 			}
 		}
 	}()
 	return nil
+}
+
+// maybeRetreat 异步处理被 inFlight 挡下的本句（P1-14）：转写后只看是不是
+// 撤退词。是撤退词 → Cancel 在途回答（停合成、旧答案不再播出），再结算
+// 本句走路由器的撤退快路径（停 MPD 音乐 + StopAudio 停客户端播报）；
+// 不是撤退词 → 丢弃（与旧行为一致），只记一行日志。
+// 注意：命中撤退词时会转写两次（这里一次、结算后 answer 里一次），
+// 多一次本地 STT（约 0.4s），换来“停”在合成中也能立即生效；
+// 非撤退词只多一次 STT 就丢弃，不进路由、不调 LLM。
+// ctx 是 OnAudioFrame 传进来的 context.Background（不取消），
+// 异步 goroutine 里继续用它结算没有问题。
+func (p *Pipeline) maybeRetreat(ctx context.Context, deviceID string, pcm []int16) {
+	if p.stt == nil {
+		log.Printf("voice: 设备 %s STT 不可用，丢弃的本句无法判撤退词", deviceID)
+		return
+	}
+	pcmBytes := make([]byte, 0, len(pcm)*2)
+	for _, v := range pcm {
+		pcmBytes = append(pcmBytes, byte(v), byte(v>>8))
+	}
+	text, err := p.stt.Transcribe(pcmBytes, "zh")
+	if err != nil {
+		log.Printf("voice: 设备 %s 丢弃的本句转写失败，不处理: %v", deviceID, err)
+		return
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	if !retreatRe.MatchString(text) {
+		log.Printf("voice: 设备 %s 上一句还没答完，本句丢弃（不是撤退词）", deviceID)
+		return
+	}
+	log.Printf("voice: 设备 %s 丢弃的本句是撤退词 %q，取消在途回答并重新结算", deviceID, text)
+	p.Cancel(deviceID)
+	if err := p.settle(ctx, deviceID, pcm); err != nil {
+		log.Printf("voice: 设备 %s 撤退词重新结算失败: %v", deviceID, err)
+	}
 }
 
 // RMS 算一帧 PCM 的均方根（供 VAD 与测试用）。
