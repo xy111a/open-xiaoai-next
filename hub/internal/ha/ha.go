@@ -320,7 +320,7 @@ func (c *Client) CallService(domain, service, entityID string) error {
 	return err
 }
 
-// FireEvent 触发一个 HA 事件（紧急呼叫通知等用）。
+// FireEvent 触发一个 HA 事件。
 func (c *Client) FireEvent(eventType string, data map[string]any) error {
 	_, err := c.call("fire_event", map[string]any{
 		"event_type": eventType,

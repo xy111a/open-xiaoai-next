@@ -61,7 +61,7 @@ elif [ "$ALLOW_NO_ALSA" = "1" ]; then
   ALSA_FEATURE_ARGS=(--no-default-features)
 else
   echo "ASSERT FAIL: musl libasound not found at $ALSA_ARM_PREFIX — refusing to silently build a no-ALSA client (P2-52)" >&2
-  echo "  (rebuild the musl libasound staging dir, or pass --allow-no-alsa explicitly if you really want the no-ALSA emergency build)" >&2
+  echo "  (rebuild the musl libasound staging dir, or pass --allow-no-alsa explicitly if you really want the no-ALSA fallback build)" >&2
   exit 1
 fi
 # P1-40：默认开 sherpa-kws feature（ARM 交付二进制必须含 KWS，

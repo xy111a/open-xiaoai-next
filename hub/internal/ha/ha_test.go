@@ -238,12 +238,12 @@ func TestFireEvent(t *testing.T) {
 	}
 	defer c.Close()
 
-	if err := c.FireEvent("open_xiaoai_emergency", map[string]any{"device": "lx06-1"}); err != nil {
+	if err := c.FireEvent("open_xiaoai_test", map[string]any{"device": "lx06-1"}); err != nil {
 		t.Fatalf("FireEvent: %v", err)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.fired) != 1 || f.fired[0] != "open_xiaoai_emergency" {
+	if len(f.fired) != 1 || f.fired[0] != "open_xiaoai_test" {
 		t.Fatalf("服务端应收到 1 次 fire_event，实际 %v", f.fired)
 	}
 }

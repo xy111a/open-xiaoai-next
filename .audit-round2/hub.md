@@ -198,8 +198,6 @@ go test -race -count=1 ./...  # FAIL：internal/ha、internal/kws 两个包失�
 | P1-15 对讲零触发 | **仍开** | 见必查项：`Start`/`Sweep` 生产零调用；`OnDisconnect` 只单向 `End`。 |
 | P1-16 播放状态机错 | **仍开** | 见必查项：三点全在（立即复位 + 无 `stop_play`；`speakText`/对讲裸帧；打断恒 false）。 |
 | P1-17 对讲失败落管线 | **仍开** | `main.go:108-126` 的 `Forward` 出错仍不 return，继续走语音管线。 |
-| P1-18 紧急呼叫谎报 | **仍开** | `router.go:282-285` 的 `_ = r.deps.Notify` 后仍无条件回“已经帮你呼叫急救并通知了家人”；重复触发仍不重试；`emergencyCall` 仍无 `notified` 字段。 |
-| P1-19 “报警”误触发 | **仍开** | `emergencyRe`（`router.go:251`）仍含裸 `报警`，无词边界、无否定排除。 |
 | P1-20 Wyoming 无锁 | **仍开** | `wyoming.Client`（`wyoming.go:32-36`）仍无 `sync.Mutex`；两台设备 + 提醒 goroutine 并发调同一 STT/TTS 连接时读写交错。 |
 | P1-21 HA 并发写不安全 | **仍开** | `ha.go:146-175` 的 `call()` 与 `SubscribeEvents` 的 `WriteJSON` 仍不持写锁；本轮 `-race` 的测试替身竞态即此 bug 类的演示。 |
 | P1-22 Web PUT 假热更新 | **仍开** | PUT 仍全量替换（`web.go:312-347`，缺字段即清空、无合并）；运行中 Agent/HA/Wyoming/Router 仍不重建；`OnRoomClaim` 与 PUT 各写各的指针与同一 `.tmp` 文件；JSON 字段仍为 Go PascalCase、与 YAML snake_case 不一致。 |
@@ -230,7 +228,6 @@ go test -race -count=1 ./...  # FAIL：internal/ha、internal/kws 两个包失�
 | P2-5 PUT 与认领互覆盖 | **仍开** | 见 P1-22：两个指针、同一 `.tmp` 文件、无锁；`OnRoomClaim` 写回的是 PUT 换指针前的旧 `Config` 对象，会把 PUT 的修改 whole-file 覆盖丢。 |
 | P2-7 上游响应无上限 | **仍开** | MA `command` 的 `io.ReadAll`（`music.go:312`）仍无上限；Agent 错误分支仍回显上游响应体全文（`agent.go:86,124`）；网易云 `Decode` 仍无 `MaxBytesReader`。Web 侧 PUT/POST 已加 1MB 上限（已修的一半）。 |
 | P2-11 HA 回调同步执行 | **仍开** | `ha.go:104-145` 的 `readLoop` 里事件 handler 仍同步执行；告警 TTS（数秒）仍会堵住 HA 结果分发；回调 panic 仍会杀死 `readLoop`。 |
-| P2-12 紧急呼叫无二次确认 | **仍开** | 任何语音（含电视/录音/广播）说“救命/打120”即触发，无声纹/二次确认。 |
 | P2-13 提醒可重复 Start | **仍开** | `reminders.Start` 仍无“已启动”守卫；`Stop` 在 `main.go` 全文仍无调用。 |
 | P2-14 提醒落盘错误吞掉 | **仍开** | `tick`/`Cancel`/`CancelByText` 的 `_ = s.saveLocked()` 仍在（`reminders.go:133,148,230`）。 |
 | P2-15 记忆 key 秒级碰撞 | **仍开** | `memory.go:44-52` 仍用 `time.Now().Format(time.RFC3339)`（秒级）做 key，同一秒内两次“记住”仍互相覆盖。 |

@@ -42,7 +42,7 @@ pytest 固件 **86**、边车 **55**、lint.sh **全部通过**、go `-race` kws
 | P2-4 | 修了 | `config.Save` 临时文件 0600；reminders/memory 落盘唯一临时文件 + 0600；证书/私钥/CA 0600；cookie 目录 0700；启动时数据目录 0700 并收紧已有文件到 0600。 |
 | P2-5 | 核实闭合 | Web PUT 与房间认领共用 `cfgMu`、同一 `*config.Config` 指针原地更新、`CreateTemp` 唯一临时文件——证据在 `main.go`/`web.go`/`config.go`，未重修。 |
 | P2-7 | 修了 | `agent.Chat` 成功响应改 `io.LimitReader` 1MB 限长解码；`netease_auth.getJSON` 改 1MB 限长；Web PUT/POST 已有 `MaxBytesReader`；MA 的无上限 `ReadAll` 已随融合 B 移除。 |
-| P2-12 | 未修 | 紧急呼叫二次确认——需 bai 拍板，见 §7。未改 `router.emergency` 代码。 |
+| P2-12 | 已删除 | 2026-11-23 紧急呼叫功能整体删除，本项作废。 |
 | P2-13 | 修了 | `Start` 加守卫（重复 Start 是 no-op，`Stop` 后可再次 `Start`，`Stop` 可重复调）；main 关停流程补 `remStore.Stop()`。 |
 | P2-14 | 修了 | `Cancel` 改签名 `(bool, error)`、`CancelByText` 改 `(int, error)`，落盘失败返回 error；`Add` 落盘失败置 `dirty` 并返回错误；调用处落盘失败时回复“取消失败，保存没存住，请稍后再试一次。” |
 | P2-15 | 核实闭合 + 加固 | P1-41 已改纳秒 key；本轮又补原子自增序号兜底同一纳秒（key = 纳秒时间戳 + `memSeq`）。 |
@@ -291,7 +291,7 @@ set -e 下不要用 `grep … && fail`，用 if。
 
 | # | 项 | 原因 / 建议 |
 |---|---|---|
-| 1 | P2-12 紧急呼叫二次确认 | 需 bai 拍板。加确认会延迟真实紧急呼叫的通知（用户说一次“救命”后可能无法再说话确认），是安全性权衡，只有 bai 能接受；确认方式（语音确认措辞、窗口、重复求救是否算确认）也是产品决策。建议方案：首次触发 → 问“确认要呼叫急救吗？请说‘确认呼叫’”，60s 窗口内“确认/是的/确认呼叫”或再次触发求救词即确认执行，“取消”撤销，超时无确认则不通知。FR-15 触发语义（触发词本身）保持不变。 |
+| 1 | P2-12 已删除 | 2026-11-23 紧急呼叫功能整体删除，本项作废，不再做。 |
 | 2 | P2-35 OTA 禁用残留路径 | 只能真机核实；VM 上能做的是 patch.sh §6 验证三处已知禁用点（已做，见 §1.4 P2-6）。 |
 | 3 | P2-42 残留：hub_url 默认 `wss://192.168.1.10:4399` | 需 bai 拍板。彻底去掉需改配置格式（hub_url 必填），属 breaking change：旧 client.toml 缺该字段即启动失败。未改的理由：Token 默认已空、指纹必填，错配的默认 Hub 无法鉴权，危险部分已被 fail-closed 兜住。 |
 | 4 | gnueabihf 脚本对不兼容 vendor `.so` 只警告不失败 | 需 bai 拍板（或第三轮审计定）。未改：该 `.so` 已知不可用是 P1-40 遗留状态，改失败会断掉当前能跑通的默认 server 模式构建。 |

@@ -866,10 +866,7 @@ func main() {
 		skillRegistry = skill.New(skills)
 		log.Printf("技能插件：已注册 %d 个技能（%v）", len(skills), skillRegistry.Skills())
 	}
-	// Router 的 Notify 闭包要读看门狗热换后的最新 HA（P1-27），
-	// 而 rt 在下面才赋值：先声明变量，闭包调用时再读。
-	var rt *router.Router
-	rt = router.New(router.Deps{
+	rt := router.New(router.Deps{
 		HA: haClient, Netease: netease, Agent: agentClient,
 		Agents: agentClients, WakeWordRoutes: cfg.WakeWordRoutes,
 		Skills: skillRegistry,
@@ -954,14 +951,6 @@ func main() {
 			}
 			return "", false
 		},
-		Notify: func(ctx context.Context, text string) error {
-			// P1-27：读当前 HA（看门狗热换后是最新的），不是启动时那个。
-			c := rt.HA()
-			if c == nil {
-				return fmt.Errorf("HA 未连接，无法通知")
-			}
-			return c.FireEvent("open_xiaoai_emergency", map[string]any{"text": text})
-		},
 	}, cfg.HAEntities)
 	// P1-38：OnWake 在 hubHandler 里记唤醒词，供 Router 选 Agent。
 	h.router = rt
@@ -973,7 +962,7 @@ func main() {
 	// （Wyoming 走 Dialer 懒重拨，不用看门狗管；HA 重连后要给
 	// alerts Watcher 重订，见下面的 watcher 变量。）
 	// P2-53：关停通道——后台 goroutine（看门狗、会话清扫、
-	// OTA/对讲/紧急扫荡）收到 done 后退出，不再靠 time.Tick
+	// OTA/对讲扫荡）收到 done 后退出，不再靠 time.Tick
 	// 泄漏到进程结束。
 	done := make(chan struct{})
 
@@ -1213,7 +1202,7 @@ func main() {
 	go h.sweepSessions(done)
 
 	// P1-9/P1-15：每 10s 扫一次——OTA 超时任务标失败（pushing 超 10 分钟
-	// 或 verifying 超 30s）、对讲超时会话挂断、紧急呼叫过期清理。
+	// 或 verifying 超 30s）、对讲超时会话挂断。
 	// P2-53：time.Tick 改 NewTicker + done 退出。
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
@@ -1230,7 +1219,6 @@ func main() {
 			if ended := h.intercom.Sweep(time.Now()); len(ended) > 0 {
 				log.Printf("对讲扫荡：超时挂断: %v", ended)
 			}
-			rt.SweepEmergency(time.Now())
 			// 多轮对话会话过期清理（内存释放；不调也行，取用时惰性清）。
 			rt.SweepSessions(time.Now())
 		}

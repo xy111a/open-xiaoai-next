@@ -100,7 +100,7 @@
 2. **F-4 串口登录实测**（需真机）：首刷后用串口 + bai 已有密码登录一次，核实 root hash 复用（镜像 shadow 与 gitignore 备份已逐字节比对一致，但“密码能登录”只能真机证实）。
 3. **S-7 Dockerfile 构建验证**（需 NAS/docker）：本机无 docker，钉 digest + apt 版本 + `USER 1000:1000` 的 Dockerfile 未实际构建过；NAS 上重编边车镜像时跑 `docker compose up -d kws-sidecar` + `/health` 冒烟确认。
 4. **真机项**（与前几轮相同，全部仍 BLOCKED）：刷机、NAS 部署、同步播放、真人唤醒率、双机仲裁、打断率、网易云扫码、HA 真联调、AEC 真实延迟校准、P2-35。
-5. **待 bai 定夺**（本轮未碰）：C-15（P2-42）hub_url 改必填；P2-12 紧急呼叫二次确认方案；gnueabihf 构建遇到不兼容 vendor .so 是警告还是失败；S-3 边车 TLS 方案；HA 是否配 TLS；P1-40 长期服务端模式认不认。
+5. **待 bai 定夺**（本轮未碰）：C-15（P2-42）hub_url 改必填；P2-12 已删除（2026-11-23，不再定夺）；gnueabihf 构建遇到不兼容 vendor .so 是警告还是失败；S-3 边车 TLS 方案；HA 是否配 TLS；P1-40 长期服务端模式认不认。
 6. **已知延期**：C-14（P2-1）指纹不校验有效期与 SAN，下次动 TLS 验证时一并补。
 
 ## 4. 取舍说明与观察项

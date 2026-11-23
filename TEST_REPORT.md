@@ -1,7 +1,7 @@
 # open-xiaoai-next 测试报告
 
 - 日期：2026-11-17（CST）
-- 范围：Phase 0 环境、Phase 1（Hub 骨架 / firmware-patch / Client）、Phase 2（仲裁 / Snapcast / 网易云）、Phase 3（连续对话 / 打断 / HA / 提醒 FR-14 / 对讲）、Phase 4（Web 面板 / OTA / 紧急呼叫 FR-15 / 摄像头播报 FR-10）
+- 范围：Phase 0 环境、Phase 1（Hub 骨架 / firmware-patch / Client）、Phase 2（仲裁 / Snapcast / 网易云）、Phase 3（连续对话 / 打断 / HA / 提醒 FR-14 / 对讲）、Phase 4（Web 面板 / OTA / 摄像头播报 FR-10）
 - 原则：每项测试真实执行被测代码；需要真机才能验证的一律记 BLOCKED，绝不写成通过。
 - 位置：`~/workspace/speaker-open-xiaoai-rebuild/open-xiaoai-next/`
 
@@ -46,7 +46,7 @@
 | internal/agent | 3 | 假 OpenAI 服务：Chat；SSE 流式（delta“你”“好”）；错误 key 401 |
 | internal/ha | 5 | 假 HA WS：auth 握手；get_states；call_service 真改状态；subscribe 后服务端推送事件收到；fire_event；错误 token 拒绝 |
 | internal/music | 6 | 假 Snapcast：GetGroups（1 组 2 台，卧室延迟 15ms）+ 延迟/流/静音/音量；假网易云：搜歌/取 URL/歌词；假 MA：Players/点歌/播放暂停 + 错误透传；假 MPD：PlayURL 发 clear/add/play |
-| internal/router | 10 | 紧急呼叫；每日/间隔提醒+取消；记忆；HA 开灯（查状态、不重复调已开的灯）；门锁拒绝；MA 点歌；网易云+MPD 降级点歌；Agent 兜底；无 Agent 明说 |
+| internal/router | 10 | 每日/间隔提醒+取消；记忆；HA 开灯（查状态、不重复调已开的灯）；门锁拒绝；MA 点歌；网易云+MPD 降级点歌；Agent 兜底；无 Agent 明说 |
 | internal/transport | 5 | hello_ok（device_id `lx06-127-0-0-1`）；错误 Token/未知型号 hello_reject 且关闭；room_claim；服务端 RPC 下发；二进制帧 0x01 前缀 |
 | internal/discovery | 3 | hostsInCIDR（/30 展 4 个，/16 截断 1024）；ProbeModel 握手成功/错误 Token 拒绝；Scan 在 127.0.0.2/32 找到 lx06，本机 IP 跳过 |
 | internal/voice | 4 | RMS；整条管线（Opus 语音帧 → 800ms 静音结算 → STT → Router → TTS → 50 帧 Opus 回帧）；audio_end 强制结算；纯静音不回答 |
@@ -116,7 +116,6 @@
 | Web 面板 + config 读写 | `go test ./internal/web/` + Hub 冒烟 | /api/status、/api/devices、config GET/PUT（含校验失败拒绝）、OTA POST 均验证；真二进制 `:18080` 可访问 | 通过 | 无 |
 | 一键 OTA（失败回滚 boot1） | `go test ./internal/ota/ ./internal/web/` | 包内状态机单测通过（Push→Verifying→OK/Failed、超时扫荡、Web 下发）；生产接线零调用（P1-9：ConfirmHello/MarkRebooted/Sweep 在 P1 全量修复前未接线），回滚闭环未实现（【2026-11-18 P2 轮注：原“均验证”说法会误以为生产 OTA 已通，见 AUDIT_ROUND2.md §6 P1-9】） | 通过（单测部分） | 真机刷机验证（需 bai 硬件）；回滚本身是设备端 boot1 行为 |
 | 对讲全双工 | — | 未实现全双工切换，当前为半双工（见 Phase 3）；全双工需真机验证回声路径（【2026-11-18 P2 轮注：本行已被第二轮补做 B 行取代——全双工已做，见下；本行是当时的状态】） | 未做（当时） | 需真机验证 |
-| 紧急呼叫 FR-15（可选） | `go test ./internal/router/` | “救命/打 120/叫救护车/打 110/报警”触发 Notify + 回复；取消路径为语音“取消呼叫”（Router 侧未接取消状态机） | 部分 | 真机验证；取消状态机待补 |
 | 摄像头主动播报 FR-10 | — | `main.go` 已接 HA `state_changed` 订阅（leak/smoke/water → 播报，勿扰时段跳过），无自动化测试 | 未测 | 真 HA 摄像头联调（需 bai 硬件） |
 
 ## 第二轮补做（2026-11-17，用户问“除了刷机还能先做完哪些”后；复核人独立重跑确认）
