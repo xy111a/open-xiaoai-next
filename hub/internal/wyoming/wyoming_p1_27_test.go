@@ -4,8 +4,6 @@ package wyoming
 
 import (
 	"bufio"
-	"encoding/json"
-	"io"
 	"net"
 	"sync"
 	"testing"
@@ -102,40 +100,24 @@ func (f *oneShotWyoming) handle(conn net.Conn) {
 	defer conn.Close()
 	r := bufio.NewReader(conn)
 	for {
-		line, err := r.ReadBytes('\n')
+		_, header, err := readWyomingFrame(r)
 		if err != nil {
 			return
 		}
-		var header map[string]any
-		if err := json.Unmarshal(line, &header); err != nil {
-			return
-		}
-		if n, ok := header["payload_length"].(float64); ok && n > 0 {
-			if _, err := io.CopyN(io.Discard, r, int64(n)); err != nil {
-				return
-			}
-		}
 		if header["type"] == "transcribe" {
 			for {
-				l2, err := r.ReadBytes('\n')
+				_, h2, err := readWyomingFrame(r)
 				if err != nil {
 					return
-				}
-				var h2 map[string]any
-				_ = json.Unmarshal(l2, &h2)
-				if n, ok := h2["payload_length"].(float64); ok && n > 0 {
-					_, _ = io.CopyN(io.Discard, r, int64(n))
 				}
 				if h2["type"] == "audio-stop" {
 					break
 				}
 			}
-			b, _ := json.Marshal(map[string]any{"type": "transcript", "text": "打开客厅灯"})
-			_, _ = conn.Write(append(b, '\n'))
+			writeWyomingFrame(conn, map[string]any{"type": "transcript", "data": map[string]any{"text": "打开客厅灯"}}, nil)
 			return // 回完即断开：模拟服务端断线
 		}
-		b, _ := json.Marshal(map[string]any{"type": "error", "text": "未知类型"})
-		_, _ = conn.Write(append(b, '\n'))
+		writeWyomingFrame(conn, map[string]any{"type": "error", "data": map[string]any{"text": "未知类型"}}, nil)
 	}
 }
 

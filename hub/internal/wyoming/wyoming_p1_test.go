@@ -128,17 +128,14 @@ func TestSynthesizeTotalCapViaFakeServer(t *testing.T) {
 		defer conn.Close()
 		r := bufio.NewReader(conn)
 		// 读掉 synthesize 请求头。
-		_, _ = r.ReadBytes('\n')
-		w := func(header string, payload []byte) {
-			_, _ = conn.Write([]byte(header + "\n"))
-			if payload != nil {
-				_, _ = conn.Write(payload)
-			}
+		_, _, _ = readWyomingFrame(r)
+		w := func(header map[string]any, payload []byte) {
+			writeWyomingFrame(conn, header, payload)
 		}
-		w(`{"type":"audio-start","rate":16000,"width":2,"channels":1}`, nil)
+		w(map[string]any{"type": "audio-start", "data": map[string]any{"rate": 16000, "width": 2, "channels": 1}}, nil)
 		chunk := make([]byte, 600<<10) // 600KB，单块合法
 		for i := 0; i < 20; i++ {
-			w(`{"type":"audio-chunk","payload_length":614400}`, chunk)
+			w(map[string]any{"type": "audio-chunk", "data": map[string]any{"rate": 16000, "width": 2, "channels": 1}}, chunk)
 		}
 		// 不发 audio-stop；累积到第 18 块（>10MB）时客户端应已报错断开。
 	}()
