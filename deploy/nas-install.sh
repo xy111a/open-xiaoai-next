@@ -240,8 +240,9 @@ info "3. NAS 端 config 调整（只改 NAS 上的副本，不动本机 hub/conf
 # 2026-11-19：Hub 监听端口是部署时定的（HUB_PORT，默认 4399=停老 Hub 直接接管；
 # 其它值=与老 Hub 并行）。种子 config.yaml 的 listen 是 ":4399"，这里按 HUB_PORT 改写，
 # 并断言改写结果；音箱端 client.toml 的 hub_url 端口必须与这里一致（见 CHECKLIST）。
-# agents 与 music_folder 的改写是防旧副本：种子已是正确值（NAS 的 LAN IP、/volume1/Music），
-# 但 NAS 上旧副本可能还是容器名 /volume1/music，也在这里一并改过来并断言。
+# agents 与 music_folder 的改写是防旧副本：种子已是正确值（NAS 的 LAN IP、/music），
+# 但 NAS 上旧副本可能还是 /volume1/Music 或 /volume1/music，也在这里一并改过来并断言。
+# 2026-11-23 彩排 P0-4：music_folder 是容器内路径 /music，只改该行。
 # 指纹注入（部署时值，幂等）：随仓库发的 config.yaml 里 discovery_fingerprints
 # 为空；这里把 CLIENT_CERT_FINGERPRINT 注入 NAS 端副本（已存在则跳过），
 # 再由下面第 3 步的 grep 断言确认。指纹是部署时才定的值，不写进仓库。
@@ -253,7 +254,7 @@ $SSH "sed -i 's#http://netease-api:3000#http://127.0.0.1:3000#' $NAS_DIR/hub/con
   sed -i \"s#192.168.1.10:8123#$NAS_IP:8123#\" $NAS_DIR/hub/config.yaml
   sed -i \"s#http://hermes:8642#http://$NAS_IP:8642#\" $NAS_DIR/hub/config.yaml
   sed -i \"s#http://openclaw:18789#http://$NAS_IP:18789#\" $NAS_DIR/hub/config.yaml
-  sed -i 's#/volume1/music#/volume1/Music#' $NAS_DIR/hub/config.yaml
+  sed -i '/^[[:space:]]*music_folder:/s#/volume1/[Mm]usic#/music#' $NAS_DIR/hub/config.yaml
   sed -i 's#listen: \":4399\"#listen: \":'$HUB_PORT'\"#' $NAS_DIR/hub/config.yaml
   # P2-23（2026-11-23 审查）：web_listen 也改写——面板绑 NAS 内网 IP:8081
   #（种子 config.yaml 里是 192.168.88.247:8081；旧副本若是 127.0.0.1:8081
@@ -265,13 +266,13 @@ $SSH "sed -i 's#http://netease-api:3000#http://127.0.0.1:3000#' $NAS_DIR/hub/con
     && grep -q \"://$NAS_IP:8123\" $NAS_DIR/hub/config.yaml \
     && grep -q \"http://$NAS_IP:8642/v1\" $NAS_DIR/hub/config.yaml \
     && grep -q \"http://$NAS_IP:18789/v1\" $NAS_DIR/hub/config.yaml \
-    && grep -q 'music_folder: /volume1/Music' $NAS_DIR/hub/config.yaml \
+    && grep -q 'music_folder: /music' $NAS_DIR/hub/config.yaml \
     && grep -q \"listen: \\\":$HUB_PORT\\\"\" $NAS_DIR/hub/config.yaml \
     && grep -q \"web_listen: \\\"$NAS_IP:8081\\\"\" $NAS_DIR/hub/config.yaml \
     && grep -q '$CLIENT_CERT_FINGERPRINT' $NAS_DIR/hub/config.yaml \
     && ! grep -q 'music_assistant:' $NAS_DIR/hub/config.yaml \
     && grep -E 'api:|url:|kws:|  url:' $NAS_DIR/hub/config.yaml" \
-  && ok "config.yaml 已改：netease.api 走 127.0.0.1:3000，kws 走 ws://127.0.0.1:10400/v1/kws，HA 走 $NAS_IP:8123，agents 走 $NAS_IP:8642 / $NAS_IP:18789，music_folder 是 /volume1/Music，Hub listen 是 :$HUB_PORT，web_listen 是 $NAS_IP:8081，discovery_fingerprints 含客户端证书指纹 97c1ed53…（以上改写均已断言；已废弃的 music_assistant 行如有也已删——新 Hub 读到该行会直接拒绝启动）" \
+  && ok "config.yaml 已改：netease.api 走 127.0.0.1:3000，kws 走 ws://127.0.0.1:10400/v1/kws，HA 走 $NAS_IP:8123，agents 走 $NAS_IP:8642 / $NAS_IP:18789，music_folder 是 /music，Hub listen 是 :$HUB_PORT，web_listen 是 $NAS_IP:8081，discovery_fingerprints 含客户端证书指纹 97c1ed53…（以上改写均已断言；已废弃的 music_assistant 行如有也已删——新 Hub 读到该行会直接拒绝启动）" \
   || bad "config.yaml 调整失败（sed 后断言不通过：HA/agents/music_folder/listen/web_listen/指纹白名单任一改写未生效，或 music_assistant 行没删掉，见上）"
 
 [ "$DO_UP" != "up" ] && {

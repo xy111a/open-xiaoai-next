@@ -33,7 +33,7 @@ func fakeNeteaseSlowP1R3(t *testing.T, searchDelay, urlDelay time.Duration, urlM
 				`{"id":11,"name":"第一首","artists":[{"name":"甲"}]},`+
 				`{"id":22,"name":"第二首","artists":[{"name":"乙"}]},`+
 				`{"id":33,"name":"第三首","artists":[{"name":"丙"}]}]}}`)
-		case strings.HasPrefix(r.URL.Path, "/song/url/v1"):
+		case strings.HasPrefix(r.URL.Path, "/song/url"):
 			mu.Lock()
 			*starts = append(*starts, time.Now())
 			mu.Unlock()

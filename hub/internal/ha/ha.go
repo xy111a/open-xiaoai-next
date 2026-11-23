@@ -14,6 +14,7 @@ package ha
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -61,6 +62,20 @@ func (c *Client) writeJSON(v any) error {
 	return c.conn.WriteJSON(v)
 }
 
+// normalizeHAURL 补全 HA WebSocket 地址的路径：HA 的 WS 端点是 /api/websocket，
+// 裸地址（ws://host:8123）握手直接失败（2026-11-23 彩排 P0-2）。Path 为空
+// 或 "/" 时补上，已有路径不动，解析失败原样返回（交给 Dial 报错）。
+func normalizeHAURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u == nil || u.Host == "" {
+		return raw
+	}
+	if u.Path == "" || u.Path == "/" {
+		u.Path = "/api/websocket"
+	}
+	return u.String()
+}
+
 // Dial 连上 HA（ws://host:8123/api/websocket），完成 auth 握手，并启动读循环。
 // P1-5：两次 ReadMessage 都带 timeout 上限（无 deadline 时对端只建连不说话
 // 即永久挂起）；空 token 直接报错，不发一次 auth 再失败。
@@ -68,6 +83,7 @@ func Dial(url, token string, timeout time.Duration) (*Client, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, fmt.Errorf("ha: HASS_TOKEN 为空，拒绝无鉴权连接（HA 须配长期访问令牌）")
 	}
+	url = normalizeHAURL(url)
 	dialer := websocket.Dialer{HandshakeTimeout: timeout}
 	conn, _, err := dialer.Dial(url, nil)
 	if err != nil {

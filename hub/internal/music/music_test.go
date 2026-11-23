@@ -134,7 +134,7 @@ func fakeNetease(t *testing.T) *httptest.Server {
 				return
 			}
 			fmt.Fprint(w, `{"code":200,"result":{"songs":[{"id":12345,"name":"青花瓷","artists":[{"name":"周杰伦"}]}]}}`)
-		case strings.HasPrefix(r.URL.Path, "/song/url/v1"):
+		case strings.HasPrefix(r.URL.Path, "/song/url"):
 			fmt.Fprint(w, `{"code":200,"data":[{"id":12345,"url":"http://music.example.com/12345.mp3"}]}`)
 		case strings.HasPrefix(r.URL.Path, "/lyric"):
 			fmt.Fprint(w, `{"code":200,"lrc":{"lyric":"[00:00.00]素胚勾勒出青花"}}`)

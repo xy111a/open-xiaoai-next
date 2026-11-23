@@ -1,7 +1,7 @@
 // Package music 的音源插件层：点歌的“去哪找歌”抽象成 Source 接口，
 // Router 只认接口，不认具体音源。内置两个音源：
 //   - netease：网易云直连（主路，搜歌 + 并行取可播地址）；
-//   - local：MPD 本地曲库（/volume1/music，兜底）。
+//   - local：MPD 本地曲库（/music，兜底）。
 //
 // Chain 按配置顺序逐个尝试：主路找不到/出错即落到下一个；
 // 加新音源只需实现 Source 接口并在 Chain 里排进去，不改 Router。

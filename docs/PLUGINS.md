@@ -51,7 +51,7 @@ agents:
 music:
   primary: netease   # 第一音源
   fallback: local    # 第二音源；为空表示不兜底
-music_folder: /volume1/music   # 本地曲库目录（MPD 已挂载）
+music_folder: /music   # 本地曲库目录（容器内路径，MPD 已挂载）
 ```
 
 | 音源 | 说明 |
