@@ -66,6 +66,48 @@ func TestRoomClaimSaveSuccess(t *testing.T) {
 	}
 }
 
+// TestRoomClaimChangeRoomSaveFailureRestoresPrev：换房间认领失败时，
+// 配置与注册表里的旧房间都要恢复（M1，PR #17 审查必修项），而不是
+// 把旧条目删掉。
+func TestRoomClaimChangeRoomSaveFailureRestoresPrev(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	h, url := newRoomClaimServer(t, cfgPath)
+	c, deviceID := dialBargeInClient(t, url, "oh2p")
+	defer c.Close()
+	msgs := startBargeInReader(t, c)
+
+	// 先在客厅认领成功，建立旧条目。
+	h.OnRoomClaim(deviceID, "客厅")
+	waitForMsgType(t, msgs, "room_ok", 2*time.Second)
+	if d, ok := h.cfg.Devices[deviceID]; !ok || d.Room != "客厅" {
+		t.Fatalf("首次认领后配置应为客厅，实际 %+v", h.cfg.Devices)
+	}
+
+	// 删掉配置所在目录，让第二次 Save 一定失败。
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	h.OnRoomClaim(deviceID, "卧室")
+	waitForMsgType(t, msgs, "room_reject", 2*time.Second)
+	select {
+	case typ := <-msgs:
+		if typ == "room_ok" {
+			t.Fatal("Save 失败时不应回 room_ok")
+		}
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if d, ok := h.reg.Get(deviceID); !ok {
+		t.Fatal("设备应在注册表里")
+	} else if d.Room != "客厅" {
+		t.Fatalf("换房间失败后注册表应恢复客厅，实际 %q", d.Room)
+	}
+	if d, ok := h.cfg.Devices[deviceID]; !ok || d.Room != "客厅" {
+		t.Fatalf("换房间失败后配置应恢复客厅旧条目，实际 %+v", h.cfg.Devices)
+	}
+}
 // TestRoomClaimSaveFailureRejects：Save 失败时收 room_reject、不收 room_ok，
 // 且注册表与配置里的认领被回滚（不留痕迹）。
 func TestRoomClaimSaveFailureRejects(t *testing.T) {

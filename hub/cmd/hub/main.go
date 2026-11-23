@@ -449,12 +449,20 @@ func (h *hubHandler) OnRoomClaim(deviceID string, room string) {
 		h.cfgMu.Lock()
 		defer h.cfgMu.Unlock()
 	}
+	// M1（PR #17 审查）：覆盖前先快照旧条目——换房间认领失败时要恢复
+	// 旧条目，而不是直接删掉它（否则之后一次无关保存会把旧房间
+	// 的认领也落盘丢掉）。
+	prevDev, hadPrev := h.cfg.Devices[deviceID]
 	h.cfg.Devices[deviceID] = config.Device{
 		Model: mustModel(h.reg, deviceID), IP: mustIP(h.reg, deviceID), Room: room,
 	}
 	if err := h.cfg.Save(h.cfgPath); err != nil {
 		log.Printf("房间认领保存失败: %v", err)
-		delete(h.cfg.Devices, deviceID)
+		if hadPrev {
+			h.cfg.Devices[deviceID] = prevDev
+		} else {
+			delete(h.cfg.Devices, deviceID)
+		}
 		if prevRoom != "" {
 			h.reg.SetRoom(deviceID, prevRoom)
 		} else {
