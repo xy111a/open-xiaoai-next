@@ -2,8 +2,6 @@ package wyoming
 
 import (
 	"bufio"
-	"encoding/json"
-	"io"
 	"net"
 	"strings"
 	"testing"
@@ -38,45 +36,24 @@ func startWeirdFake(t *testing.T, mode string) *weirdFake {
 }
 
 func (f *weirdFake) write(conn net.Conn, header map[string]any, payload []byte) {
-	if payload != nil {
-		header["payload_length"] = len(payload)
-	}
-	b, _ := json.Marshal(header)
-	_, _ = conn.Write(append(b, '\n'))
-	if payload != nil {
-		_, _ = conn.Write(payload)
-	}
+	writeWyomingFrame(conn, header, payload)
 }
 
 func (f *weirdFake) handle(conn net.Conn) {
 	defer conn.Close()
 	r := bufio.NewReader(conn)
 	for {
-		line, err := r.ReadBytes('\n')
+		_, header, err := readWyomingFrame(r)
 		if err != nil {
 			return
-		}
-		var header map[string]any
-		if err := json.Unmarshal(line, &header); err != nil {
-			return
-		}
-		if n, ok := header["payload_length"].(float64); ok && n > 0 {
-			if _, err := io.CopyN(io.Discard, r, int64(n)); err != nil {
-				return
-			}
 		}
 		switch header["type"] {
 		case "transcribe":
 			// 读掉 audio-start/chunk/stop。
 			for {
-				l2, err := r.ReadBytes('\n')
+				_, h2, err := readWyomingFrame(r)
 				if err != nil {
 					return
-				}
-				var h2 map[string]any
-				_ = json.Unmarshal(l2, &h2)
-				if n, ok := h2["payload_length"].(float64); ok && n > 0 {
-					_, _ = io.CopyN(io.Discard, r, int64(n))
 				}
 				if h2["type"] == "audio-stop" {
 					break
@@ -84,21 +61,24 @@ func (f *weirdFake) handle(conn net.Conn) {
 			}
 			if f.mode == "unknown" {
 				for i := 0; i < 20; i++ {
-					f.write(conn, map[string]any{"type": "mystery-event", "n": i}, nil)
+					f.write(conn, map[string]any{"type": "mystery-event", "data": map[string]any{"n": i}}, nil)
 				}
 				return
 			}
-			f.write(conn, map[string]any{"type": "transcript", "text": "你好"}, nil)
+			f.write(conn, map[string]any{"type": "transcript", "data": map[string]any{"text": "你好"}}, nil)
 		case "synthesize":
 			rate := 16000
 			if f.mode == "rate8000" {
 				rate = 8000
 			}
-			f.write(conn, map[string]any{"type": "audio-start", "rate": rate, "width": 2, "channels": 1}, nil)
-			f.write(conn, map[string]any{"type": "audio-chunk"}, make([]byte, 640))
-			f.write(conn, map[string]any{"type": "audio-stop"}, nil)
+			if f.mode == "rate192k" {
+				rate = 192000
+			}
+			f.write(conn, map[string]any{"type": "audio-start", "data": map[string]any{"rate": rate, "width": 2, "channels": 1}}, nil)
+			f.write(conn, map[string]any{"type": "audio-chunk", "data": map[string]any{"rate": rate, "width": 2, "channels": 1}}, make([]byte, 640))
+			f.write(conn, map[string]any{"type": "audio-stop", "data": map[string]any{}}, nil)
 		default:
-			f.write(conn, map[string]any{"type": "error", "text": "未知类型"}, nil)
+			f.write(conn, map[string]any{"type": "error", "data": map[string]any{"text": "未知类型"}}, nil)
 		}
 	}
 }
@@ -125,8 +105,12 @@ func TestUnknownEventsAbortP2(t *testing.T) {
 	}
 }
 
-// P2-48：合成采样率不是 16kHz 即报错，不播变调语音。
-func TestSynthesizeWrongRateRejectedP2(t *testing.T) {
+// P2-48：合成采样率不是 16kHz 时重采样到 16kHz 再返回，不播变调语音。
+// （旧行为是直接报错；2026-11-23 真实服务端端到端发现 Piper
+// zh_CN-huayan-medium 原生就是 22050Hz，报错等于 TTS 全灭。）
+// rate8000 的 640 字节 PCM（320 采样 @8kHz = 40ms）应返回 1280 字节
+// （640 采样 @16kHz = 40ms），时长不变。
+func TestSynthesizeResamplesNon16kRateP2(t *testing.T) {
 	f := startWeirdFake(t, "rate8000")
 	defer f.ln.Close()
 	c, err := Dial(f.ln.Addr().String(), 0)
@@ -134,8 +118,26 @@ func TestSynthesizeWrongRateRejectedP2(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
+	out, err := c.Synthesize("你好", "v")
+	if err != nil {
+		t.Fatalf("rate 8000 应重采样后返回，不应报错: %v", err)
+	}
+	if len(out) != 1280 {
+		t.Fatalf("8000Hz 640 字节应重采样为 16kHz 1280 字节，实际 %d", len(out))
+	}
+}
+
+// 采样率荒谬（0 或超 96kHz）时仍报错，不重采样。
+func TestSynthesizeRejectsAbsurdRateP2(t *testing.T) {
+	f := startWeirdFake(t, "rate192k")
+	defer f.ln.Close()
+	c, err := Dial(f.ln.Addr().String(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
 	if _, err := c.Synthesize("你好", "v"); err == nil {
-		t.Fatal("rate 8000 的合成应报错")
+		t.Fatal("rate 192000 的合成应报错")
 	} else if !strings.Contains(err.Error(), "采样率") {
 		t.Fatalf("错误应说明采样率，实际 %v", err)
 	}

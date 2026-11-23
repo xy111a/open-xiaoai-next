@@ -33,8 +33,8 @@ type ProbeResult struct {
 	Addr string
 	// Kind 是 "stt" 或 "tts"。
 	Kind string
-	// Info 是 describe 拿到的原始 info 头（失败时为 nil），
-	// 供调用方/排查看模型与语言。
+	// Info 是 describe 拿到的 info 事件的 data（如 asr/tts 服务列表，
+	// 失败时为 nil），供调用方/排查看模型与语言。
 	Info map[string]any
 	// Checks 是按执行顺序的各项检查。
 	Checks []ProbeCheck
@@ -76,8 +76,8 @@ func probeCheck(name string, ok bool, detail string) ProbeCheck {
 	return ProbeCheck{Name: name, OK: ok, Detail: detail}
 }
 
-// describeInfoNames 从 info 头里取某类服务（如 "asr" / "tts"）
-// 的名字列表，供 Detail 展示（rhasspy 的 info 形如
+// describeInfoNames 从 info data 里取某类服务（如 "asr" / "tts"）
+// 的名字列表，供 Detail 展示（rhasspy 的 info data 形如
 // {"asr": [{"name": "whisper", "languages": ["zh"], ...}]}）。
 func describeInfoNames(info map[string]any, key string) []string {
 	raw, ok := info[key].([]any)
@@ -167,7 +167,7 @@ func ProbeSTT(addr string, timeout time.Duration) ProbeResult {
 
 // ProbeTTS 按 HA 的用法验证 Piper：dial → describe（须有 tts）→
 // synthesize "你好"（须返回非空、偶数长度的 16kHz PCM；
-// 采样率已由 Synthesize 内部按 audio-start 的 rate 校验）。
+// 服务端非 16kHz 时 Synthesize 内部重采样到 16kHz）。
 // timeout<=0 时默认 10 秒。
 func ProbeTTS(addr string, timeout time.Duration) ProbeResult {
 	if timeout <= 0 {
