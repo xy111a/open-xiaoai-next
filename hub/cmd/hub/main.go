@@ -373,12 +373,9 @@ func (h *hubHandler) OnAudioFrame(deviceID string, data []byte) {
 		return
 	}
 	if err := h.pipeline.FramePCM(context.Background(), deviceID, pcm); err != nil {
+		// P0-3：FramePCM 只返回同步错误——settle 的异步回答错误走
+		// Pipeline.OnError 播报，不经过这里；只记日志。
 		log.Printf("voice frame: %v", err)
-		// P1-2：STT/TTS 不可用或管线繁忙时，播一句降级回复而不是静默。
-		// speakText 内部会在 TTS 为 nil 时只记日志，不 panic。
-		if isVoiceServiceError(err) && h.speakText != nil {
-			h.speakText(deviceID, "语音服务暂时没连上，请稍后再试")
-		}
 	}
 }
 
@@ -408,26 +405,12 @@ func (h *hubHandler) OnKWSWake(ev kws.WakeEvent) {
 	h.OnWake(ev.DeviceID, transport.Wake{WakeWord: ev.Keyword, RMSdB: rmsdB, TsMs: ev.TimestampMs})
 }
 
-// isVoiceServiceError 判断语音错误是否属于“下游服务不可用”类（P1-2 降级
-// 回复只针对这类错误；识别/路由等普通错误不重复播报）。
-func isVoiceServiceError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "STT 不可用") ||
-		strings.Contains(msg, "TTS 不可用") ||
-		strings.Contains(msg, "语音管线繁忙")
-}
-
 func (h *hubHandler) OnAudioEnd(deviceID string) {
 	// 对讲会话结束。
 	h.intercom.End(deviceID)
 	if err := h.pipeline.End(context.Background(), deviceID); err != nil {
+		// P0-3：与 OnAudioFrame 同理，异步回答错误走 Pipeline.OnError。
 		log.Printf("voice end: %v", err)
-		if isVoiceServiceError(err) && h.speakText != nil {
-			h.speakText(deviceID, "语音服务暂时没连上，请稍后再试")
-		}
 	}
 }
 
@@ -446,11 +429,20 @@ func (h *hubHandler) OnRoomClaim(deviceID string, room string) {
 		}
 		return
 	}
+	// 记下认领前的旧房间：保存失败回滚时恢复它（而不是直接清空）。
+	prevRoom := ""
+	if d, ok := h.reg.Get(deviceID); ok {
+		prevRoom = d.Room
+	}
 	if !h.reg.SetRoom(deviceID, room) {
 		return
 	}
 	// 写回 config.yaml 持久化。P1-32：Save 失败必须记日志，不许吞掉
 	//（只读挂载下房间认领重启后会丢失，操作员要能从日志看到）。
+	// P0-2：Save 失败时不要回 room_ok——用户会以为认领成功，重启后
+	// 认领丢失；改回 room_reject，并回滚本次认领的内存状态（注册表
+	// 与配置里的设备条目），免得之后一次无关保存把这次被拒的认领
+	// 又写进磁盘。
 	// P1-22：与 Web PUT 共用 cfgMu（P1-23 的唯一临时文件只防写坏，
 	// 不防两边同时写丢字段），持锁期间写配置 + 落盘。
 	if h.cfgMu != nil {
@@ -461,7 +453,17 @@ func (h *hubHandler) OnRoomClaim(deviceID string, room string) {
 		Model: mustModel(h.reg, deviceID), IP: mustIP(h.reg, deviceID), Room: room,
 	}
 	if err := h.cfg.Save(h.cfgPath); err != nil {
-		log.Printf("房间认领保存失败（重启后认领会丢失）: %v", err)
+		log.Printf("房间认领保存失败: %v", err)
+		delete(h.cfg.Devices, deviceID)
+		if prevRoom != "" {
+			h.reg.SetRoom(deviceID, prevRoom)
+		} else {
+			h.reg.ClearRoom(deviceID)
+		}
+		if c, ok := h.server.Conn(deviceID); ok {
+			_ = c.SendJSON(map[string]string{"type": "room_reject", "reason": "保存失败，请重试"})
+		}
+		return
 	}
 	if c, ok := h.server.Conn(deviceID); ok {
 		_ = c.SendJSON(map[string]string{"type": "room_ok", "room": room})
@@ -1192,6 +1194,17 @@ func main() {
 		}
 		h.playFrames(deviceID, frames)
 	}
+
+	// P0-3：异步回答失败时播一句区分性回复。以前 settle 的后台 goroutine
+	// 里 answer 出错只记日志，用户说完话后毫无声音；现在经 onError 按
+	// 错误类型播报（LLM/HA/提醒/STT/TTS/繁忙/超时，见 voice.ErrorReply）。
+	// speakText 晚绑定，回调里调用时再读字段；取消（新唤醒打断）与空回复
+	// 不经过 onError，不会误播。
+	h.pipeline.SetOnError(func(deviceID string, err error) {
+		if h.speakText != nil {
+			h.speakText(deviceID, voice.ErrorReply(err))
+		}
+	})
 
 	// 仲裁：窗口关闭后走 h.onArbitrationResult——赢家开会话 + 发
 	// wake_win，输家发 wake_lose（P1-13：赢家已断线时按 RMS 降序试

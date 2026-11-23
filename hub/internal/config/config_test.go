@@ -146,6 +146,42 @@ func TestSaveRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSaveFallbackDirectWrite：P0-2 的 rename 回退路径——直接写原文件
+// 应写出内容、权限 0600，二次覆盖也应成功。
+// 注：EBUSY 分支本身（rename 到 bind-mount 挂载点被内核拒绝）已在
+// unshare -rm 命名空间里真复现验证过：把目标文件 bind-mount 到自身后
+// Save 成功走回退写出，内容与 0600 权限都对，日志有“改走直接写原文件”
+// 一行；本测试覆盖回退的写路径本身。
+func TestSaveFallbackDirectWrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := writeFileSync(path, []byte("wake_word: 你好小李\n"), 0600); err != nil {
+		t.Fatalf("writeFileSync 失败: %v", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "wake_word: 你好小李\n" {
+		t.Fatalf("回退写出内容不对: %q", b)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0600 {
+		t.Fatalf("回退写出权限应为 0600，实际 %o", st.Mode().Perm())
+	}
+	// 二次写覆盖同一文件也应成功（模拟 rename 失败后反复保存）。
+	if err := writeFileSync(path, []byte("wake_word: 你好小明\n"), 0600); err != nil {
+		t.Fatalf("二次 writeFileSync 失败: %v", err)
+	}
+	b, _ = os.ReadFile(path)
+	if string(b) != "wake_word: 你好小明\n" {
+		t.Fatalf("二次写出内容不对: %q", b)
+	}
+}
+
 func TestTokenFromEnv(t *testing.T) {
 	t.Setenv("OPEN_XIAOAI_TOKEN", "tok-123")
 	if got := Token(); got != "tok-123" {
