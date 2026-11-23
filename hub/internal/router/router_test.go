@@ -331,7 +331,7 @@ func TestMusicDirect(t *testing.T) {
 	if reply != "" {
 		t.Fatalf("快路径下直连点歌成功应回空回复，实际 %q", reply)
 	}
-	if got := mpdLn.commands(); len(got) != 3 || got[0] != "clear" || got[1] != "add http://music.example.com/12345.mp3" || got[2] != "play" {
+	if got := mpdLn.commands(); len(got) != 3 || got[0] != "clear" || got[1] != `add "http://music.example.com/12345.mp3"` || got[2] != "play" {
 		t.Fatalf("MPD 应收到 clear/add/play，实际 %v", got)
 	}
 }
@@ -362,7 +362,7 @@ func TestMusicFallbackNeteaseMPD(t *testing.T) {
 	if reply != "" {
 		t.Fatalf("快路径下降级点歌成功应回空回复，实际 %q", reply)
 	}
-	if got := mpdLn.commands(); len(got) != 3 || got[1] != "add http://music.example.com/12345.mp3" {
+	if got := mpdLn.commands(); len(got) != 3 || got[1] != `add "http://music.example.com/12345.mp3"` {
 		t.Fatalf("MPD 应收到 clear/add/play，实际 %v", got)
 	}
 }

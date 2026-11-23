@@ -96,7 +96,7 @@ func TestMPDStatusCurrentQueue(t *testing.T) {
 	f.mu.Lock()
 	got := append([]string{}, f.cmds[n:]...)
 	f.mu.Unlock()
-	want := []string{"clear", "add 青花瓷.mp3", "play"}
+	want := []string{"clear", `add "青花瓷.mp3"`, "play"}
 	if len(got) != len(want) {
 		t.Fatalf("PlayFile 应发 %v，实际 %v", want, got)
 	}

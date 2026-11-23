@@ -148,8 +148,8 @@ func TestPluginIntegrationSkillAgentMusic(t *testing.T) {
 		t.Fatalf("快路径下主路失败兜底播出成功应回空回复，实际 %q", reply)
 	}
 	joined := strings.Join(mpdFake.commands(), "\n")
-	if !strings.Contains(joined, "add 青花瓷.mp3") {
-		t.Fatalf("MPD 应收到 add 青花瓷.mp3，实际 %v", mpdFake.commands())
+	if !strings.Contains(joined, `add "青花瓷.mp3"`) {
+		t.Fatalf("MPD 应收到 add \"青花瓷.mp3\"，实际 %v", mpdFake.commands())
 	}
 	if _, source, ok := r.CurrentTrack(); !ok || source != "local" {
 		t.Fatalf("当前曲来源应记为 local，实际 %q ok=%v", source, ok)
