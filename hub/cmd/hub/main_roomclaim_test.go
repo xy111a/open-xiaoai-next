@@ -108,6 +108,7 @@ func TestRoomClaimChangeRoomSaveFailureRestoresPrev(t *testing.T) {
 		t.Fatalf("换房间失败后配置应恢复客厅旧条目，实际 %+v", h.cfg.Devices)
 	}
 }
+
 // TestRoomClaimSaveFailureRejects：Save 失败时收 room_reject、不收 room_ok，
 // 且注册表与配置里的认领被回滚（不留痕迹）。
 func TestRoomClaimSaveFailureRejects(t *testing.T) {
