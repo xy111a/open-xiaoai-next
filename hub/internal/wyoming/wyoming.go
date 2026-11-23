@@ -52,6 +52,15 @@ var (
 	synthesizeTimeout = 120 * time.Second // Synthesize 整轮上限
 )
 
+// retryFastWindow 是 Dialer 重试的“快失败”窗口（P1-8，2026-11-23 审查）：
+// 首次调用在 10s 内失败（建连失败/立即失败）才重试一次；首次调用已耗时
+// 很久（读写超时 120s）时不再重试——否则单次 STT/TTS 最坏耗时从 120s
+// 翻倍到约 240s，远超语音管线 120s 的 answerTimeout。10s 的分界：建连
+// 失败通常在毫秒~3s 内返回；超过 10s 的失败基本是服务端已在处理中途挂掉，
+// 立即重拨大概率同样慢，不如让调用方快速失败、语音管线播报降级回复。
+// var 而非 const，供测试缩短（与 transcribeTimeout 同款）。
+var retryFastWindow = 10 * time.Second
+
 // Client 是一个 Wyoming 连接。
 // P1-20：同一连接上的读写必须串行——两台设备 + 提醒 goroutine 并发调
 // 同一 STT/TTS 连接时，旧代码读写交错（写事件 A 头 + 写事件 B 头再读
@@ -399,7 +408,8 @@ func (d *Dialer) Close() error {
 	return err
 }
 
-// Transcribe 识别：出错时丢旧连接、重拨重试一次。
+// Transcribe 识别：快失败时丢旧连接、重拨重试一次；
+// 首次调用已耗时很久才失败时不重试（P1-8：见 retryFastWindow）。
 // 失败时错误带“STT 不可用”前缀（P1-27：语音管线的降级播报靠此识别）。
 func (d *Dialer) Transcribe(pcm []byte, language string) (string, error) {
 	c, err := d.get()
@@ -409,9 +419,15 @@ func (d *Dialer) Transcribe(pcm []byte, language string) (string, error) {
 	if c == nil {
 		return "", fmt.Errorf("STT 不可用（Wyoming 未连接）: 连接为空")
 	}
+	start := time.Now()
 	text, err := c.Transcribe(pcm, language)
 	if err == nil {
 		return text, nil
+	}
+	// P1-8：首次调用已耗时很久才失败（读写超时）时不重试——
+	// 重试一次会把最坏耗时翻倍到约 240s。
+	if time.Since(start) > retryFastWindow {
+		return "", fmt.Errorf("STT 不可用: %w", err)
 	}
 	d.drop(c)
 	c2, err := d.get()
@@ -428,7 +444,8 @@ func (d *Dialer) Transcribe(pcm []byte, language string) (string, error) {
 	return text, nil
 }
 
-// Synthesize 合成：出错时丢旧连接、重拨重试一次。
+// Synthesize 合成：快失败时丢旧连接、重拨重试一次；
+// 首次调用已耗时很久才失败时不重试（P1-8：见 retryFastWindow）。
 // 失败时错误带“TTS 不可用”前缀（P1-27：语音管线的降级播报靠此识别）。
 func (d *Dialer) Synthesize(text, voice string) ([]byte, error) {
 	c, err := d.get()
@@ -438,9 +455,15 @@ func (d *Dialer) Synthesize(text, voice string) ([]byte, error) {
 	if c == nil {
 		return nil, fmt.Errorf("TTS 不可用（Wyoming 未连接）: 连接为空")
 	}
+	start := time.Now()
 	out, err := c.Synthesize(text, voice)
 	if err == nil {
 		return out, nil
+	}
+	// P1-8：首次调用已耗时很久才失败（读写超时）时不重试——
+	// 重试一次会把最坏耗时翻倍到约 240s。
+	if time.Since(start) > retryFastWindow {
+		return nil, fmt.Errorf("TTS 不可用: %w", err)
 	}
 	d.drop(c)
 	c2, err := d.get()

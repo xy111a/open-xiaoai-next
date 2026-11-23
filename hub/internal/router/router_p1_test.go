@@ -215,7 +215,9 @@ func TestMemoryRecall(t *testing.T) {
 
 func TestTimedAction(t *testing.T) {
 	deps, rem, _, _ := testDeps(t)
-	r := New(deps, nil)
+	// P1-12：定时动作建提醒前校验别名表——测试路由须配“客厅灯”别名，
+	// 否则“关客厅灯”命中不了别名表、当场拒绝。
+	r := New(deps, map[string]string{"客厅灯": "light.living_room"})
 	ctx := context.Background()
 	reply, err := r.Route(ctx, "lx06-1", "2 小时后关灯")
 	if err != nil {

@@ -59,26 +59,36 @@ type Store struct {
 	mu      sync.Mutex
 	items   map[string]*Reminder
 	path    string // 持久化文件（JSON）
-	onFire  func(r Reminder)
+	onFire  func(r Reminder) error
 	stopCh  chan struct{}
 	started bool
 	// dirty 是“内存已改、落盘失败待重试”标记（P2-14）：saveLocked
 	// 失败时置位，下次 tick 重试保存，不让一次磁盘错误丢掉整批变更。
 	dirty bool
+	// attempts 是执行失败的重试计数（P1-12）：once/action 执行失败时
+	// 保留并至多重试 1 次；计数只放内存（重启后清零，可接受——
+	// 重启后提醒按 Next 正常触发，失败计数重新算）。
+	attempts map[string]int
 }
 
-// New 新建 Store。path 为空表示不持久化。onFire 在提醒到点时被调用。
-func New(path string, onFire func(r Reminder)) *Store {
+// reminderRetryDelay 是一次性提醒执行失败后的重试间隔（P1-12）：1 分钟。
+const reminderRetryDelay = time.Minute
+
+// New 新建 Store。path 为空表示不持久化。onFire 在提醒到点时被调用，
+// 返回 nil 表示执行成功（once/action 随后删除），返回 error 表示
+// 执行失败（once/action 保留并至多重试 1 次）。
+func New(path string, onFire func(r Reminder) error) *Store {
 	return &Store{
-		items:  map[string]*Reminder{},
-		path:   path,
-		onFire: onFire,
-		stopCh: make(chan struct{}),
+		items:    map[string]*Reminder{},
+		path:     path,
+		onFire:   onFire,
+		stopCh:   make(chan struct{}),
+		attempts: map[string]int{},
 	}
 }
 
 // SetOnFire 设置到点回调（启动调度前调）。
-func (s *Store) SetOnFire(fn func(r Reminder)) {
+func (s *Store) SetOnFire(fn func(r Reminder) error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onFire = fn
@@ -196,6 +206,7 @@ func (s *Store) Cancel(id string) (bool, error) {
 		return false, nil
 	}
 	delete(s.items, id)
+	delete(s.attempts, id)
 	if err := s.saveLocked(); err != nil {
 		s.dirty = true
 		log.Printf("reminders: 取消 %s 后落盘失败（重启后可能复活）: %v", id, err)
@@ -213,6 +224,7 @@ func (s *Store) CancelByText(text string) (int, error) {
 	for id, it := range s.items {
 		if it.Text == text {
 			delete(s.items, id)
+			delete(s.attempts, id)
 			n++
 		}
 	}
@@ -302,13 +314,18 @@ func (s *Store) tick(now time.Time) {
 		}
 		cp := *it
 		due = append(due, &cp)
-		changed = true
 		// 算下一次。
 		switch it.Kind {
 		case KindOnce, KindAction:
-			// KindAction 与 KindOnce 同语义：触发一次后删除。
-			delete(s.items, it.ID)
+			// P1-12（2026-11-23 审查）：一次性提醒不再先删后执行——
+			// 执行失败（Route 报错、无在线设备）时提醒就静默丢了。
+			// 改为先把 Next 顺延一个重试间隔（防执行期间下一轮 tick
+			// 重复触发），执行成功后 fireAsync 再删；失败保留、
+			// 1 分钟后重试（见 fireAsync）。
+			changed = true
+			it.Next = now.Add(reminderRetryDelay)
 		case KindDaily:
+			changed = true
 			next, err := NextDaily(it.At, now)
 			if err == nil {
 				it.Next = next
@@ -316,6 +333,7 @@ func (s *Store) tick(now time.Time) {
 				delete(s.items, it.ID)
 			}
 		case KindInterval:
+			changed = true
 			if it.Every > 0 {
 				it.Next = now.Add(time.Duration(it.Every) * time.Minute)
 			} else {
@@ -324,6 +342,7 @@ func (s *Store) tick(now time.Time) {
 		default:
 			// P1-24：未知 Kind（旧数据/手写文件）删除并记日志——
 			// 否则 Next 恒 ≤ now，每秒触发一次 onFire 永不停。
+			changed = true
 			log.Printf("reminders: 删除未知类型提醒 %s（kind=%q）", it.ID, it.Kind)
 			delete(s.items, it.ID)
 		}
@@ -345,7 +364,54 @@ func (s *Store) tick(now time.Time) {
 	// 执行（TTS 合成 + 网络发送慢也不拖住 1s tick）。
 	for _, r := range due {
 		if onFire != nil {
-			go onFire(*r)
+			go s.fireAsync(*r, onFire)
+		}
+	}
+}
+
+// fireAsync 执行一条到点提醒并按结果处理 once/action 的删除/重试：
+// onFire 返回 nil 即成功，执行完删除；失败时保留并至多重试 1 次
+// （Next 已在 tick 里顺延 1 分钟）；第二次失败即删除并记 error 日志，
+// 不再无限重试，也不再静默丢失。daily/interval 不走删除逻辑
+// （tick 里已重算 Next）。
+// 注意：删除是异步的（onFire 返回后才删）——调用方不要假设回调
+// 到达时表里已删；测试应轮询 List() 等删除完成。
+func (s *Store) fireAsync(r Reminder, onFire func(r Reminder) error) {
+	err := onFire(r)
+	if r.Kind != KindOnce && r.Kind != KindAction {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	deleted := false
+	if err == nil {
+		if _, ok := s.items[r.ID]; ok {
+			delete(s.items, r.ID)
+			deleted = true
+		}
+		delete(s.attempts, r.ID)
+	} else {
+		if s.attempts == nil {
+			s.attempts = map[string]int{}
+		}
+		s.attempts[r.ID]++
+		if s.attempts[r.ID] >= 2 {
+			log.Printf("reminders: 提醒 %s 执行失败，已重试 1 次后放弃: %v", r.ID, err)
+			if _, ok := s.items[r.ID]; ok {
+				delete(s.items, r.ID)
+				deleted = true
+			}
+			delete(s.attempts, r.ID)
+		} else {
+			// 保留：Next 已在 tick 里顺延 1 分钟，1 分钟后重试。
+			// 只记 ID 与错误，不记提醒文本（提醒内容可能含隐私，见 P2-43）。
+			log.Printf("reminders: 提醒 %s 执行失败，1 分钟后重试: %v", r.ID, err)
+		}
+	}
+	if deleted {
+		if serr := s.saveLocked(); serr != nil {
+			s.dirty = true
+			log.Printf("reminders: 提醒落盘失败（下次 tick 重试）: %v", serr)
 		}
 	}
 }

@@ -12,7 +12,7 @@ import (
 func TestDoubleStartNoDoubleFireP2(t *testing.T) {
 	dir := t.TempDir()
 	var n atomic.Int32
-	s := New(filepath.Join(dir, "r.json"), func(r Reminder) { n.Add(1) })
+	s := New(filepath.Join(dir, "r.json"), func(r Reminder) error { n.Add(1); return nil })
 	if _, err := s.Add(Reminder{Kind: KindOnce, Text: "喝水", Next: time.Now().Add(100 * time.Millisecond)}); err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +29,7 @@ func TestDoubleStartNoDoubleFireP2(t *testing.T) {
 func TestStopThenStartAgainP2(t *testing.T) {
 	dir := t.TempDir()
 	fired := make(chan struct{}, 2)
-	s := New(filepath.Join(dir, "r.json"), func(r Reminder) { fired <- struct{}{} })
+	s := New(filepath.Join(dir, "r.json"), func(r Reminder) error { fired <- struct{}{}; return nil })
 	s.Start()
 	s.Stop()
 	// Stop 后再次 Start 应能正常调度（旧代码 stopCh 已关闭，新 goroutine

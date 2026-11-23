@@ -419,6 +419,19 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("kws.keywords 里有空唤醒词")
 			}
 		}
+		// P1-1（2026-11-23 审查）：wake_word 必须在 kws.keywords 里——
+		// 否则 Hub 拿“你好小李”唤醒、边车却只检测 keywords 里的词，
+		// 唤醒永远触发不了，且启动时没有任何报错。比对时两边都去首尾空白。
+		found := false
+		for _, kw := range c.KWS.Keywords {
+			if strings.TrimSpace(kw) == strings.TrimSpace(c.WakeWord) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("wake_word %q 不在 kws.keywords 里（kws.enabled=true 时唤醒词必须与边车关键词一致，边车只检测 keywords 里的词）", c.WakeWord)
+		}
 		// N-P2-10 / S-14：边车指纹须是 64 位 hex（大小写不限，SHA-256），
 		// 否则配了也认不出；归一化与 kws 包共用 NormalizeFingerprintHex。
 		if c.KWS.Fingerprint != "" {
