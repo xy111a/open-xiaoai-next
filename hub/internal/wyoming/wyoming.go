@@ -1,6 +1,16 @@
 // Package wyoming 是 Wyoming 协议客户端（HA 官方语音协议）。
-// 协议格式：每条消息 = 一行 JSON 头（\n 结尾）+ 可选的二进制负载。
-// 头里 type 区分消息；payload 长度由头里的字段决定（音频帧直接跟在头后面）。
+// Wire 格式（Python 参考库 wyoming 1.11.0 的 async_write_event /
+// async_read_event，一行 JSON 头 + 分离的 data JSON + 可选二进制负载）：
+//
+//	{"type": ..., "version": "1.11.0", "data_length": N, "payload_length": M}\n
+//	<N 字节 data JSON><M 字节 payload>
+//
+// data 不在头行里：写侧把 header["data"] 序列化后作为 data_length 字节
+// 紧跟头行；读侧按 data_length 读回 data JSON 再 merge 进头（头行里若
+// 也有内联 data，分离字节优先）。data 为空时不发 data_length。
+// 2026-11-23 彩排 P0-1：旧代码把字段写在头行顶层（无 data_length），
+// whisper/piper 的 from_event 读 event.data["rate"]/["text"] 失败，
+// STT/TTS 全灭；且读侧不消费 data_length 字节，后续帧全部错位。
 // STT：transcribe → transcript；TTS：synthesize → audio-start/audio-chunk/audio-stop。
 //
 // HA 融合（probe.go）：HA 的 Wyoming 集成就是这样一个外部客户端——
@@ -23,15 +33,28 @@ import (
 	"time"
 )
 
+// wyomingVersion 是写事件时头行带的协议版本号（与 Python 参考库
+// async_write_event 一致；服务端读侧忽略它，带上只为与参考实现同形）。
+const wyomingVersion = "1.11.0"
+
 // maxUnknownEvents 是 Transcribe/Synthesize 读循环里连续未知事件的上限
 // （P2-17）：旧代码遇未知类型只静默循环，全靠 120s 整体超时兜底；
 // 现连续 10 个未知事件即报错（服务端行为异常时早失败、不空转）。
 const maxUnknownEvents = 10
 
 // expectedSampleRate 是语音管线假定的采样率（P2-48）：
-// Piper 应返回 16kHz 单声道 PCM；audio-start 带的 rate 不是 16000
-// 即报错，不让变调/变速的语音悄悄播出去。
+// 下游 Opus 编码固定 16kHz；服务端以其他采样率合成时，Synthesize
+// 内部重采样到 16kHz 再返回（Piper zh_CN-huayan-medium 实测 22050Hz）。
 const expectedSampleRate = 16000
+
+// maxSampleRate 是服务端 audio-start 采样率的上界：超过即视为异常，
+// Synthesize 报错而不重采样（防垃圾 rate 导致超大输出）。
+const maxSampleRate = 96000
+
+// minSampleRate 是服务端 audio-start 采样率的下界：低于即视为异常。
+// 8000Hz 是电话音质下限；低于它时 resamplePCM16 会把输入放大
+// 2 倍以上（100Hz 时 160 倍），可能因巨额分配拖垮 Hub（2026-11-23 审阅 O1）。
+const minSampleRate = 8000
 
 // P1-1 防护上限：单条 Wyoming 负载（音频 chunk）最大 1MB；
 // 头行（JSON）最大 64KB；读写各设 10s deadline。
@@ -85,11 +108,13 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
-// readEvent 读一条事件：JSON 头 + 可选负载。
-// 返回头 map 与负载 bytes。音频负载是原始 PCM（小端 int16）。
-// P1-1：全程设 10s 读写 deadline；头行限长读取；payload_length 经
-// parsePayloadLength 校验（非数字/负数/非整数/超 1MB 一律报错，调用方
-// 收到错误后应断开连接——本函数只返回错误，不自行 Close）。
+// readEvent 读一条事件：JSON 头行 + 分离的 data JSON + 可选负载。
+// 返回的头 map 已把 data merge 进 header["data"]（参考库
+// async_read_event 的行为：头行内联 data 与 data_length 分离字节
+// 合并，分离字节优先）。
+// P1-1：全程设 10s 读写 deadline；头行限长读取；data_length /
+// payload_length 经 parseLength 校验（非数字/负数/非整数/超 1MB
+// 一律报错，调用方收到错误后应断开连接——本函数只返回错误，不自行 Close）。
 func (c *Client) readEvent() (map[string]any, []byte, error) {
 	if err := c.conn.SetReadDeadline(time.Now().Add(readEventTimeout)); err != nil {
 		return nil, nil, err
@@ -104,6 +129,33 @@ func (c *Client) readEvent() (map[string]any, []byte, error) {
 	var header map[string]any
 	if err := json.Unmarshal(line, &header); err != nil {
 		return nil, nil, fmt.Errorf("wyoming: 头解析失败: %w", err)
+	}
+	// data_length 分离字节：读回 data JSON，merge 进 header["data"]。
+	// data_length 为 0 时参考库不读分离字节（async_read_event 只在
+	// data_length > 0 时读），这里同样跳过，否则空字节 Unmarshal 会报错。
+	if l, ok := header["data_length"]; ok {
+		n, err := parseLength(l, "data_length", MaxPayloadLength)
+		if err != nil {
+			return nil, nil, err
+		}
+		if n > 0 {
+			dataBytes := make([]byte, n)
+			if _, err := io.ReadFull(c.reader, dataBytes); err != nil {
+				return nil, nil, err
+			}
+			var data map[string]any
+			if err := json.Unmarshal(dataBytes, &data); err != nil {
+				return nil, nil, fmt.Errorf("wyoming: data 解析失败: %w", err)
+			}
+			merged, _ := header["data"].(map[string]any)
+			if merged == nil {
+				merged = make(map[string]any, len(data))
+			}
+			for k, v := range data {
+				merged[k] = v
+			}
+			header["data"] = merged
+		}
 	}
 	var payload []byte
 	if l, ok := header["payload_length"]; ok {
@@ -137,29 +189,39 @@ func (c *Client) readHeaderLine() ([]byte, error) {
 	}
 }
 
-// parsePayloadLength 校验 Wyoming 头里的 payload_length：
-// 必须是 JSON 数字、非负、整数，且 ≤ MaxPayloadLength。
-func parsePayloadLength(v any) (int, error) {
+// parseLength 校验 Wyoming 头里的长度字段（data_length / payload_length）：
+// 必须是 JSON 数字、非负、整数，且 ≤ max。
+func parseLength(v any, field string, max int) (int, error) {
 	f, ok := v.(float64)
 	if !ok {
-		return 0, fmt.Errorf("wyoming: payload_length 不是数字: %T", v)
+		return 0, fmt.Errorf("wyoming: %s 不是数字: %T", field, v)
 	}
 	if math.IsNaN(f) || math.IsInf(f, 0) {
-		return 0, fmt.Errorf("wyoming: payload_length 不是有限数字: %v", f)
+		return 0, fmt.Errorf("wyoming: %s 不是有限数字: %v", field, f)
 	}
 	if f < 0 {
-		return 0, fmt.Errorf("wyoming: payload_length 为负: %v", f)
+		return 0, fmt.Errorf("wyoming: %s 为负: %v", field, f)
 	}
 	if f != math.Trunc(f) {
-		return 0, fmt.Errorf("wyoming: payload_length 不是整数: %v", f)
+		return 0, fmt.Errorf("wyoming: %s 不是整数: %v", field, f)
 	}
-	if f > MaxPayloadLength {
-		return 0, fmt.Errorf("wyoming: payload_length 超限: %v > %d", f, MaxPayloadLength)
+	if f > float64(max) {
+		return 0, fmt.Errorf("wyoming: %s 超限: %v > %d", field, f, max)
 	}
 	return int(f), nil
 }
 
+// parsePayloadLength 校验 Wyoming 头里的 payload_length：
+// 必须是 JSON 数字、非负、整数，且 ≤ MaxPayloadLength。
+func parsePayloadLength(v any) (int, error) {
+	return parseLength(v, "payload_length", MaxPayloadLength)
+}
+
 // writeEvent 发一条事件。P1-1：每次写设 10s deadline，写死等不再无限挂起。
+// Wire 格式（参考库 async_write_event）：调用方传
+// {"type": ..., "data": {...}}，这里把 data 拆出头行——头行只含
+// type/version/data_length/payload_length，data JSON 紧跟头行，
+// payload 最后；data 为空时不发 data_length。
 func (c *Client) writeEvent(header map[string]any, payload []byte) error {
 	if err := c.conn.SetWriteDeadline(time.Now().Add(readEventTimeout)); err != nil {
 		return err
@@ -167,19 +229,39 @@ func (c *Client) writeEvent(header map[string]any, payload []byte) error {
 	// 清写 deadline：best-effort，失败无处可报（函数已在返回；
 	// 连接关闭时 deadline 随之失效），故显式丢弃错误。
 	defer func() { _ = c.conn.SetWriteDeadline(time.Time{}) }()
-	b, err := json.Marshal(header)
-	if err != nil {
-		return err
-	}
-	if payload != nil {
-		header["payload_length"] = len(payload)
-		b, err = json.Marshal(header)
+	var dataBytes []byte
+	if data, ok := header["data"].(map[string]any); ok && len(data) > 0 {
+		b, err := json.Marshal(data)
 		if err != nil {
 			return err
 		}
+		dataBytes = b
+	}
+	line := make(map[string]any, len(header)+2)
+	for k, v := range header {
+		if k == "data" {
+			continue
+		}
+		line[k] = v
+	}
+	line["version"] = wyomingVersion
+	if dataBytes != nil {
+		line["data_length"] = len(dataBytes)
+	}
+	if payload != nil {
+		line["payload_length"] = len(payload)
+	}
+	b, err := json.Marshal(line)
+	if err != nil {
+		return err
 	}
 	if _, err := c.conn.Write(append(b, '\n')); err != nil {
 		return err
+	}
+	if dataBytes != nil {
+		if _, err := c.conn.Write(dataBytes); err != nil {
+			return err
+		}
 	}
 	if payload != nil {
 		if _, err := c.conn.Write(payload); err != nil {
@@ -189,7 +271,17 @@ func (c *Client) writeEvent(header map[string]any, payload []byte) error {
 	return nil
 }
 
+// eventData 取事件头的 data 对象（Wyoming 协议：除 type 与
+// payload_length 外所有字段都在 data 里）。缺失或不是对象时返回 nil，
+// 调用方按字段缺失处理（空串/放行），不 panic。
+func eventData(header map[string]any) map[string]any {
+	data, _ := header["data"].(map[string]any)
+	return data
+}
+
 // Describe 拿服务信息（模型、语言等），用于连通性检查。
+// 返回 info 事件的 data（如 {"asr": [...], "tts": [...]})，
+// 不是整个头——type 字段不在 data 里。
 func (c *Client) Describe() (map[string]any, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -198,7 +290,7 @@ func (c *Client) Describe() (map[string]any, error) {
 
 func (c *Client) describeLocked() (map[string]any, error) {
 	if err := writeWithDeadline(c.conn, 5*time.Second, func() error {
-		return c.writeEvent(map[string]any{"type": "describe"}, nil)
+		return c.writeEvent(map[string]any{"type": "describe", "data": map[string]any{}}, nil)
 	}); err != nil {
 		return nil, err
 	}
@@ -209,7 +301,7 @@ func (c *Client) describeLocked() (map[string]any, error) {
 	if header["type"] != "info" {
 		return nil, fmt.Errorf("wyoming: describe 期望 info，实际 %v", header["type"])
 	}
-	return header, nil
+	return eventData(header), nil
 }
 
 // Transcribe 把一段 16kHz 单声道 PCM 发去 STT，返回识别文本。
@@ -226,12 +318,15 @@ func (c *Client) Transcribe(pcm []byte, language string) (text string, err error
 	}()
 	deadline := time.Now().Add(transcribeTimeout)
 	if err := c.writeEvent(map[string]any{
-		"type": "transcribe", "name": "whisper", "language": language,
+		"type": "transcribe", "data": map[string]any{"name": "whisper", "language": language},
 	}, nil); err != nil {
 		return "", err
 	}
 	// 音频帧：每条 audio-start/audio-chunk/audio-stop；这里一次发完。
-	if err := c.writeEvent(map[string]any{"type": "audio-start", "rate": 16000, "width": 2, "channels": 1}, nil); err != nil {
+	// 参考库 AudioStart/AudioChunk 的 event() 都把 rate/width/channels
+	// 放进 data（AudioChunk.from_event 读 event.data["rate"]，缺了即 KeyError）。
+	audioData := map[string]any{"rate": 16000, "width": 2, "channels": 1}
+	if err := c.writeEvent(map[string]any{"type": "audio-start", "data": audioData}, nil); err != nil {
 		return "", err
 	}
 	const chunk = 4096
@@ -240,12 +335,12 @@ func (c *Client) Transcribe(pcm []byte, language string) (text string, err error
 		if len(pcm) < n {
 			n = len(pcm)
 		}
-		if err := c.writeEvent(map[string]any{"type": "audio-chunk"}, pcm[:n]); err != nil {
+		if err := c.writeEvent(map[string]any{"type": "audio-chunk", "data": audioData}, pcm[:n]); err != nil {
 			return "", err
 		}
 		pcm = pcm[n:]
 	}
-	if err := c.writeEvent(map[string]any{"type": "audio-stop"}, nil); err != nil {
+	if err := c.writeEvent(map[string]any{"type": "audio-stop", "data": map[string]any{}}, nil); err != nil {
 		return "", err
 	}
 	unknown := 0
@@ -259,10 +354,11 @@ func (c *Client) Transcribe(pcm []byte, language string) (text string, err error
 		}
 		switch header["type"] {
 		case "transcript":
-			text, _ := header["text"].(string)
+			text, _ := eventData(header)["text"].(string)
 			return text, nil
 		case "error":
-			return "", fmt.Errorf("wyoming stt error: %v", header["text"])
+			errText, _ := eventData(header)["text"].(string)
+			return "", fmt.Errorf("wyoming stt error: %s", errText)
 		default:
 			// P2-17：未知事件类型计数，连续超限即报错，不静默空转。
 			unknown++
@@ -277,6 +373,9 @@ func (c *Client) Transcribe(pcm []byte, language string) (text string, err error
 }
 
 // Synthesize 把文本发去 TTS，返回 16kHz 单声道 PCM（小端 int16 字节流）。
+// 服务端若以非 16kHz 合成（如 Piper zh_CN-huayan-medium 是 22050Hz，
+// 2026-11-23 真实服务端端到端实测），内部线性插值重采样到 16kHz 再返回，
+// 保证下游 Opus 编码（固定 16kHz）拿到的永远是 16kHz。
 // P1-1：整轮设 synthesizeTimeout 上限；累积 PCM 超 MaxSynthesizeTotal 即
 // 报错（防服务端无限发 chunk 打满内存）；panic 转错误。
 func (c *Client) Synthesize(text, voice string) (pcm []byte, err error) {
@@ -290,10 +389,11 @@ func (c *Client) Synthesize(text, voice string) (pcm []byte, err error) {
 	}()
 	deadline := time.Now().Add(synthesizeTimeout)
 	if err := c.writeEvent(map[string]any{
-		"type": "synthesize", "text": text, "voice": map[string]any{"name": voice},
+		"type": "synthesize", "data": map[string]any{"text": text, "voice": map[string]any{"name": voice}},
 	}, nil); err != nil {
 		return nil, err
 	}
+	sampleRate := expectedSampleRate // audio-start 未带 rate 时按默认 16kHz
 	unknown := 0
 	for {
 		if time.Now().After(deadline) {
@@ -305,11 +405,10 @@ func (c *Client) Synthesize(text, voice string) (pcm []byte, err error) {
 		}
 		switch header["type"] {
 		case "audio-start":
-			// P2-48：校验合成采样率——audio-start 带 rate 且不是 16kHz
-			// 即报错（变调/变速的语音不播）；不带 rate 字段时放行
-			// （旧版 Piper 不发 rate，按默认 16kHz 处理）。
-			if rate, ok := header["rate"].(float64); ok && int(rate) != expectedSampleRate {
-				return nil, fmt.Errorf("wyoming: tts 采样率 %d 不是 %d，拒绝播放", int(rate), expectedSampleRate)
+			// 服务端合成采样率：记下来，结束时重采样到 16kHz。
+			// 旧版 Piper 不发 rate，按默认 16kHz 处理。
+			if rate, ok := eventData(header)["rate"].(float64); ok {
+				sampleRate = int(rate)
 			}
 		case "audio-chunk":
 			if len(pcm)+len(payload) > MaxSynthesizeTotal {
@@ -317,9 +416,16 @@ func (c *Client) Synthesize(text, voice string) (pcm []byte, err error) {
 			}
 			pcm = append(pcm, payload...)
 		case "audio-stop":
+			if sampleRate < minSampleRate || sampleRate > maxSampleRate {
+				return nil, fmt.Errorf("wyoming: tts 采样率 %d 非法，拒绝播放", sampleRate)
+			}
+			if sampleRate != expectedSampleRate {
+				pcm = resamplePCM16(pcm, sampleRate, expectedSampleRate)
+			}
 			return pcm, nil
 		case "error":
-			return nil, fmt.Errorf("wyoming tts error: %v", header["text"])
+			errText, _ := eventData(header)["text"].(string)
+			return nil, fmt.Errorf("wyoming tts error: %s", errText)
 		default:
 			// P2-17：未知事件类型计数，连续超限即报错，不静默空转。
 			unknown++
@@ -331,6 +437,31 @@ func (c *Client) Synthesize(text, voice string) (pcm []byte, err error) {
 			}
 		}
 	}
+}
+
+// resamplePCM16 把单声道 int16 PCM 从 fromRate 线性插值重采样到 toRate。
+// 语音播报够用（Piper 22050→16000 实测）；fromRate==toRate 时原样返回。
+func resamplePCM16(pcm []byte, fromRate, toRate int) []byte {
+	if fromRate == toRate || len(pcm) == 0 {
+		return pcm
+	}
+	in := PCMToInt16(pcm)
+	outLen := len(in) * toRate / fromRate
+	if outLen == 0 {
+		return nil
+	}
+	out := make([]int16, outLen)
+	for i := range out {
+		pos := float64(i) * float64(fromRate) / float64(toRate)
+		idx := int(pos)
+		frac := pos - float64(idx)
+		if idx+1 < len(in) {
+			out[i] = int16(float64(in[idx])*(1-frac) + float64(in[idx+1])*frac)
+		} else {
+			out[i] = in[len(in)-1]
+		}
+	}
+	return Int16ToPCM(out)
 }
 
 // PCMToInt16 把小端 int16 字节流转成采样点（用 binary.LittleEndian，避免手写位运算出错）。

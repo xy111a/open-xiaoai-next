@@ -31,15 +31,16 @@ wake_word_routes:
 # IP 由设备注册时上报；room 由语音认领写入，未认领为空。
 devices: {}
 
-# 音乐文件夹，默认 /volume1/Music；不存在时只警告，本地曲库兜底不可用
-#（点歌仍走网易云直连，不阻塞启动）。
-music_folder: /volume1/Music
+# 音乐文件夹，容器内路径 /music（宿主机 /volume1/Music 经 compose 挂载，
+# 2026-11-23 彩排 P0-4：旧值写宿主机路径，容器内根本不存在）；不存在时只警告，
+# 本地曲库兜底不可用（点歌仍走网易云直连，不阻塞启动）。
+music_folder: /music
 
 # Home Assistant：Token 走环境变量 HASS_TOKEN，不要写进文件。
 # 2026-11-18 bai 定：HA 未配 TLS，用 ws（此前误写成 wss，握手直接失败）。
 # 2026-11-19：HA 就在 NAS 上，地址是 NAS 的 LAN IP（不是旧的 192.168.1.10）。
 home_assistant:
-  url: "ws://192.168.88.247:8123"
+  url: "ws://192.168.88.247:8123/api/websocket"
   # media_player 上报（HA 融合 b）：Hub 每 15 秒把注册表里的音箱
   # 报给 HA 做 media_player.open_xiaoai_* 实体（state/音量/当前曲，
   # 走 REST POST /api/states，与上面 WS 共用 HASS_TOKEN）。

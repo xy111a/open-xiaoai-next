@@ -302,9 +302,11 @@ func (c *NeteaseClient) Search(ctx context.Context, keywords string, limit int) 
 	return songs, nil
 }
 
-// SongURL 取一首歌的可播地址（level=standard；VIP 歌需 VIP 账号 Cookie）。
+// SongURL 取一首歌的可播地址（br=320000；VIP 歌需 VIP 账号 Cookie）。
+// 2026-11-23 彩排 P0-3：/song/url/v1 带 Cookie 请求触发 -460 风控，
+// 改用老端点 /song/url（老系统一直在用的路径；NAS 实测返回直链）。
 func (c *NeteaseClient) SongURL(ctx context.Context, id int64) (string, error) {
-	u := fmt.Sprintf("%s/song/url/v1?id=%d&level=standard", c.baseURL, id)
+	u := fmt.Sprintf("%s/song/url?id=%d&br=320000", c.baseURL, id)
 	resp, err := c.get(ctx, u)
 	if err != nil {
 		return "", err

@@ -5,8 +5,6 @@ package wyoming
 
 import (
 	"bufio"
-	"encoding/json"
-	"io"
 	"net"
 	"sync"
 	"testing"
@@ -56,26 +54,16 @@ func (f *countingListener) handle(conn net.Conn) {
 	// delayed-error：读完 transcribe 一轮（到 audio-stop），再等 delay 回 error。
 	r := bufio.NewReader(conn)
 	for {
-		line, err := r.ReadBytes('\n')
+		_, header, err := readWyomingFrame(r)
 		if err != nil {
 			return
-		}
-		var header map[string]any
-		if err := json.Unmarshal(line, &header); err != nil {
-			return
-		}
-		if n, ok := header["payload_length"].(float64); ok && n > 0 {
-			if _, err := io.CopyN(io.Discard, r, int64(n)); err != nil {
-				return
-			}
 		}
 		if header["type"] == "audio-stop" {
 			break
 		}
 	}
 	time.Sleep(f.delay)
-	b, _ := json.Marshal(map[string]any{"type": "error", "text": "slow boom"})
-	_, _ = conn.Write(append(b, '\n'))
+	writeWyomingFrame(conn, map[string]any{"type": "error", "data": map[string]any{"text": "slow boom"}}, nil)
 }
 
 func (f *countingListener) count() int {

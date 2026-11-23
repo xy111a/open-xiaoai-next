@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -239,7 +240,9 @@ func (s *Store) CancelByText(text string) (int, error) {
 	return n, nil
 }
 
-// List 返回全部提醒的快照。
+// List 返回全部提醒的快照，按（下次触发时间，ID）排序。
+// 2026-11-23 审阅 O3：旧版直接遍历 map，顺序随机，导致
+// TestTimedActionKeepsOtherRoom 偶发失败（下标断言撞上乱序）。
 func (s *Store) List() []Reminder {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -247,6 +250,12 @@ func (s *Store) List() []Reminder {
 	for _, it := range s.items {
 		out = append(out, *it)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].Next.Equal(out[j].Next) {
+			return out[i].Next.Before(out[j].Next)
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out
 }
 

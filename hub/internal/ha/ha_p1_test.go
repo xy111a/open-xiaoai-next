@@ -80,3 +80,31 @@ func TestConcurrentCallsNoRace(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestNormalizeHAURL(t *testing.T) {
+	// 2026-11-23 彩排 P0-2：裸地址缺 /api/websocket，HA 握手直接失败。
+	// startFakeHA 不校验请求路径，Dial 层面的测试证明不了归一化，
+	// 所以直接测 helper 本身。
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"裸 ws", "ws://192.168.88.247:8123", "ws://192.168.88.247:8123/api/websocket"},
+		{"裸 wss", "wss://192.168.88.247:8123", "wss://192.168.88.247:8123/api/websocket"},
+		{"根路径 /", "ws://192.168.88.247:8123/", "ws://192.168.88.247:8123/api/websocket"},
+		{"已带路径不动", "ws://192.168.88.247:8123/api/websocket", "ws://192.168.88.247:8123/api/websocket"},
+		{"其他路径不动", "ws://192.168.88.247:8123/custom", "ws://192.168.88.247:8123/custom"},
+		{"带端口与空白", "  ws://127.0.0.1:8123  ", "ws://127.0.0.1:8123/api/websocket"},
+		{"非法 URL 原样返回", "://bad url", "://bad url"},
+		{"空串原样返回", "", ""},
+		{"无 host 原样返回", "ws:///api/websocket", "ws:///api/websocket"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := normalizeHAURL(tc.in); got != tc.want {
+				t.Fatalf("normalizeHAURL(%q) = %q，想要 %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}

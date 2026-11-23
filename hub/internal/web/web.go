@@ -539,8 +539,8 @@ pre.lyric{white-space:pre-wrap;font-size:13px;max-height:220px;overflow:auto;bac
 <div class="form-grid">
 <div class="field"><label>唤醒词</label><input id="cfg-wake" placeholder="如 你好小李"></div>
 <div class="field"><label>唤醒词走哪个 Agent</label><select id="cfg-route"><option value="qwen">qwen（本地 Qwen3.5-4B）</option><option value="hermes">hermes</option><option value="openclaw">openclaw</option></select></div>
-<div class="field"><label>Home Assistant 地址</label><input id="cfg-ha" placeholder="ws://192.168.88.247:8123"></div>
-<div class="field"><label>音乐文件夹</label><input id="cfg-music" placeholder="/volume1/Music"></div>
+<div class="field"><label>Home Assistant 地址</label><input id="cfg-ha" placeholder="ws://192.168.88.247:8123/api/websocket"></div>
+<div class="field"><label>音乐文件夹</label><input id="cfg-music" placeholder="/music"></div>
 <div class="field"><label>勿扰时段</label><input id="cfg-dnd" placeholder="23:00-07:00"></div>
 <div class="field"><label>Qwen Agent 地址</label><input id="cfg-qwen-url" placeholder="http://192.168.88.247:9000/v3"></div>
 <div class="field"><label>Qwen 模型</label><input id="cfg-qwen-model" placeholder="qwen3.5-4b"></div>

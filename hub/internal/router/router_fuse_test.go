@@ -40,7 +40,7 @@ func fakeNeteaseFuse(t *testing.T, mode string, paths *[]string) *httptest.Serve
 				return
 			}
 			fmt.Fprint(w, `{"code":200,"result":{"songs":[{"id":12345,"name":"青花瓷","artists":[{"name":"周杰伦"}]}]}}`)
-		case strings.HasPrefix(r.URL.Path, "/song/url/v1"):
+		case strings.HasPrefix(r.URL.Path, "/song/url"):
 			switch mode {
 			case "ok":
 				fmt.Fprint(w, `{"code":200,"data":[{"id":12345,"url":"http://music.example.com/12345.mp3"}]}`)
@@ -115,8 +115,8 @@ func TestMusicDirectOrderAndFallbackToLocal(t *testing.T) {
 		t.Fatalf("快路径下兜底播出成功应回空回复，实际 %q", reply)
 	}
 	// 调用顺序：先搜歌，再取地址（失败），再本地搜文件、播本地文件。
-	if len(paths) < 2 || paths[0] != "/search" || paths[1] != "/song/url/v1" {
-		t.Fatalf("应先调 /search 再调 /song/url/v1，实际 %v", paths)
+	if len(paths) < 2 || paths[0] != "/search" || paths[1] != "/song/url" {
+		t.Fatalf("应先调 /search 再调 /song/url，实际 %v", paths)
 	}
 	cmds := mpdFake.commands()
 	joined := strings.Join(cmds, "\n")

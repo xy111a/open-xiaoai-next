@@ -61,7 +61,7 @@ func recordingNetease(t *testing.T, queries *[]string) *httptest.Server {
 		case strings.HasPrefix(r.URL.Path, "/search"):
 			*queries = append(*queries, r.URL.Query().Get("keywords"))
 			fmt.Fprint(w, `{"code":200,"result":{"songs":[{"id":12345,"name":"青花瓷","artists":[{"name":"周杰伦"}]}]}}`)
-		case strings.HasPrefix(r.URL.Path, "/song/url/v1"):
+		case strings.HasPrefix(r.URL.Path, "/song/url"):
 			fmt.Fprint(w, `{"code":200,"data":[{"id":12345,"url":"http://music.example.com/12345.mp3"}]}`)
 		default:
 			http.NotFound(w, r)
