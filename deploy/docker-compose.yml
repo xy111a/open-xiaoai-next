@@ -53,6 +53,11 @@ services:
     network_mode: host
     # P1-4：以 uid 1000 的 appuser 运行（镜像内已建，见 Dockerfile.hub）。
     user: "1000:1000"
+    # 2026-11-23 彩排 P0-4：/volume1 是带 UGOS ACL 的 btrfs，POSIX 777 只是
+    # 表象，只放行 admin 组（gid 10）；uid 1000 单独挂载读不到 /music，
+    # 补 group 10 即可（NAS 实测 --group-add 10 可列出）。
+    group_add:
+      - "10"
     cap_drop:
       - ALL
     environment:
@@ -75,6 +80,9 @@ services:
       # P1-31：卷挂到 /app/hub-data——Hub 数据目录就是 ./hub-data（WORKDIR /app），
       # 原来挂 /app/data 没人用，容器重建后提醒/记忆/TLS 证书全丢。
       - hub-data:/app/hub-data
+      # 2026-11-23 彩排 P0-4：音乐文件夹挂到容器内 /music（与 mpd 同一写法）；
+      # 旧 compose 没这挂载，config 又写宿主机路径，本地曲库兜底全死。
+      - ${MUSIC_FOLDER:-/volume1/Music}:/music:ro
     depends_on:
       # P1-4（2026-11-23 审查）：长语法 + condition: service_healthy——
       # Hub 只有在 whisper/piper/kws-sidecar 都健康后才启动，不再只等容器
