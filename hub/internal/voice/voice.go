@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -88,6 +89,12 @@ type Pipeline struct {
 	utterances map[string]*utterance
 	onReply    func(deviceID string, opusFrames [][]byte)
 
+	// onError 是 answer 失败时的回调（P0-3）：settle 的后台 goroutine 里
+	// answer 出错时调用；main 接 speakText 播一句区分性回复。
+	// 为 nil 时不调用。回调里不要再调本管线的 Frame/End/answer
+	//（speakText 直接走 TTS，不经过管线，不会递归）。
+	onError func(deviceID string, err error)
+
 	// inFlight 是每设备正在回答的在途记录（P1-29 + 打断后续）：
 	// 同一设备上一句还没答完时新结算直接丢弃（只记日志），不让回答
 	// 在后台无限排队；Cancel 用它找到并取消在途回答的 ctx。
@@ -123,6 +130,61 @@ func New(stt STT, tts TTS, router Router, voice string, onReply func(deviceID st
 		inFlight:   map[string]*flight{},
 		onReply:    onReply,
 		sem:        make(chan struct{}, MaxConcurrentAnswers),
+	}
+}
+
+// SetOnError 设 answer 失败时的回调（P0-3）；为 nil 表示不播报。
+// main 在 speakText 赋值后接上，回调里读 h.speakText（晚绑定）。
+func (p *Pipeline) SetOnError(fn func(deviceID string, err error)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.onError = fn
+}
+
+// callOnError 调 onError 回调（未设则什么都不做）；回调在锁外执行，
+// 不让回调里的播报反过来阻塞管线。
+func (p *Pipeline) callOnError(deviceID string, err error) {
+	p.mu.Lock()
+	fn := p.onError
+	p.mu.Unlock()
+	if fn != nil {
+		fn(deviceID, err)
+	}
+}
+
+// errAnswerTimeout 是回答总超时（120s）的哨兵错误：settle 里 answer
+// 超时也走 errAnswerCancelled，用它区分“超时”和“用户打断”。
+var errAnswerTimeout = errors.New("voice: 回答超时")
+
+// ErrorReply 把一次回答失败翻成一句播给用户的区分性回复（P0-3）。
+// 分类只看下游包的错误文本标记，与 isVoiceServiceError 同款做法
+// （Wyoming 的 STT/TTS 错误自带“STT/TTS 不可用”前缀，HA 错误以
+// “ha: ”开头，Agent 错误含 “agent”，提醒错误含“提醒”）。
+// 空回复不经过这里（answer 返回 nil，不调 onError）。
+func ErrorReply(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "STT 不可用"):
+		return "语音识别没连上，请稍后再试"
+	case strings.Contains(msg, "TTS 不可用"):
+		return "语音合成没连上，请稍后再试"
+	case strings.Contains(msg, "语音管线繁忙"):
+		return "我现在有点忙，请稍后再试"
+	case strings.Contains(msg, "agent"):
+		return "大脑没连上，请稍后再试"
+	case strings.Contains(msg, "ha:"):
+		return "家电没控制住，请稍后再试"
+	case strings.Contains(msg, "提醒"):
+		return "提醒没记上，请再说一遍"
+	case strings.Contains(msg, "MPD"), strings.Contains(msg, "音乐"), strings.Contains(msg, "网易云"):
+		return "音乐没放出来，请稍后再试"
+	case strings.Contains(msg, "超时"):
+		return "想得太久了，请再说一遍"
+	default:
+		return "语音服务暂时没连上，请稍后再试"
 	}
 }
 
@@ -176,10 +238,29 @@ func (p *Pipeline) settle(ctx context.Context, deviceID string, pcm []int16) err
 			p.mu.Unlock()
 		}()
 		if err := p.answer(ctx, deviceID, pcm); err != nil {
+			// P0-3：以前这里只记日志，用户说完话后毫无声音，分不清是
+			// 没听清还是系统挂了；现在经 onError 播一句区分性回复。
+			// 只有 err != nil 才播报：空回复（撤退词、点歌快路径）走
+			// answer 返回 nil，不经过这里，保持静默。
 			if errors.Is(err, errAnswerCancelled) || errors.Is(err, context.Canceled) {
-				log.Printf("voice: 设备 %s 回答已取消（新唤醒打断）", deviceID)
+				// 120s 总超时也走 errAnswerCancelled：用 ctx 区分——
+				// DeadlineExceeded 是超时（故障，要播报），Canceled 是
+				// 用户打断（正常，静默）。defer 的 cancel() 在本分支
+				// 之后才跑，此时的 ctx.Err() 反映真实原因。
+				if ctx.Err() == context.DeadlineExceeded {
+					log.Printf("voice: 设备 %s 回答超时（120s 未回）", deviceID)
+					p.callOnError(deviceID, errAnswerTimeout)
+				} else {
+					log.Printf("voice: 设备 %s 回答已取消（新唤醒打断）", deviceID)
+				}
+			} else if ctx.Err() == context.DeadlineExceeded {
+				// 超时后才返回的原始错误（如 Route 的 DeadlineExceeded）：
+				// 同样按超时播报，不按原始错误分类。
+				log.Printf("voice: 设备 %s 回答超时（120s 未回）: %v", deviceID, err)
+				p.callOnError(deviceID, errAnswerTimeout)
 			} else {
 				log.Printf("voice: 设备 %s 回答失败: %v", deviceID, err)
+				p.callOnError(deviceID, err)
 			}
 		}
 	}()
