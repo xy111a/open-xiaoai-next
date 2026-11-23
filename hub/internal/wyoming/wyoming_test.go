@@ -87,12 +87,13 @@ func readWyomingFrame(r *bufio.Reader) (string, map[string]any, error) {
 // 2026-11-23 彩排 P0-1 的教训：旧假服务器说的是顶层字段的错误方言，
 // 单测全过、真服务端全灭；回归测试必须在假服务器上钉死 wire 格式。
 type fakeWyoming struct {
-	t        *testing.T
-	ln       net.Listener
-	done     chan struct{}
-	mu       sync.Mutex
-	received []map[string]any // 客户端发来的全部头（data 已 merge，服务端逻辑视角）
-	rawLines []string         // 客户端发来的原始头行（wire 格式断言用）
+	t         *testing.T
+	ln        net.Listener
+	done      chan struct{}
+	mu        sync.Mutex
+	received  []map[string]any // 客户端发来的全部头（data 已 merge，服务端逻辑视角）
+	rawLines  []string         // 客户端发来的原始头行（wire 格式断言用）
+	synthRate int              // 合成 audio-start 用的采样率；0 表示默认 16000
 }
 
 // receivedHeaders 返回客户端发来的头快照（按收到顺序，data 已 merge）。
@@ -168,12 +169,18 @@ func (f *fakeWyoming) handle(conn net.Conn) {
 			}
 			f.write(conn, map[string]any{"type": "transcript", "data": map[string]any{"text": "打开客厅灯"}}, nil)
 		case "synthesize":
-			f.write(conn, map[string]any{"type": "audio-start", "data": map[string]any{"rate": 16000, "width": 2, "channels": 1}}, nil)
+			f.mu.Lock()
+			rate := f.synthRate
+			f.mu.Unlock()
+			if rate == 0 {
+				rate = 16000
+			}
+			f.write(conn, map[string]any{"type": "audio-start", "data": map[string]any{"rate": rate, "width": 2, "channels": 1}}, nil)
 			pcm := make([]byte, 320*2) // 20ms 静音 PCM
 			for i := range pcm {
 				pcm[i] = byte(i % 251)
 			}
-			f.write(conn, map[string]any{"type": "audio-chunk", "data": map[string]any{"rate": 16000, "width": 2, "channels": 1}}, pcm)
+			f.write(conn, map[string]any{"type": "audio-chunk", "data": map[string]any{"rate": rate, "width": 2, "channels": 1}}, pcm)
 			f.write(conn, map[string]any{"type": "audio-stop", "data": map[string]any{}}, nil)
 		default:
 			f.write(conn, map[string]any{"type": "error", "data": map[string]any{"text": "未知类型"}}, nil)
@@ -221,6 +228,51 @@ func TestDescribeTranscribeSynthesize(t *testing.T) {
 	}
 	if len(out) != 640 {
 		t.Fatalf("Synthesize 应返回 640 字节 PCM，实际 %d", len(out))
+	}
+}
+
+// TestSynthesizeSampleRateBounds 钉住 Synthesize 的采样率上下界
+// （2026-11-23 审阅 O1）：低于 8000Hz 时 resamplePCM16 会把输入放大
+// 2 倍以上（100Hz 时 160 倍），必须报错而非分配巨额内存；
+// 8000Hz 是下限本身，应成功并重采样到 16kHz（640 字节 8kHz PCM
+// → 1280 字节 16kHz PCM）。
+func TestSynthesizeSampleRateBounds(t *testing.T) {
+	cases := []struct {
+		name    string
+		rate    int
+		wantLen int // -1 表示应报错
+	}{
+		{"100Hz 拒收", 100, -1},
+		{"100000Hz 拒收", 100000, -1},
+		{"8000Hz 下限通过", 8000, 1280},
+		{"22050Hz 重采样", 22050, 464}, // 320 采样 ×16000/22050=232 采样 =464 字节
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := startFake(t)
+			defer f.ln.Close()
+			f.mu.Lock()
+			f.synthRate = tc.rate
+			f.mu.Unlock()
+			c, err := Dial(f.addr(), 0)
+			if err != nil {
+				t.Fatalf("Dial 假 Wyoming 失败: %v", err)
+			}
+			defer c.Close()
+			out, err := c.Synthesize("你好", "zh_CN-huayan-medium")
+			if tc.wantLen < 0 {
+				if err == nil {
+					t.Fatalf("采样率 %d 应报错，实际返回 %d 字节", tc.rate, len(out))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("采样率 %d 应成功，实际报错: %v", tc.rate, err)
+			}
+			if len(out) != tc.wantLen {
+				t.Fatalf("采样率 %d 应返回 %d 字节 PCM，实际 %d", tc.rate, tc.wantLen, len(out))
+			}
+		})
 	}
 }
 

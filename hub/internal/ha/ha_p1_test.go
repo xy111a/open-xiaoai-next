@@ -98,6 +98,7 @@ func TestNormalizeHAURL(t *testing.T) {
 		{"带端口与空白", "  ws://127.0.0.1:8123  ", "ws://127.0.0.1:8123/api/websocket"},
 		{"非法 URL 原样返回", "://bad url", "://bad url"},
 		{"空串原样返回", "", ""},
+		{"无 host 原样返回", "ws:///api/websocket", "ws:///api/websocket"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -51,6 +51,11 @@ const expectedSampleRate = 16000
 // Synthesize 报错而不重采样（防垃圾 rate 导致超大输出）。
 const maxSampleRate = 96000
 
+// minSampleRate 是服务端 audio-start 采样率的下界：低于即视为异常。
+// 8000Hz 是电话音质下限；低于它时 resamplePCM16 会把输入放大
+// 2 倍以上（100Hz 时 160 倍），可能因巨额分配拖垮 Hub（2026-11-23 审阅 O1）。
+const minSampleRate = 8000
+
 // P1-1 防护上限：单条 Wyoming 负载（音频 chunk）最大 1MB；
 // 头行（JSON）最大 64KB；读写各设 10s deadline。
 const (
@@ -126,27 +131,31 @@ func (c *Client) readEvent() (map[string]any, []byte, error) {
 		return nil, nil, fmt.Errorf("wyoming: 头解析失败: %w", err)
 	}
 	// data_length 分离字节：读回 data JSON，merge 进 header["data"]。
+	// data_length 为 0 时参考库不读分离字节（async_read_event 只在
+	// data_length > 0 时读），这里同样跳过，否则空字节 Unmarshal 会报错。
 	if l, ok := header["data_length"]; ok {
 		n, err := parseLength(l, "data_length", MaxPayloadLength)
 		if err != nil {
 			return nil, nil, err
 		}
-		dataBytes := make([]byte, n)
-		if _, err := io.ReadFull(c.reader, dataBytes); err != nil {
-			return nil, nil, err
+		if n > 0 {
+			dataBytes := make([]byte, n)
+			if _, err := io.ReadFull(c.reader, dataBytes); err != nil {
+				return nil, nil, err
+			}
+			var data map[string]any
+			if err := json.Unmarshal(dataBytes, &data); err != nil {
+				return nil, nil, fmt.Errorf("wyoming: data 解析失败: %w", err)
+			}
+			merged, _ := header["data"].(map[string]any)
+			if merged == nil {
+				merged = make(map[string]any, len(data))
+			}
+			for k, v := range data {
+				merged[k] = v
+			}
+			header["data"] = merged
 		}
-		var data map[string]any
-		if err := json.Unmarshal(dataBytes, &data); err != nil {
-			return nil, nil, fmt.Errorf("wyoming: data 解析失败: %w", err)
-		}
-		merged, _ := header["data"].(map[string]any)
-		if merged == nil {
-			merged = make(map[string]any, len(data))
-		}
-		for k, v := range data {
-			merged[k] = v
-		}
-		header["data"] = merged
 	}
 	var payload []byte
 	if l, ok := header["payload_length"]; ok {
@@ -348,7 +357,8 @@ func (c *Client) Transcribe(pcm []byte, language string) (text string, err error
 			text, _ := eventData(header)["text"].(string)
 			return text, nil
 		case "error":
-			return "", fmt.Errorf("wyoming stt error: %v", eventData(header)["text"])
+			errText, _ := eventData(header)["text"].(string)
+			return "", fmt.Errorf("wyoming stt error: %s", errText)
 		default:
 			// P2-17：未知事件类型计数，连续超限即报错，不静默空转。
 			unknown++
@@ -406,7 +416,7 @@ func (c *Client) Synthesize(text, voice string) (pcm []byte, err error) {
 			}
 			pcm = append(pcm, payload...)
 		case "audio-stop":
-			if sampleRate <= 0 || sampleRate > maxSampleRate {
+			if sampleRate < minSampleRate || sampleRate > maxSampleRate {
 				return nil, fmt.Errorf("wyoming: tts 采样率 %d 非法，拒绝播放", sampleRate)
 			}
 			if sampleRate != expectedSampleRate {
@@ -414,7 +424,8 @@ func (c *Client) Synthesize(text, voice string) (pcm []byte, err error) {
 			}
 			return pcm, nil
 		case "error":
-			return nil, fmt.Errorf("wyoming tts error: %v", eventData(header)["text"])
+			errText, _ := eventData(header)["text"].(string)
+			return nil, fmt.Errorf("wyoming tts error: %s", errText)
 		default:
 			// P2-17：未知事件类型计数，连续超限即报错，不静默空转。
 			unknown++
