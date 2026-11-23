@@ -45,7 +45,7 @@
 ### P0-3 4399 只有单 Token 鉴权，无 mTLS；`CHANGE_ME` 默认 Token 可直接上线
 - **修复状态（2026-11-17，已修复）**：`transport.ValidateToken`（空 / <16 位 / 弱值表即错，错误含 `openssl rand -hex 16`）+ `tlscert.LoadOrCreateMTLS`（自有 CA + CA 签发的服务端证书 + 共享客户端证书）+ `transport.SetClientCAs`（`RequireAndVerifyClientCert`），`main.go` 已接线（启动时 Fatal 弱 Token、mTLS 服务）；`nas-install.sh` 预检查拒绝弱 Token；客户端 `connect_once` 建连前拒弱 Token，默认 Token 改 `""`（fail closed）。证据：`go test ./internal/transport/` 8 passed、`./internal/tlscert/` 6 passed、`cargo test` 46 passed；真二进制冒烟：无客户端证书握手被拒（`tls: client didn't provide a certificate`），带 CA 签发证书握手成功（TLSv1.3，Verify return code 0），弱 Token 启动即 Fatal（本轮重跑）。剩余：客户端证书随固件下发到两台音箱的路径待真机验证；旧自签证书被覆盖后指纹需同步更新 `client.toml`；`CheckOrigin` 恒 true 与 deviceID 顶替（P1-3）未修。
 - **文件:行号**：PLAN `NFR-02`（“Client→Hub mTLS + Token；4399 不裸奔”）；`hub/internal/transport/transport.go:150-151,206`（`New(token…)` 注明“token 为空表示不鉴权（只允许测试用）”，`handleWS` 仅 `hello.Token != s.token` 比较，非恒定时间）；`hub/internal/transport/transport.go:173-182`（`Serve()` 只有服务端证书，无 `ClientAuth`）；`client/src/transport.rs:187,203`（两种分支均为 `.with_no_client_auth()`）；`hub/cmd/hub/main.go:222-225`（启动只拒绝空 Token，`CHANGE_ME` 照常通过）；`client/src/config.rs:14-15`（默认 Token `CHANGE_ME`）；`deploy/.env.example:15`（`OPEN_XIAOAI_TOKEN=CHANGE_ME`）；`deploy/nas-install.sh:45-52`（预检查只查三 Token“非空”，`CHANGE_ME` 能通过）。
-- **问题**：三层落差：(1) PLAN 要 mTLS，实际双向均为 `with_no_client_auth`——Hub 不验证客户端证书，客户端只验服务端指纹（且指纹可选，见 P1-10），Token 是唯一认证因素；Token 一旦泄露（见 P0-4）或被猜中，攻击者即可冒充任意音箱、收发语音、触发 HA/提醒/紧急呼叫；(2) 默认值 `CHANGE_ME` 是公开的：仓库、`.env.example`、客户端默认配置三处一致，操作员若照抄示例部署，Token 等于公开。
+- **问题**：三层落差：(1) PLAN 要 mTLS，实际双向均为 `with_no_client_auth`——Hub 不验证客户端证书，客户端只验服务端指纹（且指纹可选，见 P1-10），Token 是唯一认证因素；Token 一旦泄露（见 P0-4）或被猜中，攻击者即可冒充任意音箱、收发语音、触发 HA/提醒；(2) 默认值 `CHANGE_ME` 是公开的：仓库、`.env.example`、客户端默认配置三处一致，操作员若照抄示例部署，Token 等于公开。
 - **为什么重要**：4399 是全屋语音与家电控制的入口，单因素 + 公开默认值 = 未鉴权即有控制权。
 - **建议修复**：(a) 启动时拒绝弱 Token：长度 <16、等于 `CHANGE_ME`/`secret`/`password` 等常见值即 Fatal，并给出生成命令（`openssl rand -hex 16`）；`nas-install.sh` 同样拦截；(b) 按 PLAN 补 mTLS：Hub 生成客户端证书并随固件/OTA 下发，服务端 `tls.RequireAndVerifyClientCert`，客户端带证书连接；做不到 mTLS 之前，至少把 Token 当作机密轮换并在文档中明确“当前只有 Token，无 mTLS，与 PLAN 有差距”；(c) Token 比较改 `crypto/subtle.ConstantTimeCompare`。
 
@@ -147,7 +147,7 @@
 - **建议修复**：`Kws` 维护最近 N 帧（如 500ms 窗口）的 RMS 峰值，命中时上报该峰值；或在 `feed` 里命中后回溯 `pending` 帧重算。补单测：词后喂 10 帧静音再命中，断言上报 RMS 仍为词内峰值。
 
 ### P1-15 对讲在生产代码里零接线：无任何触发入口，且超时清理从不运行
-- **文件:行号**：`hub/internal/intercom/intercom.go:69-226`（`Start`/`StartBroadcast`/`SetFullDuplex`/`EchoCancel`/`Sweep`）；`hub/cmd/hub/main.go` 全文无任何调用（仅 `Forward`/`End` 被 `OnAudioFrame`/`OnAudioEnd` 调到）；`hub/internal/router/router.go` 全文件无“呼叫/对讲/广播”分支（`grep 呼叫` 仅 FR-15 紧急呼叫）；`hub/cmd/hub/main.go:183-189`（`OnDisconnect` 只 `End(deviceID)`，即只清以该设备为发起方的会话）。
+- **文件:行号**：`hub/internal/intercom/intercom.go:69-226`（`Start`/`StartBroadcast`/`SetFullDuplex`/`EchoCancel`/`Sweep`）；`hub/cmd/hub/main.go` 全文无任何调用（仅 `Forward`/`End` 被 `OnAudioFrame`/`OnAudioEnd` 调到）；`hub/internal/router/router.go` 全文件无“呼叫/对讲/广播”分支（`grep 呼叫` 当时仅 FR-15）；`hub/cmd/hub/main.go:183-189`（`OnDisconnect` 只 `End(deviceID)`，即只清以该设备为发起方的会话）。
 - **为什么重要**：与 `TEST_REPORT.md` 的表述有实质差异：报告写“对讲全双工已实现、半双工已测”，实际是包内单测通过、生产接线为零——FR-04（点对点呼叫 + 全屋广播）当前不可用。没有任何 Router 分支、RPC 方法、Web API 能调用 `Start`/`StartBroadcast`——语音说“呼叫卧室”会落到 Agent 闲聊，`intercom.Manager` 永远建不出会话。`Sweep`（5 秒空闲超时）在 `main.go` 里没有 goroutine 调用，`LastFrame` 的更新因此毫无作用。另：目标方断线时 `OnDisconnect` 只 `End(断线方)`，若断线方是目标而非发起方，会话永不结束；`participantBusy` 会永久拒绝该发起方的新呼叫（无 Sweep 兜底）；目标方断线、Client 崩溃未发 `audio_end`、网络丢帧超过 5s 空闲时，会话永远留在 `sessions` 里，双方都无法再发起对讲，只能重启 Hub。
 - **建议修复**：先接通最小触发路径（Router 增加“呼叫/对讲 + 房间”分支调 `Start`，`audio_end` 调 `End`），并在 `main.go` 起一个每秒 `intercom.Sweep` 的 goroutine（与 `sweepSessions` 并列）；`OnDisconnect` 改为按“发起方或目标方”双向结束会话。
 
@@ -161,15 +161,7 @@
 - **为什么重要**：`relay` 失败（目标刚离线，`intercom.New` 注入的 relay 返回 `设备 %s 不在线`）时 `err != nil`，代码不 return，继续走“仲裁赢了/会话期内”的语音管线；若该设备恰在 20 秒连续对话会话内，对讲音频会被当成语音命令转写并执行。对讲失败时用户听到的是“音箱把对讲内容当命令执行了”（如对讲里说“关灯”真的关了灯），属于错误路由。
 - **建议修复**：`Forward` 返回 `(to, isBroadcast, err)` 后先判断“是否在对讲会话中”（`to != "" || isBroadcast || err != nil 且会话存在`）就 return；中继失败记日志并（可选）向发起方播报“对方不在线”。
 
-### P1-18 FR-15 紧急呼叫 Notify 失败被吞掉，用户仍被告知“已通知家人”；60 秒内重复触发不再重试
-- **文件:行号**：`hub/internal/router/router.go:184-192`（`_ = r.deps.Notify(ctx, msg)`，随后无条件返回 `"已经帮你呼叫急救并通知了家人，请保持通话。…"`；重复触发分支直接 return“已经在呼叫急救了”）；`hub/cmd/hub/main.go:322-328`（`Notify` 本就是 `haClient.FireEvent`，HA 未连接时返回 `HA 未连接，无法通知`）。
-- **为什么重要**：`Notify`（生产是 `haClient.FireEvent`）的错误被 `_ =` 丢弃，随后无条件返回“已经帮你呼叫急救并通知了家人”。HA 未连接/断线时（见 P1-27，HA 断线是常态），用户听到的是虚假确认。且第一次 Notify 失败后 60 秒内再次喊“救命”会走“重复触发不重复 Notify”分支，永远不再补发通知。紧急呼叫是安全功能，虚假确认比不确认更危险：用户会停止自救/等待根本不会来的救援。PLAN 要求“触发后 10 秒内拨出或推送送达”，当前代码对送达与否完全不观测。
-- **建议修复**：`Notify` 错误必须向上传播并改播报为“呼叫失败，HA 未连接，请直接打电话”，并重试一次；重复触发时若上次 Notify 失败应重试（记录上次 Notify 是否成功）；`emergencyCall` 增加 `notified bool` 字段；`Notify` 成功也应只说“已尝试通知”，除非 HA 侧有送达回执。
-
-### P1-19 FR-15 “报警”子串误触发
-- **文件:行号**：`hub/internal/router/router.go:155-156`（`emergencyRe = 救命|打\s*120|叫救护车|打\s*110|报警`）。
-- **为什么重要**：纯子串匹配，无词边界、无否定判断。日常语音“烟雾报警器响了”“漏水报警了怎么办”“不要报警”都会触发紧急呼叫 + Notify。与 P1-18 叠加：误触发后用户还会被告知“已经呼叫急救”。误触发会骚扰家人/触发 HA 自动化，几次之后用户将不再信任紧急呼叫，真正求救时也可能被当作误触取消。
-- **建议修复**：收紧正则：`报警` 要求独立成词或与“打/叫/帮我”搭配（如锚定形态），并把“报警器/报警了”类陈述句与“别/不要报警”等否定句排除；补否定测试用例。另：紧急呼叫应加二次语音确认（“确认要呼叫急救吗”）或声纹/按键确认，见 P2-12。
+### P1-18 / P1-19：已删除（2026-11-23 紧急呼叫功能整体删除，本两节作废）
 
 ### P1-20 Wyoming 客户端无锁，同一连接被多设备 goroutine 与提醒/播报并发共用
 - **文件:行号**：`hub/internal/wyoming/wyoming.go:20-24`（`Client` 只有 `conn` + `reader`，无 `sync.Mutex`）；`:100-190`（`Transcribe`/`Synthesize` 都是“写一串事件 → 循环读事件”的多步序列，无锁）；`hub/cmd/hub/main.go:274-289`（STT/TTS 各一个共享 client）、`main.go:342-390`（`speakText` 与 Pipeline 共用同一个 `tts`）。
@@ -209,7 +201,7 @@
 
 ### P1-27 HA / Wyoming 断线永不重连；读循环出错静默退出，haClient 成僵尸
 - **文件:行号**：`hub/cmd/hub/main.go:236-245`（`ha.Dial` 失败记“HA 连接失败（稍后重试，不阻塞启动）”，但全文无任何重试代码）；`:274-282`（Wyoming STT/TTS 同样一次 Dial，失败即 nil）；`hub/internal/ha/ha.go:102-135`（`readLoop` 读错即 `return`，无重连、无通知）；全仓库无 `reconnect`/`redial`/`health` 相关代码（`grep -rn reconnect hub/` 无结果，除 Client 外）。
-- **为什么重要**：注释承诺的“稍后重试”不存在。HA 重启/网络抖动一次，`haClient` 即永久失效：之后每次家电命令先 `GetStates` 失败（错误被 `router.go` 的 `err == nil` 判断吞掉），再 `CallService` 等 10 秒超时才报错；FR-10 的 `Watcher` 订阅也随读循环退出而永久失效，且 `main.go` 只在启动时订阅一次。HA 是家电、场景、紧急通知、摄像头播报四条线的共同上游，断一次等于四条线全断且永不自愈；用户侧表现为“突然什么家电都不听使唤了”，只能重启 Hub。NAS 上容器重启、HA 升级是最常见的运维事件，每次都要人工重启 Hub 才能恢复语音，且失败是静默的。
+- **为什么重要**：注释承诺的“稍后重试”不存在。HA 重启/网络抖动一次，`haClient` 即永久失效：之后每次家电命令先 `GetStates` 失败（错误被 `router.go` 的 `err == nil` 判断吞掉），再 `CallService` 等 10 秒超时才报错；FR-10 的 `Watcher` 订阅也随读循环退出而永久失效，且 `main.go` 只在启动时订阅一次。HA 是家电、场景、摄像头播报三条线的共同上游，断一次等于三条线全断且永不自愈；用户侧表现为“突然什么家电都不听使唤了”，只能重启 Hub。NAS 上容器重启、HA 升级是最常见的运维事件，每次都要人工重启 Hub 才能恢复语音，且失败是静默的。
 - **建议修复**：给 `ha.Client` 加带退避的重连（断线后每 5→30 秒重 Dial，成功后重订阅已有 handlers 并恢复 `pending`）；Wyoming STT/TTS 用“懒连接 + 失败重试”包装，或在 `answer()`/`speakText` 失败时触发一次重拨；或 `main.go` 起一个监督 goroutine 定期探活、失败则重建 client 并重新接 `Watcher` 与 Router 的 `HA` 引用（注意 Router 持有的是启动时传入的指针，重建需同步更新）；Web `/api/status` 暴露各下游健康状态。
 
 ### P1-28 语音 utterance 无长度上限且断线不清理：长语音无限累积，断线后旧音频混入下一句
@@ -370,10 +362,7 @@
 - **为什么重要**：一次漏水事件的 TTS（数秒）会堵住 HA 的 `result` 分发，使并发的家电命令超时（10s）；回调 panic 会直接杀死 `readLoop`。
 - **建议修复**：事件回调改为异步投递（有界 channel + 工作 goroutine）；回调加 recover；结合 P1-27 的 HA 重连，恢复后重新订阅。
 
-### P2-12 紧急呼叫无二次确认：任何语音（含电视/录音/对讲广播）说“救命/打120”即触发
-- **文件:行号**：`hub/internal/router/router.go:170-230`（`emergency()`：任何语音——含电视/录音/对讲广播——说“救命/打120”即触发紧急呼叫，无声纹/二次确认；取消只按 `deviceID` 隔离，同一 IP 的设备可互相取消，见 P1-3 的 deviceID 问题）。
-- **为什么重要**：电视里的一句台词、录音回放都可能触发紧急呼叫 + Notify，结合 P1-18 的谎报成功，误报链完整。
-- **建议修复**：紧急呼叫加二次语音确认（“确认要呼叫急救吗”）或声纹/按键确认；取消按设备唯一 ID 隔离。
+### P2-12：已删除（2026-11-23 紧急呼叫功能整体删除，本节作废）
 
 ### P2-13 提醒调度器可重复 Start 导致双倍触发；Stop 从不调用
 - **文件:行号**：`hub/internal/reminders/reminders.go:177-201`（`Start` 无“已启动”守卫，每调一次多一个 ticker goroutine；`Stop` 在 `main.go` 全文无调用）。
@@ -615,7 +604,6 @@
 | FR-12 多 Agent 路由 | **未实现** | P1-38：启动时选定一次，per-wake 路由不存在 |
 | FR-13 唤醒词管理 | **未实现（端到端）** | 换模型文件 + 改配置的路径存在，但无模型分发机制（OTA 不传模型文件，见 P1-9），Client 侧换词需手动放文件 |
 | FR-14 循环提醒 | **部分实现** | 调度/持久化/语音取消已实现并有测试；但 P1-46 时区、P1-16 播报可能无声、P2-44/P2-45 细节缺口 |
-| FR-15 紧急呼叫 | **部分实现** | 触发 + 取消状态机已实现并有测试；但 P1-18 谎报成功、P1-19 误触发；真实通知链路 10s 送达未验证（TEST_REPORT 已知） |
 | NFR-01 本地优先 | **基本满足** | 唤醒/VAD/仲裁/音乐/HA 均在局域网；仅 LLM 文本出网（DeepSeek 在 config 默认模型名中出现，但 base_url 指向本地 Hermes/OpenClaw，见 `hub/config.yaml:33-41`） |
 | NFR-02 安全 | **不满足** | P0-1、P0-2、P0-3、P0-4；另 P2-2、P2-56 |
 | NFR-03 音频 | **基本满足** | 语音 Opus 16kHz/16kbps、音乐 48kHz Snapcast（协议层正确；生产接线见 P1-26） |
@@ -636,7 +624,7 @@
 - **OTA 下载的已知版本二次校验**：`download-ota.py:31-34,94-99` 对 `lx06 1.94.13` 与 `oh2p 1.58.6` 有硬编码 MD5+大小二次比对。**不足见 P0-5（其它版本无此保护）。**
 - **Hub TLS 证书文件权限**：`tlscert.go:46,91,94`：目录 `0700`、证书/私钥 `0600`，正确。
 - **家电高风险域隔离**：`router.go:340-360`：即使别名表配了门锁/燃气/热水器，`domain` 白名单只放行 `light/switch/climate/cover`，其它一律拒绝并提示当面确认；先查 HA 状态再调服务，不编数字。**该隔离是有效的。**
-- **语音路由顺序与 LLM 隔离**：`router.go:120-170`：紧急→提醒→场景/记忆→音乐→家电→Agent；LLM 只返回播报文本，无工具调用、不能直接调 HA/提醒/紧急接口。**提示注入经语音进入 LLM 的影响限于一句播报文本。**
+- **语音路由顺序与 LLM 隔离**：`router.go:120-170`：提醒→场景/记忆→音乐→家电→Agent；LLM 只返回播报文本，无工具调用、不能直接调 HA/提醒接口。**提示注入经语音进入 LLM 的影响限于一句播报文本。**
 - **MPD `add %s` 的 format 串安全**：`music.go:465` 的 URL 是 `Fprintf` 的参数而非格式串，`%` 本身不构成 format 注入。**不足是换行注入，见 P1-7。**
 - **Opus 编解码边界**：`hub/internal/opus/opus.go:40-77`：编码强制 320 点、解码缓冲固定 320 点；客户端 `audio.rs:80-88,130-142`：空包拒绝、`unwrap_audio_frame` 对 `[0x01]` 空帧与错误首字节返回 `None`。**未发现越界。**
 - **WebSocket 文本解析的 panic 面**：`transport.go:260-290` 与 `client/src/transport.rs:250-290`：JSON 解析失败均 `continue`/忽略，不 panic；字段缺失时用 `unwrap_or("")`/`as_str()` 兜底。**不足是无大小/速率限制，见 P1-3。**

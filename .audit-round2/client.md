@@ -152,7 +152,7 @@
 ### 2. P1-15 对讲：触发入口、start_play、超时清理 —— 仍缺失；Opus 级回声接线 —— 仍为零调用
 
 - **触发入口**：Hub 全仓 grep，`intercom.Start` / `StartBroadcast` 在生产代码里**零调用**（只有 `intercom.go` 里的定义与注释）；`router.go` 无“呼叫/对讲”分支。客户端侧：`start_recording` RPC 是空操作（见新 P1-N2），`send_room_claim` 仍 `#[allow(dead_code)]`、仍无调用方（`transport.rs:516`，`main.rs` 全文件无调用）——P1-39 同样仍在。
-- **超时清理**：`intercom.Sweep` 在生产代码里**零调用**（grep `hub/` 仅定义与 `SweepEmergency` 的无关命中）；`main.go` 无定时调用。目标方断线/会话泄漏问题仍在。
+- **超时清理**：`intercom.Sweep` 在生产代码里**零调用**（grep `hub/` 仅定义）；`main.go` 无定时调用。目标方断线/会话泄漏问题仍在。
 - **Opus 级回声（EchoCancel）**：`hub/internal/intercom/intercom.go:136` 的 `EchoCancel` 在生产代码里**零调用**（grep 全仓仅定义一处）；Hub 的 `OnAudioFrame` 在对讲路径里不做任何回声消除。客户端侧无任何 AEC 代码（也不应有——回声消除按设计在 Hub 侧）。结论：仍为零接线。
 
 ### 3. `kws_mode="server"` —— 已落地且行为与文档一致；local 模式 fail-loud 回归仍在

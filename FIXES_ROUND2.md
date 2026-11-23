@@ -72,8 +72,8 @@
 | **P1-14** RMS 单帧值 | ✅ 修了（客户端）：local 模式改 `RmsWindow`（50 帧 = 1s）均值，sherpa 命中时上报窗口均方根。已实测确认 trailing 静音稀释真实存在，根治属 SC-P2-2，未修。 |
 | **P1-15** 对讲零触发 | ✅ 修了（Hub+客户端）：Hub 侧 Router 呼叫/对讲/广播/挂断分支、intercom `EndFor` 双向结束、`Sweep` 每 10s 定时接线、`OnDisconnect` 双向 End；客户端侧 `start_recording` 真实现、`start_play` 收到后能播。 |
 | **P1-17** 对讲失败落管线 | ✅ 修了（Hub）：`main.go` OnAudioFrame 的 `Forward` 出错即 return，不再走语音管线。 |
-| **P1-18** 紧急呼叫谎报 | ✅ 修了（Hub/router）：Notify 失败重试 3 次，仍失败回“通知失败，请立即手动拨打 120”，不记 notified。 |
-| **P1-19** “报警”误触发 | ✅ 修了（Hub/router）：词边界 + 否定/设备词/已报警排除。 |
+| **P1-18** | 已删除 | 2026-11-23 紧急呼叫功能整体删除，本项作废。 |
+| **P1-19** | 已删除 | 2026-11-23 紧急呼叫功能整体删除，本项作废。 |
 | **P1-20** Wyoming 无锁 | ✅ 修了（Hub/wyoming）：`wyoming.Client` 加写锁。 |
 | **P1-21** HA 并发写不安全 | ✅ 修了（Hub/ha）：`call()` 与 `SubscribeEvents` 的 `WriteJSON` 加写锁。 |
 | **P1-22** Web PUT 合并语义 + 配置锁 | ✅ 修了（Hub/web/config）：PUT 递归合并、原地更新 `*s.cfg`、与房间认领共用 `cfgMu`；全部 Config 字段补 `json` 标签。已知限制：PUT 合并无法表达删除设备，删设备需直接改文件。 |

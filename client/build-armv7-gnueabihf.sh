@@ -149,7 +149,7 @@ for arg in "${CARGO_ARGS[@]}"; do
   esac
 done
 if [ "$ALSA_ASSERT_SKIP" = "1" ]; then
-  echo "WARNING: --no-default-features given explicitly — skipping ALSA backend marker assertion (no-ALSA emergency build has no marker by design)"
+  echo "WARNING: --no-default-features given explicitly — skipping ALSA backend marker assertion (no-ALSA fallback build has no marker by design)"
 elif ! grep -qF "open-xiaoai-audio-backend=alsa" "$STRINGS_TXT"; then
   echo "ASSERT FAIL: ALSA backend marker missing from $BIN (built without the alsa feature?)" >&2
   exit 1

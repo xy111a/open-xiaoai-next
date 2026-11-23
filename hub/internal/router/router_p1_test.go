@@ -1,7 +1,7 @@
 package router
 
-// P1 全量修复回归测试：P1-15 对讲触发、P1-18 紧急谎报、P1-19 报警误触发、
-// P1-25 每日提醒越界、P1-38 多 Agent 路由、P1-39 房间认领、P1-41 记忆读
+// P1 全量修复回归测试：P1-15 对讲触发、P1-25 每日提醒越界、
+// P1-38 多 Agent 路由、P1-39 房间认领、P1-41 记忆读
 // 与定时动作、P1-42 查询与查状态失败、P1-27 SetHA 热换；顺带 P2-45。
 
 import (
@@ -16,109 +16,6 @@ import (
 	"github.com/huajun/open-xiaoai-next/hub/internal/agent"
 	"github.com/huajun/open-xiaoai-next/hub/internal/reminders"
 )
-
-// ---- P1-18：Notify 失败不再谎报 ----
-
-func failingNotifyDeps(t *testing.T) (Deps, *int) {
-	deps, _, _, _ := testDeps(t)
-	n := 0
-	deps.Notify = func(ctx context.Context, text string) error {
-		n++
-		return fmt.Errorf("HA 推送失败")
-	}
-	return deps, &n
-}
-
-func TestEmergencyNotifyFailureNotLying(t *testing.T) {
-	deps, n := failingNotifyDeps(t)
-	r := New(deps, nil)
-	reply, err := r.Route(context.Background(), "lx06-1", "救命")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(reply, "已经帮你呼叫") {
-		t.Fatalf("Notify 失败时不能回“已经帮你呼叫”，实际 %q", reply)
-	}
-	if !strings.Contains(reply, "手动拨打 120") {
-		t.Fatalf("Notify 失败应提示手动拨打 120，实际 %q", reply)
-	}
-	// 仍失败时重复触发应重新尝试 Notify（而不是被“已在呼叫”挡住）。
-	if _, err := r.Route(context.Background(), "lx06-1", "打 120"); err != nil {
-		t.Fatal(err)
-	}
-	// 每次触发内部重试 3 次：两次触发共 6 次调用。
-	if *n != 6 {
-		t.Fatalf("失败重试应为每次 3 次、两次共 6 次，实际 %d", *n)
-	}
-	if !r.EmergencyActive("lx06-1") {
-		t.Fatal("通知失败后呼叫仍应处于进行中（可取消/可再试）")
-	}
-}
-
-func TestEmergencyNotifyRetryThenSuccess(t *testing.T) {
-	deps, _, _, _ := testDeps(t)
-	n := 0
-	deps.Notify = func(ctx context.Context, text string) error {
-		n++
-		if n < 3 {
-			return fmt.Errorf("第 %d 次失败", n)
-		}
-		return nil
-	}
-	r := New(deps, nil)
-	reply, err := r.Route(context.Background(), "lx06-1", "救命")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 同一次触发内重试 3 次后成功：应回成功文案。
-	if !strings.Contains(reply, "已经帮你呼叫急救") {
-		t.Fatalf("重试成功后应回“已经帮你呼叫急救”，实际 %q", reply)
-	}
-	if n != 3 {
-		t.Fatalf("应重试到第 3 次成功，实际调用 %d 次", n)
-	}
-	// 通知成功后重复触发不再 Notify。
-	if _, err := r.Route(context.Background(), "lx06-1", "打 120"); err != nil {
-		t.Fatal(err)
-	}
-	if n != 3 {
-		t.Fatalf("成功后重复触发不应再 Notify，实际 %d 次", n)
-	}
-}
-
-// ---- P1-19：“报警”误触发 ----
-
-func TestEmergencyTriggerWordBoundary(t *testing.T) {
-	deps, _, _, _ := testDeps(t)
-	r := New(deps, nil)
-	ctx := context.Background()
-	// 否定与设备词都不应触发紧急呼叫（应落到 Agent/无大脑回复）。
-	for _, text := range []string{"不要报警", "别报警", "不用报警", "报警器响了", "报警声好大", "刚才误报了"} {
-		reply, err := r.Route(ctx, "lx06-1", text)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.Contains(reply, "呼叫急救") || strings.Contains(reply, "手动拨打 120") {
-			t.Fatalf("%q 不应触发紧急呼叫，实际 %q", text, reply)
-		}
-		if r.EmergencyActive("lx06-1") {
-			t.Fatalf("%q 不应留下进行中的呼叫", text)
-		}
-	}
-	// 真求助仍触发。
-	for _, text := range []string{"帮我报警", "我要报警", "救命", "打 120"} {
-		reply, err := r.Route(ctx, "lx06-1", text)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !strings.Contains(reply, "呼叫急救") {
-			t.Fatalf("%q 应触发紧急呼叫，实际 %q", text, reply)
-		}
-		if _, err := r.Route(ctx, "lx06-1", "取消呼叫"); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
 
 // ---- P1-15：对讲触发 ----
 
