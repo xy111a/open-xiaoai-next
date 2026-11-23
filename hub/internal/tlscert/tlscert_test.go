@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -141,6 +142,32 @@ func TestLoadOrCreateCAReuseAndMismatch(t *testing.T) {
 	}
 	if _, err := parseCA(ca1.CertPEM, other.KeyPEM); err == nil {
 		t.Fatal("CA 私钥与证书不匹配时应报错")
+	}
+}
+
+// H2：CA 文件损坏时先备份再明确报错拒绝启动，不再静默重建。
+func TestLoadOrCreateCADamagedRefusesStartup(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := LoadOrCreateCA(dir); err != nil {
+		t.Fatalf("首次 LoadOrCreateCA: %v", err)
+	}
+	// 写坏 ca.crt：解析失败时应备份并拒绝启动，而不是静默重建。
+	caCert := filepath.Join(dir, "tls", "ca.crt")
+	if err := os.WriteFile(caCert, []byte("not a pem"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadOrCreateCA(dir); err == nil {
+		t.Fatal("CA 损坏时应拒绝启动")
+	} else if !strings.Contains(err.Error(), "CA 文件损坏") {
+		t.Fatalf("错误应说明 CA 损坏，实际：%v", err)
+	}
+	// 损坏的 CA 应备份到 .bak.<时间戳>，原路径文件已被移走。
+	matches, _ := filepath.Glob(caCert + ".bak.*")
+	if len(matches) == 0 {
+		t.Fatal("损坏的 CA 应备份到 .bak.<时间戳>")
+	}
+	if _, err := os.Stat(caCert); !os.IsNotExist(err) {
+		t.Fatal("损坏的 CA 文件应已被移走备份")
 	}
 }
 

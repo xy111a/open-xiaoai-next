@@ -146,6 +146,9 @@ else
   bad "缺 deploy/.env（先 cp deploy/.env.example deploy/.env 再填）"
 fi
 [ "$FAIL" -gt 0 ] && { echo "本机预检查有 FAIL，先修好再继续。"; exit 1; }
+# M5：deploy/.env 含 4 个 Token，默认 umask 下是 0644（同机其他用户可读），
+# 预检查通过后收紧到 0600；NAS 上那份在传文件后同样收紧（见 §2）。
+chmod 600 deploy/.env && ok "deploy/.env 权限已收紧到 600" || echo "WARN: chmod 600 deploy/.env 失败（请手动收紧）"
 
 # ---------- 1. NAS 连通与环境检查 ----------
 info "1. NAS 连通与环境检查"
@@ -180,6 +183,8 @@ $SSH "mkdir -p $NAS_DIR/deploy $NAS_DIR/hub" \
 $SCP deploy/docker-compose.yml deploy/Dockerfile.hub deploy/hub-linux-amd64 \
       deploy/snapserver.conf deploy/mpd.conf deploy/.env "$NAS_SSH:$NAS_DIR/deploy/" \
   && ok "部署文件已传到 $NAS_DIR/deploy/" || { bad "scp 传部署文件失败"; exit 1; }
+# M5：NAS 上那份 .env 同样收紧到 0600（含 4 个 Token）。
+$SSH "chmod 600 $NAS_DIR/deploy/.env" && ok "NAS 上 deploy/.env 权限已收紧到 600" || echo "WARN: NAS 上 chmod 600 deploy/.env 失败（请手动收紧）"
 # P2-55：kws-sidecar 的构建上下文不在 deploy/ 里——compose 里它是
 # build: ../kws-sidecar，且无 image:，只传 deploy/ 的话 NAS 上
 # docker compose up 会因构建上下文缺失而失败。只传构建所需文件
