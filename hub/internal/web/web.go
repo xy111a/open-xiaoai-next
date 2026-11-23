@@ -25,6 +25,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -218,6 +220,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/latency", s.requireAuth(s.latency))
 	mux.HandleFunc("/api/health", s.requireAuth(s.health))
 	mux.HandleFunc("/api/config", s.requireAuth(s.configAPI))
+	mux.HandleFunc("/api/config/restore", s.requireAuth(s.configRestore))
 	mux.HandleFunc("/api/restart", s.requireAuth(s.restart))
 	mux.HandleFunc("/api/ota", s.requireAuth(s.otaAPI))
 	mux.HandleFunc("/api/fingerprint", s.requireAuth(s.fingerprintAPI))
@@ -1012,6 +1015,69 @@ func callSidecarRestart(restartURL, token string) error {
 	return nil
 }
 
+// ---- 配置备份与恢复（P1-6，2026-11-23 审查）----
+//
+// 面板 PUT 改配置以前只写文件、无备份无回滚：一次写坏（或新配置
+// 让 Hub 起不来）就只能人工从 NAS 恢复。现在 PUT 前先把当前
+// config.yaml 拷一份带时间戳的备份（config.yaml.bak.<时间戳>，
+// 保留最近 3 份），并提供 POST /api/config/restore 恢复最新（或指定）一份。
+
+// maxConfigBackups 是保留的配置备份份数。
+const maxConfigBackups = 3
+
+// configBackupPrefix 是备份文件名的前缀（config.yaml.bak.）。
+func configBackupPrefix(path string) string {
+	return filepath.Base(path) + ".bak."
+}
+
+// listConfigBackups 列出 path 的全部备份文件名（basename，按时间戳升序）。
+func listConfigBackups(path string) []string {
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		return nil
+	}
+	prefix := configBackupPrefix(path)
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), prefix) {
+			continue
+		}
+		out = append(out, e.Name())
+	}
+	sort.Strings(out)
+	return out
+}
+
+// backupConfig 把当前配置文件复制一份带时间戳的备份，保留最近
+// maxConfigBackups 份。源文件不存在（首次部署）时返回 ""，nil。
+// 返回备份文件名（basename），供 PUT 响应与日志引用。
+func backupConfig(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	name := configBackupPrefix(path) + time.Now().Format("20060102-150405")
+	bak := filepath.Join(filepath.Dir(path), name)
+	if err := os.WriteFile(bak, b, 0600); err != nil {
+		return "", err
+	}
+	pruneConfigBackups(path)
+	return name, nil
+}
+
+// pruneConfigBackups 删掉超出保留份数的旧备份（只删本目录下
+// config.yaml.bak.*，不动其它文件）。
+func pruneConfigBackups(path string) {
+	names := listConfigBackups(path)
+	for len(names) > maxConfigBackups {
+		_ = os.Remove(filepath.Join(filepath.Dir(path), names[0]))
+		names = names[1:]
+	}
+}
+
 // configAPI 读/写 config.yaml。
 // GET 返回脱敏后的当前配置；PUT 接收部分配置 JSON（snake_case，与 YAML
 // 一致），与当前配置递归合并后校验、写文件、原地热更新内存配置
@@ -1076,6 +1142,16 @@ func (s *Server) configAPI(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "校验失败: " + err.Error()})
 			return
 		}
+		// P1-6：写新配置前先备份当前配置——备份失败即拒绝写，
+		// 否则一次写坏就没有回滚点了。
+		bakName, err := backupConfig(s.cfgPath)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "备份当前配置失败: " + err.Error()})
+			return
+		}
+		if bakName != "" {
+			log.Printf("配置备份：PUT 前已备份当前配置为 %s", bakName)
+		}
 		if err := cfg.Save(s.cfgPath); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写文件失败: " + err.Error()})
 			return
@@ -1083,10 +1159,105 @@ func (s *Server) configAPI(w http.ResponseWriter, r *http.Request) {
 		// 原地更新（不换指针）：main.go 的 h.cfg 与 s.cfg 是同一指针，
 		// 更新后两边都看到。
 		*s.cfg = cfg
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "note": "配置已保存；Agent/HA/Wyoming 等下游连接在 Hub 重启后生效"})
+		resp := map[string]string{"status": "ok", "note": "配置已保存；Agent/HA/Wyoming 等下游连接在 Hub 重启后生效"}
+		if bakName != "" {
+			resp["backup"] = bakName
+		}
+		writeJSON(w, http.StatusOK, resp)
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只支持 GET/PUT"})
 	}
+}
+
+// configRestore 恢复上次配置：把一份备份拷回 config.yaml 并热更新
+// 内存配置。POST /api/config/restore；请求体可选 {"backup": "<文件名>"}
+// 指定恢复哪一份（缺省最新一份）。恢复本身先备份当前配置（可再恢复回来）。
+// 注意：恢复只换配置文件与内存配置，下游连接（Agent/HA/Wyoming）仍需
+// POST /api/restart 重启 Hub 才重载；Hub 因坏配置起不来时面板也不在，
+// 那时改用 NAS 端手工 cp 备份文件（备份就在 config.yaml 同目录）。
+func (s *Server) configRestore(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "只许 POST"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	var req struct {
+		Backup string `json:"backup"`
+	}
+	if r.Body != nil {
+		// 体为空或非法时忽略，用最新一份（不报错）。
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	lock := s.cfgLock()
+	lock.Lock()
+	defer lock.Unlock()
+	name := req.Backup
+	if name == "" {
+		names := listConfigBackups(s.cfgPath)
+		if len(names) == 0 {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "没有可恢复的配置备份"})
+			return
+		}
+		name = names[len(names)-1]
+	} else {
+		// 只许本目录下 config.yaml.bak.* 的 basename，防路径穿越。
+		if strings.ContainsAny(name, `/\`) || !strings.HasPrefix(name, configBackupPrefix(s.cfgPath)) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "backup 只能是本目录下的配置备份文件名"})
+			return
+		}
+	}
+	bakPath := filepath.Join(filepath.Dir(s.cfgPath), name)
+	b, err := os.ReadFile(bakPath)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "读备份失败: " + err.Error()})
+		return
+	}
+	// 恢复前先备份当前配置（恢复本身也可回滚）。
+	if _, err := backupConfig(s.cfgPath); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "备份当前配置失败: " + err.Error()})
+		return
+	}
+	// 原子写回：临时文件 + 改名（与 Config.Save 同款写法，不动 config.go）。
+	tmp, err := os.CreateTemp(filepath.Dir(s.cfgPath), ".config-restore-*.tmp")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写回失败: " + err.Error()})
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写回失败: " + err.Error()})
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写回失败: " + err.Error()})
+		return
+	}
+	if err := os.Chmod(tmpName, 0600); err != nil {
+		_ = os.Remove(tmpName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写回失败: " + err.Error()})
+		return
+	}
+	if err := os.Rename(tmpName, s.cfgPath); err != nil {
+		_ = os.Remove(tmpName)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写回失败: " + err.Error()})
+		return
+	}
+	// 从磁盘重载进内存（校验不过即拒绝；磁盘文件已是备份内容，
+	// 面板可再调一次 restore 恢复回来）。
+	cfg, err := config.Load(s.cfgPath)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "恢复的文件校验失败: " + err.Error()})
+		return
+	}
+	if err := cfg.Validate(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "恢复的文件校验失败: " + err.Error()})
+		return
+	}
+	*s.cfg = *cfg
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "restored_from": name, "note": "已恢复备份配置；Agent/HA/Wyoming 等下游连接在 Hub 重启后生效"})
 }
 
 // fingerprintAPI 返回 Hub TLS 服务端证书指纹（P1-10）：

@@ -2,7 +2,7 @@ package voice
 
 // P1-28 / P1-29 回归测试：断线 Discard 丢弃残留 utterance；
 // 结算异步化（Frame/End 立即返回，回答在后台跑）；同一设备上一句
-// 未答完时新结算丢弃。
+// 未答完时新结算先判撤退词（P1-14），不是撤退词才丢弃。
 
 import (
 	"context"
@@ -116,8 +116,10 @@ func TestSettleDropsWhenInFlight(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(100 * time.Millisecond)
-	if n := stt.calls(); n != 1 {
-		t.Fatalf("in-flight 时新结算应丢弃，STT 应只被调 1 次，实际 %d", n)
+	// P1-14：in-flight 时新结算先判撤退词——被挡下的本句多一次 STT
+	// （撤退词检查），不是撤退词则丢弃、不进路由。
+	if n := stt.calls(); n != 2 {
+		t.Fatalf("in-flight 时新结算应判撤退词，STT 应被调 2 次（回答 1 次 + 撤退检查 1 次），实际 %d", n)
 	}
 	// 放行后第一句答完；再结算一局应正常进行。
 	close(release)
@@ -125,6 +127,12 @@ func TestSettleDropsWhenInFlight(t *testing.T) {
 	case <-replied:
 	case <-time.After(2 * time.Second):
 		t.Fatal("第一句回答应完成")
+	}
+	// 被挡下的本句不是撤退词（blockingSTT 回“你好”），不应再有回答。
+	select {
+	case <-replied:
+		t.Fatal("非撤退词的丢弃句不应触发回答")
+	case <-time.After(300 * time.Millisecond):
 	}
 	// 等 inFlight 标记清除（最多 2 秒）。
 	deadline := time.Now().Add(2 * time.Second)
@@ -145,7 +153,7 @@ func TestSettleDropsWhenInFlight(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("上一句答完后新结算应正常回答")
 	}
-	if n := stt.calls(); n != 2 {
-		t.Fatalf("新结算应调 STT，累计应为 2 次，实际 %d", n)
+	if n := stt.calls(); n != 3 {
+		t.Fatalf("新结算应调 STT，累计应为 3 次，实际 %d", n)
 	}
 }

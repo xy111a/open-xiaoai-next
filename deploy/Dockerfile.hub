@@ -42,6 +42,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD ["bash", "-c", "cat < /dev/null > /dev/tcp/127.0.0.1/4399"]
 
 USER appuser
-EXPOSE 4399 8080
+EXPOSE 4399 8081
 ENTRYPOINT ["/usr/local/bin/hub"]
 CMD ["-config", "/app/config.yaml"]

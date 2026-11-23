@@ -24,7 +24,7 @@ func TestAddRejectsUnknownKind(t *testing.T) {
 func TestTickDeletesUnknownKindOnce(t *testing.T) {
 	s := New("", nil)
 	fired := make(chan struct{}, 10)
-	s.SetOnFire(func(r Reminder) { fired <- struct{}{} })
+	s.SetOnFire(func(r Reminder) error { fired <- struct{}{}; return nil })
 	// Add 拦不住手写/旧数据：直接进表模拟磁盘里的未知 Kind。
 	s.mu.Lock()
 	s.items["u1"] = &Reminder{ID: "u1", Kind: "bogus", Text: "x", Enabled: true, Next: time.Now().Add(-time.Second)}
@@ -72,7 +72,7 @@ func TestLoadDropsUnknownKind(t *testing.T) {
 func TestKindActionFiresOnceThenDeleted(t *testing.T) {
 	s := New("", nil)
 	fired := make(chan Reminder, 10)
-	s.SetOnFire(func(r Reminder) { fired <- r })
+	s.SetOnFire(func(r Reminder) error { fired <- r; return nil })
 	if _, err := s.Add(Reminder{Kind: KindAction, Text: "关客厅灯", Room: "客厅", Next: time.Now().Add(-time.Second)}); err != nil {
 		t.Fatal(err)
 	}
@@ -91,6 +91,11 @@ func TestKindActionFiresOnceThenDeleted(t *testing.T) {
 	case got := <-fired:
 		t.Fatalf("KindAction 触发后应删除、不再触发，实际 %+v", got)
 	case <-time.After(300 * time.Millisecond):
+	}
+	// P1-12：删除在 onFire 返回后异步发生，等删除完成（2s 内）。
+	deadline := time.Now().Add(2 * time.Second)
+	for len(s.List()) != 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
 	}
 	if len(s.List()) != 0 {
 		t.Fatalf("KindAction 触发后应删除，实际 %+v", s.List())

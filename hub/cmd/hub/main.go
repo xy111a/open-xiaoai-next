@@ -965,9 +965,17 @@ func main() {
 	// OTA/对讲扫荡）收到 done 后退出，不再靠 time.Tick
 	// 泄漏到进程结束。
 	done := make(chan struct{})
+	// P1-9（2026-11-23 审查）：后台 goroutine 的退出等待——close(done)
+	// 后主流程先 bgWG.Wait() 再关客户端；否则看门狗正写 haClient /
+	// mpdClient / snapClient 时主流程直接读并 Close() 是数据竞争。
+	// 覆盖全部四个听 done 的 goroutine（看门狗、媒体上报、会话清扫、
+	// OTA/对讲扫荡）；KWS 事件循环不听 done（随 kwsClient.Close() 结束），不在此列。
+	var bgWG sync.WaitGroup
 
 	var watcher *alerts.Watcher
+	bgWG.Add(1)
 	go func() {
+		defer bgWG.Done()
 		// P2-53：time.Tick 改 NewTicker + done 退出。
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -1044,7 +1052,9 @@ func main() {
 	// 本轮（只记 debug 级日志，不刷屏）；上报失败只记日志，
 	// 下一轮重试，绝不影响 Hub 主流程。退出时随 done 通道停。
 	if mediaReporter != nil {
+		bgWG.Add(1)
 		go func() {
+			defer bgWG.Done()
 			syncMediaPlayers := func() {
 				st, cur, err := rt.PlaybackStatus(context.Background())
 				if err != nil {
@@ -1090,7 +1100,11 @@ func main() {
 	// 可观测性：语音管线记 KWS/STT/TTS 分段耗时（见 voice.Pipeline.Latency）。
 	h.pipeline.Latency = latencyRec
 	// 提醒到点：KindAction 是定时动作（走 Route 执行命令），其余是播报。
-	remStore.SetOnFire(func(r reminders.Reminder) {
+	// P1-12：onFire 返回 error——KindAction 执行失败（Route 报错/
+	// 无在线设备）时 Store 保留提醒并 1 分钟后重试一次，不再静默丢失；
+	// 播报类无在线设备时同样返回 error；TTS 内部失败仍是 best-effort
+	// （speakText 内记日志），Store 层不据此重试。
+	remStore.SetOnFire(func(r reminders.Reminder) error {
 		if r.Kind == reminders.KindAction {
 			// P1-41：定时动作——把 Text 当命令走一遍 Route 执行，
 			// 回复播报到对应房间的全部设备（P2-27：旧代码只取
@@ -1108,20 +1122,18 @@ func main() {
 				}
 			}
 			if len(targets) == 0 {
-				log.Printf("定时动作无在线设备，跳过：%s", r.Text)
-				return
+				return fmt.Errorf("定时动作无在线设备，跳过：%s", r.Text)
 			}
 			reply, err := rt.Route(context.Background(), targets[0], r.Text)
 			if err != nil {
-				log.Printf("定时动作执行失败（%s）: %v", r.Text, err)
-				return
+				return fmt.Errorf("定时动作执行失败（%s）: %w", r.Text, err)
 			}
 			if reply != "" && h.speakText != nil {
 				for _, devID := range targets {
 					h.speakText(devID, reply)
 				}
 			}
-			return
+			return nil
 		}
 		text := "提醒你" + r.Text
 		if r.Room != "" {
@@ -1130,14 +1142,18 @@ func main() {
 				for _, d := range devs {
 					h.speakText(d.ID, text)
 				}
-				return
+				return nil
 			}
+		}
+		if len(reg.Online()) == 0 {
+			return fmt.Errorf("播报提醒无在线设备：%s", r.Text)
 		}
 		for _, d := range reg.Online() {
 			if h.speakText != nil {
 				h.speakText(d.ID, text)
 			}
 		}
+		return nil
 	})
 	remStore.Start()
 	// speakText：经 Pipeline 的 TTS 合成后发给设备（提醒/主动播报共用）。
@@ -1199,12 +1215,18 @@ func main() {
 	// 跟随播放钩子在 onArbitrationResult 末尾（赢家确定后调
 	// h.router.FollowMeOnWake，见该方法）。
 	h.arbiter = arbitration.New(arbitration.Window, h.onArbitrationResult)
-	go h.sweepSessions(done)
+	bgWG.Add(1)
+	go func() {
+		defer bgWG.Done()
+		h.sweepSessions(done)
+	}()
 
 	// P1-9/P1-15：每 10s 扫一次——OTA 超时任务标失败（pushing 超 10 分钟
 	// 或 verifying 超 30s）、对讲超时会话挂断。
 	// P2-53：time.Tick 改 NewTicker + done 退出。
+	bgWG.Add(1)
 	go func() {
+		defer bgWG.Done()
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -1343,8 +1365,11 @@ func main() {
 	webSrv := webServer.NewHTTPServer()
 	go func() {
 		log.Printf("Web 面板：http://%s", webSrv.Addr)
+		// P1-3（2026-11-23 审查）：面板监听失败即拒绝启动（Fatal），
+		// 不要只记一行日志继续跑——面板起不来时部署检查应立刻发现，
+		// 而不是等用户发现面板打不开。Shutdown 引起的 ErrServerClosed 除外。
 		if err := webSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("Web 面板退出: %v", err)
+			log.Fatalf("Web 面板启动失败: %v", err)
 		}
 	}()
 
@@ -1379,6 +1404,8 @@ func main() {
 	// 先停后台 goroutine（看门狗/清扫/扫荡），再停各客户端；
 	// 提醒存储最后 Stop（落盘正在进行的提醒）。
 	close(done)
+	// P1-9：等后台 goroutine 全部退出再关客户端（见 bgWG 声明处注释）。
+	bgWG.Wait()
 	if remStore != nil {
 		remStore.Stop()
 	}

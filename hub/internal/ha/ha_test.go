@@ -22,6 +22,10 @@ type fakeHA struct {
 	conn    *websocket.Conn
 	// stubborn 为真时 call_service 只记录、不改状态（读回不一致测试用）。
 	stubborn bool
+	// hangService 为真时 call_service 永远不回（P1-7 总预算测试用）。
+	hangService bool
+	// attrs 是 get_states 里随实体一起回的属性（P1-15 ReadEntity 测试用）。
+	attrs map[string]map[string]any
 	// slowGetStates 让 get_states 回复前拖延（超时测试用）。
 	slowGetStates time.Duration
 	// flipAfterReads/flipEntity/flipTo：第几次 get_states 后把指定实体
@@ -98,13 +102,25 @@ func (f *fakeHA) handle(msg map[string]any) {
 		f.mu.Lock()
 		var out []map[string]any
 		for eid, st := range f.states {
-			out = append(out, map[string]any{"entity_id": eid, "state": st})
+			item := map[string]any{"entity_id": eid, "state": st}
+			if a := f.attrs[eid]; a != nil {
+				item["attributes"] = a
+			}
+			out = append(out, item)
 		}
 		f.mu.Unlock()
 		reply(out)
 	case "call_service":
 		f.mu.Lock()
 		f.calls = append(f.calls, msg)
+		hang := f.hangService
+		f.mu.Unlock()
+		if hang {
+			// 永远不回：客户端应在自己的超时/预算内报错，而不是等服务端。
+			time.Sleep(30 * time.Second)
+			return
+		}
+		f.mu.Lock()
 		// 真改状态：turn_on → on，turn_off → off；stubborn 时只记录不改。
 		eid, _ := msg["target"].(map[string]any)["entity_id"].(string)
 		if eid == "" {

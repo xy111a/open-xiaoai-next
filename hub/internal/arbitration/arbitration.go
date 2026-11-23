@@ -281,6 +281,13 @@ type Arbiter struct {
 	lastClose   time.Time // 上一轮窗口关闭的时间（冷却期用）
 	lastWinner  string    // 上一轮赢家（会话粘性加分用）
 	lastWinAt   time.Time // 上一轮裁决时间（粘性窗口用）
+
+	// closeMu 串行化 close() 全程（P1-10，2026-11-23 审查）：快照 →
+	// Decide → lastWinner 更新 → onResult（网络 I/O）必须按窗口顺序
+	// 依次完成。否则上轮 onResult 还在等网络时下轮 close 已跑完，
+	// 后一轮的裁决结果可能先于前一轮送达（设备收到乱序的赢家通知）。
+	// onResult 不回调 Arbiter（只发设备消息），closeMu 不会与 mu 死锁。
+	closeMu sync.Mutex
 }
 
 // New 新建 Arbiter。
@@ -328,6 +335,11 @@ func (a *Arbiter) Submit(ev WakeEvent) {
 }
 
 func (a *Arbiter) close() {
+	// P1-10：整轮 close 串行化（见 closeMu 注释）；timer 回调里
+	// 同步做网络 I/O（onResult）时，下一轮 close 在这里排队，
+	// 不与上一轮交错、不乱序送达。
+	a.closeMu.Lock()
+	defer a.closeMu.Unlock()
 	a.mu.Lock()
 	events := a.pending
 	a.pending = nil
