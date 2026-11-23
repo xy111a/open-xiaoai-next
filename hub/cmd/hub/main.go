@@ -678,6 +678,16 @@ func main() {
 	if err := transport.ValidateToken(token); err != nil {
 		log.Fatalf("OPEN_XIAOAI_TOKEN 无效: %v", err)
 	}
+	// H3：Web Token 与 Client Token 同款校验（空/<16 位/弱值即 Fatal），
+	// 且两者必须不同（相同即 Web 泄露等于 4399 泄露）。只放在生产启动处，
+	// 不放进 transport.New/Serve（测试用短 Token 不受影响）。
+	webToken := os.Getenv("OPEN_XIAOAI_WEB_TOKEN")
+	if err := transport.ValidateTokenNamed(webToken, "OPEN_XIAOAI_WEB_TOKEN"); err != nil {
+		log.Fatalf("OPEN_XIAOAI_WEB_TOKEN 无效: %v", err)
+	}
+	if webToken == token {
+		log.Fatalf("OPEN_XIAOAI_WEB_TOKEN 与 OPEN_XIAOAI_TOKEN 相同（两个 Token 必须不同，否则 Web 泄露即等于 4399 泄露）")
+	}
 	// P2-4：数据目录 0700（旧代码 0755，同 NAS 多用户可列目录）；
 	// 已有的数据文件（提醒/记忆含用户语音原文）在启动时收紧到 0600。
 	if err := os.MkdirAll(cfg.Hub.DataDir, 0700); err != nil {

@@ -211,6 +211,9 @@ check_env() {
     || fail "$name" "找不到 $ENV_FILE" "先 cp deploy/.env.example deploy/.env 再填（见 deploy/NAS_CHECKLIST.md §0.4）"
   load_env_file "$ENV_FILE" \
     || fail "$name" "读 $ENV_FILE 失败" "确认文件可读、每行是 KEY=VALUE 格式"
+  # M5：提示 .env 当前权限（0600 以外即提醒收紧；nas-install.sh 会在预检查通过后 chmod 600）。
+  _env_perm="$(stat -c %a "$ENV_FILE" 2>/dev/null || true)"
+  [ -n "$_env_perm" ] && [ "$_env_perm" != "600" ] && warn "$name" "$ENV_FILE 当前权限为 $_env_perm（含 4 个 Token），建议收紧到 600：chmod 600 $ENV_FILE"
 
   OPEN_XIAOAI_TOKEN="$(env_or_file OPEN_XIAOAI_TOKEN)"
   OPEN_XIAOAI_WEB_TOKEN="$(env_or_file OPEN_XIAOAI_WEB_TOKEN)"

@@ -47,3 +47,10 @@ deploy/data/
 
 # gnueabihf 链接期 staging（build-armv7-gnueabihf.sh 每次运行自 rootfs 重建，不进仓库）
 client/.link-gnueabihf/
+
+# 部署种子目录含 CA 私钥与 Cookie，绝不能提交
+deploy/hub-certs/
+deploy/hub-data/
+# 兜底：任何私钥/证书都不进仓库
+*.key
+*.pem
