@@ -386,12 +386,20 @@ func (c *Client) ReadState(entityID string) (string, error) {
 // 读不到（实体不存在/HA 故障/超时）即未知——不等读完 3 次，HA 不可达时
 // 重试没有意义，立刻返回。
 func (c *Client) VerifyState(entityID, want string) ReadbackOutcome {
+	return c.VerifyStatePred(entityID, func(state string) bool { return state == want })
+}
+
+// VerifyStatePred 读回验证的判定函数版：不是所有 domain 的 state 都能用
+// 精确字符串比对——climate 开着时 state 是运行模式（heat/cool/auto…）
+// 而不是 "on"，cover 开着时是 "open"/"opening"。调用方按 domain 给判定，
+// 重试/超时语义与 VerifyState 完全相同。
+func (c *Client) VerifyStatePred(entityID string, want func(state string) bool) ReadbackOutcome {
 	for i := 0; i < ReadbackAttempts; i++ {
 		state, err := c.ReadState(entityID)
 		if err != nil {
 			return ReadbackUnknown
 		}
-		if state == want {
+		if want(state) {
 			return ReadbackConfirmed
 		}
 		if i < ReadbackAttempts-1 {
@@ -428,4 +436,14 @@ func (c *Client) CallServiceWithReadback(domain, service, entityID, want string)
 		return ReadbackUnknown, err
 	}
 	return c.VerifyState(entityID, want), nil
+}
+
+// CallServiceWithReadbackPred 是 CallServiceWithReadback 的判定函数版，
+// 供 state 不能精确比对的 domain 用（climate/cover，见 router 的
+// haControlTarget）。重试/超时语义与 CallServiceWithReadback 相同。
+func (c *Client) CallServiceWithReadbackPred(domain, service, entityID string, want func(state string) bool) (ReadbackOutcome, error) {
+	if err := c.CallService(domain, service, entityID); err != nil {
+		return ReadbackUnknown, err
+	}
+	return c.VerifyStatePred(entityID, want), nil
 }

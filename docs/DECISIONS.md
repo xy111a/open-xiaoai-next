@@ -31,7 +31,16 @@
   不谎称失败也不谎称成功。场景（“我回来了”）读回比的是状态变化（场景实体
   的 state 是上次触发时间）。白名单合并：原表 light/switch/climate/cover
   加上 home-mate 的 fan/input_boolean，climate 保留（卧室空调就是 climate，
-  去掉会断语音控空调）；门锁/燃气/热水器仍排除。
+  去掉会断语音控空调）；门锁/燃气/热水器仍排除。但只保留白名单不够：
+  climate 的 state 是运行模式（heat/cool…）不是 "on"，cover 没有
+  turn_on/turn_off 服务——白名单合并时“与现有行为兼容”的说法对这两个
+  domain 不成立（2026-11-23 审查 M1 修的回归：开空调调服务成功后读回
+  永远比对不上，必然报 mismatch）。现在按 domain 算服务与期望
+  （`router.haControlTarget`）：light/switch/fan/input_boolean 用
+  turn_on/turn_off + "on"/"off"；climate 用 turn_on/turn_off，但开 = state
+  不是 "off"/"unknown"/"unavailable"、关 = "off"；cover 用 open_cover/
+  close_cover，开 = "open"/"opening"、关 = "closed"/"closing"。幂等预查与
+  读回验证用同一套判定。
 - 撤退词快路径（`hub/internal/router` + `hub/cmd/hub/main.go`）：
   整句是“停/停止/停下/别说了/别播了/不要说了”时，本地立即切断声音
   （MPD 暂停 + StopAudio 发 interrupt 停 TTS 播报），不进 LLM、不进仲裁、

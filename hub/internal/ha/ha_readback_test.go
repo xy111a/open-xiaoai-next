@@ -99,6 +99,57 @@ func TestVerifyStateChanged(t *testing.T) {
 	}
 }
 
+// 判定函数版读回验证（2026-11-23 审查 M1）：climate 开着是运行模式
+// （heat/cool…）不是 "on"，cover 用 open/close_cover、state 是 open/closed。
+// 精确比对 "on" 在这两个 domain 上永远确认不了。
+func TestCallServiceWithReadbackPredClimateAndCover(t *testing.T) {
+	f, url := startFakeHA(t)
+	c, err := Dial(url, "hass-token", 5*time.Second)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+
+	// climate 开：turn_on 后 state 是 heat（运行模式），判定“非 off”
+	// 应确认成功；拿旧的精确 "on" 去比对则必然不一致——这就是 M1 的 bug。
+	f.mu.Lock()
+	f.states["climate.bedroom"] = "off"
+	f.mu.Unlock()
+	notOff := func(state string) bool {
+		return state != "off" && state != "unknown" && state != "unavailable"
+	}
+	outcome, err := c.CallServiceWithReadbackPred("climate", "turn_on", "climate.bedroom", notOff)
+	if err != nil {
+		t.Fatalf("CallServiceWithReadbackPred: %v", err)
+	}
+	if outcome != ReadbackConfirmed {
+		t.Fatalf("climate turn_on 后 state=heat，判定非 off 应确认成功，实际 %v", outcome)
+	}
+
+	// cover 开：open_cover 后 state 是 open。
+	f.mu.Lock()
+	f.states["cover.living_room"] = "closed"
+	f.mu.Unlock()
+	isOpen := func(state string) bool { return state == "open" || state == "opening" }
+	outcome, err = c.CallServiceWithReadbackPred("cover", "open_cover", "cover.living_room", isOpen)
+	if err != nil {
+		t.Fatalf("CallServiceWithReadbackPred: %v", err)
+	}
+	if outcome != ReadbackConfirmed {
+		t.Fatalf("cover open_cover 后 state=open，应确认成功，实际 %v", outcome)
+	}
+
+	// cover 关：close_cover 后 state 是 closed。
+	isClosed := func(state string) bool { return state == "closed" || state == "closing" }
+	outcome, err = c.CallServiceWithReadbackPred("cover", "close_cover", "cover.living_room", isClosed)
+	if err != nil {
+		t.Fatalf("CallServiceWithReadbackPred: %v", err)
+	}
+	if outcome != ReadbackConfirmed {
+		t.Fatalf("cover close_cover 后 state=closed，应确认成功，实际 %v", outcome)
+	}
+}
+
 func TestReadStateTimeout(t *testing.T) {
 	f, url := startFakeHA(t)
 	f.slowGetStates = 5 * time.Second // 服务端 5s 才回

@@ -146,10 +146,23 @@ func startFakeHA(t *testing.T) (*fakeHA, *ha.Client) {
 				eid, _ := msg["target"].(map[string]any)["entity_id"].(string)
 				f.calls = append(f.calls, msg["domain"].(string)+"/"+msg["service"].(string)+"/"+eid)
 				if !f.stubborn {
-					if msg["service"] == "turn_on" {
-						f.states[eid] = "on"
-					} else if msg["service"] == "turn_off" {
+					// 按 domain 建模真实 state：climate 开着是运行模式
+					// （heat/cool…）不是 "on"，cover 用 open/close_cover，
+					// state 是 "open"/"closed"。拿 "on" 一律写死会测不到
+					// M1 的 bug（2026-11-23 审查 M2）。
+					switch msg["service"] {
+					case "turn_on":
+						if strings.HasPrefix(eid, "climate.") {
+							f.states[eid] = "heat"
+						} else {
+							f.states[eid] = "on"
+						}
+					case "turn_off":
 						f.states[eid] = "off"
+					case "open_cover":
+						f.states[eid] = "open"
+					case "close_cover":
+						f.states[eid] = "closed"
 					}
 				}
 				f.mu.Unlock()

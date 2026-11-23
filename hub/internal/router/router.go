@@ -1429,6 +1429,40 @@ func truncateLyric(lyric string) string {
 // homeQueryRe 是查询类命令（P1-42）：“灯开着吗”“客厅多少度”只查不调。
 var homeQueryRe = regexp.MustCompile(`^(.+?)(开着吗|关着吗|开着还是关着|多少度|温度是多少|现在多少度)$`)
 
+// haControlTarget 按 domain 算设备控制的服务与目标状态判定：
+//   - light/switch/fan/input_boolean：turn_on/turn_off，state 就是 "on"/"off"；
+//   - climate：服务仍是 turn_on/turn_off，但 state 从来不是 "on"，而是运行模式
+//     （heat/cool/auto/dry…）。开 = state 不是 "off"/"unknown"/"unavailable"，
+//     关 = "off"。拿 "on" 去比对，空调明明开了也会报 mismatch（2026-11-23
+//     审查 M1 修的回归）；
+//   - cover：HA 的 cover 域根本没有 turn_on/turn_off 服务（只有 open_cover/
+//     close_cover/stop_cover 等），调 turn_on 会直接报错；state 是
+//     "open"/"closed"，开 = "open"/"opening"，关 = "closed"/"closing"。
+//
+// 返回的 isTarget 同时用于幂等预查与读回验证，必须是同一套判定——
+// 否则空调已开着（state=heat）也会被预查放过、重复调服务再报 mismatch。
+func haControlTarget(domain string, turnOn bool) (service string, isTarget func(state string) bool) {
+	switch domain {
+	case "cover":
+		if turnOn {
+			return "open_cover", func(state string) bool { return state == "open" || state == "opening" }
+		}
+		return "close_cover", func(state string) bool { return state == "closed" || state == "closing" }
+	case "climate":
+		if turnOn {
+			return "turn_on", func(state string) bool {
+				return state != "off" && state != "unknown" && state != "unavailable"
+			}
+		}
+		return "turn_off", func(state string) bool { return state == "off" }
+	default: // light/switch/fan/input_boolean
+		if turnOn {
+			return "turn_on", func(state string) bool { return state == "on" }
+		}
+		return "turn_off", func(state string) bool { return state == "off" }
+	}
+}
+
 // homeAssistant 处理“开/关 + 别名”命令。先查 HA 状态再调服务，不编数字。
 func (r *Router) homeAssistant(ctx context.Context, deviceID, text string) (string, bool, error) {
 	haClient := r.ha()
@@ -1490,35 +1524,28 @@ func (r *Router) homeAssistant(ctx context.Context, deviceID, text string) (stri
 		return "这个设备不能语音直接控制，请当面确认。", true, nil
 	}
 	turnOn := action == "开" || action == "打开" || action == "开启"
-	service := "turn_off"
+	// 服务与目标判定按 domain 算（haControlTarget）：climate 的 state 是
+	// 运行模式不是 "on"，cover 没有 turn_on/turn_off 服务。
+	service, isTarget := haControlTarget(domain, turnOn)
 	verb := "关了"
 	if turnOn {
-		service = "turn_on"
 		verb = "开了"
 	}
 	// 先查状态：已经是目标状态就直说，不重复调。
 	// P1-42：查状态出错时不再跳过比较直接调服务——先不操作，等查得到再说。
+	// 幂等预查与读回验证用同一套 isTarget（见 haControlTarget），否则
+	// 空调已开着（state=heat）也会被放过、重复调服务再报 mismatch。
 	state, err := haClient.GetEntityState(entityID)
 	if err != nil {
 		return "查不到" + alias + "的状态，先不操作，请检查 HA 连接。", true, nil
 	}
-	{
-		want := "off"
-		if turnOn {
-			want = "on"
-		}
-		if state == want {
-			return alias + "已经是" + map[bool]string{true: "开着", false: "关着"}[turnOn] + "的了。", true, nil
-		}
+	if isTarget(state) {
+		return alias + "已经是" + map[bool]string{true: "开着", false: "关着"}[turnOn] + "的了。", true, nil
 	}
 	// 2026-11-23：调服务后读回验证——CallService 成功只表示 HA 接受了
 	// 请求，读回状态与目标一致才算真的动了；不一致/读不到都要如实说，
 	// 不谎报成功（旧代码调服务成功就直接说“开了/关了”）。
-	want := "off"
-	if turnOn {
-		want = "on"
-	}
-	outcome, err := haClient.CallServiceWithReadback(domain, service, entityID, want)
+	outcome, err := haClient.CallServiceWithReadbackPred(domain, service, entityID, isTarget)
 	if err != nil {
 		return "", true, err
 	}
