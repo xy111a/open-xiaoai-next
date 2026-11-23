@@ -204,11 +204,6 @@ func (r *Router) ha() *ha.Client {
 	return r.deps.HA
 }
 
-// HA 返回当前 HA 客户端（P1-27：看门狗热换后，看门狗等调用方经此读最新值，不再抓启动时那个旧客户端）。
-func (r *Router) HA() *ha.Client {
-	return r.ha()
-}
-
 // SetHA 在 HA 断线重连后热换客户端（P1-27）。
 func (r *Router) SetHA(c *ha.Client) {
 	r.depsMu.Lock()
@@ -469,7 +464,7 @@ func (r *Router) Route(ctx context.Context, deviceID, text string) (string, erro
 	return out, nil
 }
 
-// ---- 6b. 技能插件 ----
+// ---- 7. 技能插件 ----
 
 // skillRoute 处理技能插件路由：文本命中某技能的触发词时 POST 给
 // 技能端点，回的文本直接播报（走现有 TTS 通路：Route 的返回值
@@ -623,7 +618,7 @@ func (r *Router) roomClaim(_ context.Context, deviceID, text string) (string, bo
 	return "", false
 }
 
-// ---- 2. 提醒（FR-14）----
+// ---- 3. 提醒（FR-14）----
 
 var (
 	dailyRe        = regexp.MustCompile(`每天\s*(\d{1,2})\s*[点:：]\s*(\d{1,2})?\s*分?提醒我(.+)`)
@@ -753,7 +748,7 @@ func (r *Router) timedAction(deviceID, room, text string) (string, bool, error) 
 	return fmt.Sprintf("记下了，%d %s后帮你%s。", amount, unitName, cmd), true, nil
 }
 
-// ---- 3. 场景/记忆（FR-09）----
+// ---- 4. 场景/记忆（FR-09）----
 
 var rememberRe = regexp.MustCompile(`^记住(.+)$`)
 var recallRe = regexp.MustCompile(`^(你还记得|你记得|我说过|我让你记住的)(什么|啥|哪些|哪些事)?$`)
@@ -834,7 +829,7 @@ func (r *Router) sceneMemory(ctx context.Context, deviceID, text string) (string
 	return "", false, nil
 }
 
-// ---- 4. 音乐（FR-05）----
+// ---- 5. 音乐（FR-05）----
 
 // 点歌与播放控制的命令词（融合 B：全部走 MPD 队列，Hub 内存记当前曲）。
 var (
@@ -1263,7 +1258,7 @@ func truncateLyric(lyric string) string {
 	return string(runes[:maxRunes]) + "……（歌词太长，只读前面一部分）"
 }
 
-// ---- 5. 家电（FR-06）----
+// ---- 6. 家电（FR-06）----
 
 // homeQueryRe 是查询类命令（P1-42）：“灯开着吗”“客厅多少度”只查不调。
 var homeQueryRe = regexp.MustCompile(`^(.+?)(开着吗|关着吗|开着还是关着|多少度|温度是多少|现在多少度)$`)
