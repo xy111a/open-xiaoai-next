@@ -82,6 +82,7 @@ func TestMPDStatusCurrentQueue(t *testing.T) {
 	if len(q) != 2 || q[1].File != "青花瓷.mp3" || q[1].ID != 6 || q[1].Pos != 1 {
 		t.Fatalf("Queue 应有 2 首、第二首是本地文件，实际 %+v", q)
 	}
+	n := len(f.cmds)
 	files, err := c.SearchFile("青花瓷")
 	if err != nil {
 		t.Fatalf("SearchFile: %v", err)
@@ -89,7 +90,13 @@ func TestMPDStatusCurrentQueue(t *testing.T) {
 	if len(files) != 1 || files[0] != "青花瓷.mp3" {
 		t.Fatalf("SearchFile 应返回 [青花瓷.mp3]，实际 %v", files)
 	}
-	n := len(f.cmds)
+	f.mu.Lock()
+	gotSearch := append([]string{}, f.cmds[n:]...)
+	f.mu.Unlock()
+	if len(gotSearch) != 1 || gotSearch[0] != `search filename "青花瓷"` {
+		t.Fatalf("SearchFile 应发 [search filename \"青花瓷\"]，实际 %v", gotSearch)
+	}
+	n = len(f.cmds)
 	if err := c.PlayFile("青花瓷.mp3"); err != nil {
 		t.Fatalf("PlayFile: %v", err)
 	}
