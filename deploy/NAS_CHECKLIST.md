@@ -15,7 +15,7 @@
 | 0.1 | NAS 开 SSH（UGOS → 控制面板 → 终端机 / SSH），记下登录账号 | 能从电脑 `ssh huajun@NAS_IP` 登录（2026-11-19：NAS 账号是 huajun，不是 root） |
 | 0.2 | UGOS 确认 Docker 已装（自带 Docker 管理器），`docker --version` + `docker compose version` 都有输出 | 两个命令都有版本号 |
 | 0.3 | （可选）本地歌兜底：在 UGOS 文件管理里确认 `/volume1/Music`（音乐在 /volume1/Music，不是 /volume1/music，大小写敏感），放几首 MP3/FLAC 测试 | `ls /volume1/Music` 能看到音乐文件；**不建也不阻塞启动**（music_folder 是可选本地兜底，网易云直连是主路） |
-| 0.4 | 本机：`cp deploy/.env.example deploy/.env`，填 `NAS_IP` / `HASS_TOKEN` / `LLM_API_KEY` / `OPEN_XIAOAI_TOKEN` / `OPEN_XIAOAI_WEB_TOKEN`（后四个不能为空；Hub 没 `OPEN_XIAOAI_TOKEN` 会直接退出，没 `OPEN_XIAOAI_WEB_TOKEN` 时 Web 面板 /api/* 一律 401；两个 Token 必须不同，各用 `openssl rand -hex 16` 生成） | `.env` 里五项都有值 |
+| 0.4 | 本机：`cp deploy/.env.example deploy/.env`，填 `NAS_IP` / `HASS_TOKEN` / `LLM_API_KEY` / `OPEN_XIAOAI_TOKEN` / `OPEN_XIAOAI_WEB_TOKEN`（`HASS_TOKEN` / `OPEN_XIAOAI_TOKEN` / `OPEN_XIAOAI_WEB_TOKEN` 不能为空；Hub 没 `OPEN_XIAOAI_TOKEN` 会直接退出，没 `OPEN_XIAOAI_WEB_TOKEN` 时 Web 面板 /api/* 一律 401；两个 Token 必须不同，各用 `openssl rand -hex 16` 生成。**`LLM_API_KEY` 留空是正常的**：对话走本地 OVMS Qwen3.5-4B（NAS 9000/v3，无需 key），只有改用云端模型时才需填；`nas-install.sh` §0 遇到空 `LLM_API_KEY` 只警告、不 FAIL） | `.env` 里除 `LLM_API_KEY` 外四项都有值 |
 | 0.5 | 准备网易云账号（手机上装好网易云音乐 App）；要听 VIP 歌的话账号本身得是 VIP | 能正常登录网易云 App |
 
 ## 1. 传文件到 NAS
@@ -23,15 +23,15 @@
 | # | 做什么 | 预期结果 |
 |---|---|---|
 | 1.1 | `NAS_SSH=huajun@NAS_IP NAS_DIR=/volume4/docker/open-xiaoai-next HUB_PORT=4399 ./deploy/nas-install.sh`（不带 `up`，只传文件+检查；HUB_PORT 部署时定，默认 4399=停老 Hub 直接接管，4400=与老 Hub 并行） | 末尾汇总 `FAIL=0`；文件在 `$NAS_DIR/deploy/`（docker-compose.yml / Dockerfile.hub / hub-linux-amd64 / snapserver.conf / .env）、`$NAS_DIR/hub/config.yaml`，以及 `$NAS_DIR/kws-sidecar/`（构建源文件：Dockerfile / server.py / entrypoint.sh / requirements.txt / scripts/——compose 里边车是 `build: ../kws-sidecar`，只传 deploy/ 的话 `up` 会因构建上下文缺失而失败，2026-11-18 P2 轮已补传） |
-| 1.2 | 脚本第 3 步会自动改 NAS 上的 `config.yaml`：netease 的 `api` 地址改成 `127.0.0.1:3000`，kws.url 若是旧容器名 `ws://kws-sidecar:10400` 也改成 `ws://127.0.0.1:10400`，HA 地址改成 `NAS_IP:8123`（保持原有 ws/wss 协议，不降级成明文），agents 的 `hermes`/`openclaw` 地址改成 `NAS_IP:8642` / `NAS_IP:18789`（容器名在 host 网络下解析不到，openclaw 只绑 LAN IP），`music_folder` 改成 `/volume1/Music`，`listen` 改成 `:$HUB_PORT`（部署时定的端口，默认 4399）。每处改写都有 grep 断言，任一处没改上脚本即 FAIL（NAS 上已有 config 时不覆盖，先备份为带时间戳的 `config.yaml.bak.YYYYMMDDHHMMSS`；首次部署才传种子配置）。2026-11-18 融合 B：`music_assistant` 地址不再改写——该行已废弃，脚本会直接删掉 NAS 副本里的这一行（新 Hub 读到它会拒绝启动）；种子配置里的该行由 Hub 面删除 | 屏幕打印出的 `api:` / `url:` 行是 `127.0.0.1` / `NAS_IP`，`kws:` 下的 `url:` 是 `ws://127.0.0.1:10400/v1/kws`，`listen:` 是 `:$HUB_PORT`；打印结果里不应再有 `music_assistant:` |
+| 1.2 | 脚本第 3 步会自动改 NAS 上的 `config.yaml`：netease 的 `api` 地址改成 `127.0.0.1:3000`，kws.url 若是旧容器名 `ws://kws-sidecar:10400` 也改成 `ws://127.0.0.1:10400`，HA 地址改成 `NAS_IP:8123`（保持原有 ws/wss 协议，不降级成明文），agents 的 `hermes`/`openclaw` 地址改成 `NAS_IP:8642` / `NAS_IP:18789`（容器名在 host 网络下解析不到，openclaw 只绑 LAN IP），`music_folder` 改成 `/volume1/Music`，`listen` 改成 `:$HUB_PORT`（部署时定的端口，默认 4399），`web_listen` 改成 `NAS_IP:8081`（2026-11-23 审查 P2-23 补：面板绑 NAS 内网 IP，旧副本若是 127.0.0.1:8081 会在局域网打不开）。每处改写都有 grep 断言，任一处没改上脚本即 FAIL（NAS 上已有 config 时不覆盖，先备份为带时间戳的 `config.yaml.bak.YYYYMMDDHHMMSS`；首次部署才传种子配置）。2026-11-18 融合 B：`music_assistant` 地址不再改写——该行已废弃，脚本会直接删掉 NAS 副本里的这一行（新 Hub 读到它会拒绝启动）；种子配置里的该行由 Hub 面删除 | 屏幕打印出的 `api:` / `url:` 行是 `127.0.0.1` / `NAS_IP`，`kws:` 下的 `url:` 是 `ws://127.0.0.1:10400/v1/kws`，`listen:` 是 `:$HUB_PORT`，`web_listen:` 是 `NAS_IP:8081`；打印结果里不应再有 `music_assistant:` |
 | 1.3 | 原因（不用改回来）：Hub 跑在 host 网络下，Docker 容器名 `netease-api` / `kws-sidecar` / `hermes` / `openclaw` 解析不到，必须用 `127.0.0.1` 或 NAS 的 LAN IP；kws-sidecar 与 Hub 一样走 host 网络（见 `deploy/docker-compose.yml`）；本机 `hub/config.yaml` 没动 | — |
 
 ## 2. 拉镜像并启动
 
 | # | 做什么 | 预期结果 |
 |---|---|---|
-| 2.1 | `NAS_SSH=huajun@NAS_IP NAS_DIR=/volume4/docker/open-xiaoai-next HUB_PORT=4399 ./deploy/nas-install.sh up`，或手工：`cd $NAS_DIR/deploy && docker compose pull && docker compose up -d`（HUB_PORT 与 1.1 保持一致） | `pull` 4 个镜像都成功（见镜像核实表；`binaryify/netease_cloud_music_api` 是修正后的官方镜像；hub、kws-sidecar 与 whisper 是本地构建，不拉取；mosquitto、Music Assistant 已删，不再拉取）；`up -d` 无报错 |
-| 2.2 | 等 3 分钟（whisper 首次要下载 funasr/paraformer-zh 模型，约 850MB，分钟级；kws-sidecar 首次还要下载约 5.6MB 唤醒模型到 `kws-data` 卷，`docker compose ps` 里它会晚一点变健康），再 `docker compose ps` | 7 个容器状态全是 `Up`：oxn-hub / oxn-whisper / oxn-piper / oxn-kws-sidecar / oxn-snapserver / oxn-mpd / oxn-netease-api |
+| 2.1 | `NAS_SSH=huajun@NAS_IP NAS_DIR=/volume4/docker/open-xiaoai-next HUB_PORT=4399 ./deploy/nas-install.sh up`，或手工：`cd $NAS_DIR/deploy && docker compose up -d`（HUB_PORT 与 1.1 保持一致；**不要手工 `docker compose pull`**：2026-11-23 审查 P1-5 + NAS 实测——NAS Docker 29.6.2 pull-by-digest 有 bug，按 digest 拉到的镜像无 tag、compose 认不出；脚本第 4 步改为逐镜像按 tag 拉取再用 `docker image inspect` 比对 digest，不一致即 FAIL。手工拉镜像时照此办理） | `pull` 4 个镜像都成功（见镜像核实表；`binaryify/netease_cloud_music_api` 是修正后的官方镜像；hub、kws-sidecar 与 whisper 是本地构建，不拉取；mosquitto、Music Assistant 已删，不再拉取）；`up -d` 无报错 |
+| 2.2 | 等 whisper/piper/netease-api 健康检查变 healthy（脚本第 5 步自动等，最多 600s，超时即 FAIL；whisper 首次要下载 funasr/paraformer-zh 模型，约 850MB，分钟级——Wyoming 服务只在模型加载完、打 Ready 日志后才绑 10300 端口，旧说法“5 秒内端口已通”是错的，2026-11-23 NAS 实测镜像源码确认；kws-sidecar 首次还要下载约 5.6MB 唤醒模型到 `kws-data` 卷，`docker compose ps` 里它会晚一点变健康），再 `docker compose ps` | 7 个容器状态全是 `Up`：oxn-hub / oxn-whisper / oxn-piper / oxn-kws-sidecar / oxn-snapserver / oxn-mpd / oxn-netease-api |
 
 ## 3. 端口检查（NAS 上跑）
 
@@ -76,8 +76,10 @@
 |---|---|---|
 | 6.1 | `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env \| cut -d= -f2-); curl -H "Authorization: Bearer $WEB_TOKEN" http://192.168.88.247:8081/api/devices`（Token 在本机 `deploy/.env` 里；面板绑 NAS 内网 IP） | 有音箱刷好并连上后，列表里出现设备且 `Online:true`（没刷机前只有配置里的两台占位，`Online:false` 是正常的） |
 | 6.1a | 对音箱说“你好小李”（真人唤醒，VM 联调只验过合成语音） | 只有一台应答；另一台静默；Hub 日志出现 `kws: 设备 … 唤醒 "你好小李"`，`/api/status` 的 `kws_status` 为 `ok`（真人唤醒率 1m/3m ≥95% 仍是 BLOCKED，需真机测） |
-| 6.2 | 语音“你好小李，播放周杰伦的青花瓷” | 3 秒内出声（FR-05 验收线）；歌词/暂停/下一首可用 |
+| 6.2 | 语音“你好小李，播放周杰伦的青花瓷” | 首声约 4.4s（2026-11-21 实测；旧“3 秒内出声”线已达不到）；歌词/暂停/下一首可用；**部署日实测并记录实际首声时间** |
 | 6.3 | 两台音箱都刷好后放同一首歌 | 同组同步播放，延迟差 ≤10ms（关口 3） |
+| 6.4 | 17 条音频经 compose 重测（STT 17-clip 回归，见 bench-20261119）+ 一次真人语音测试 | 17 条识别结果与 bench 基线一致（短命令全对）；真人语音唤醒 + 问答各通一次 |
+| 6.5 | 在家电上验一次场景读回（如“你好小李，我回来了”） | 场景触发后 Hub 读回确认才报成功；设备没动时如实报“可能没生效”，不谎报成功 |
 
 ## 7. P1-31 / P1-32 冒烟：重启后数据与配置不丢（2026-11-17 补）
 
@@ -87,7 +89,7 @@
 |---|---|---|
 | 7.1 | `up` 后：`docker compose exec hub ls /app/hub-data`，再 `docker compose logs hub \| grep "证书指纹"` 记下指纹 | `/app/hub-data` 里有证书文件、`reminders.json`、`memory.json`（没有也先记下实际内容）；指纹是一串十六进制 |
 | 7.2 | 语音认领一台房间（如“你好小李，我在客厅”），或在 Web 面板改一次配置 | 认领后 `WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env \| cut -d= -f2-); curl -H "Authorization: Bearer $WEB_TOKEN" http://192.168.88.247:8081/api/devices` 里该设备 `Room` 已变（局域网内直接调）；NAS 上 `cat $NAS_DIR/hub/config.yaml \| grep -A2 <设备ID>` 能看到新房间 |
-| 7.3 | `docker compose restart hub`，等 10 秒，再查一次指纹与房间：`docker compose logs hub \| grep "证书指纹"`、`WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env \| cut -d= -f2-); curl -H "Authorization: Bearer $WEB_TOKEN" http://192.168.88.247:8081/api/devices`（同上，须先建好 §5.0 的隧道） | **指纹与 7.1 记下的一致**（变了说明证书丢了重生成，音箱指纹 pin 会失效）；房间认领还在；`/app/hub-data` 内容还在 |
+| 7.3 | `docker compose restart hub`，等 10 秒，再查一次指纹与房间：`docker compose logs hub \| grep "证书指纹"`、`WEB_TOKEN=$(grep '^OPEN_XIAOAI_WEB_TOKEN=' deploy/.env \| cut -d= -f2-); curl -H "Authorization: Bearer $WEB_TOKEN" http://192.168.88.247:8081/api/devices`（面板绑 NAS 内网 IP，局域网内直接调，不用建隧道） | **指纹与 7.1 记下的一致**（变了说明证书丢了重生成，音箱指纹 pin 会失效）；房间认领还在；`/app/hub-data` 内容还在 |
 | 7.4 | 若 7.3 任一项不对 | 停下，把 `docker compose logs hub` 与 `docker compose config` 的输出原样贴回来，不要猜着往下走 |
 
 | 现象 | 含义 |
@@ -138,4 +140,4 @@ one-shot、只 `compose up` 全新卷也能起来（SC-P2-12 半修的回归项�
 | binarytorch/neteasecloudmusicapi:latest | **不存在** | Docker Hub 返回 404；compose 已改为官方镜像 |
 | binaryify/netease_cloud_music_api:latest（替代） | 存在 | Docker Hub 页面可打开，官方 `docker pull binaryify/netease_cloud_music_api` |
 | kws-sidecar（本地构建，`python:3.12-slim` + sherpa-onnx） | 已修 | `deploy/docker-compose.yml` 的 kws-sidecar 服务：与 Hub 一样走 host 网络，Hub 经 `ws://127.0.0.1:10400/v1/kws` 连接；模型不 bake 进镜像，首次启动由 entrypoint 下载到 `kws-data` 卷（约 5.6MB，SHA256 见 `kws-sidecar/scripts/download-model.sh`），下载失败容器报错退出 |
-| hub（本地构建） | 已修 | 原 `build: ../hub` 无 Dockerfile；现用 `deploy/Dockerfile.hub` + 预编译 `deploy/hub-linux-amd64`（12,093,544 字节，SHA256 `973a3b1fa2d34acab7a1feaa5c6fb146bc01167735b4c50ba408d1acd0213091`，2026-11-18 P2 轮收尾从分支尖 afcdcf0 重编，清单 `deploy/hub-linux-amd64.sha256`；旧值 `95535eee…ead7de` / 12,093,552 字节、`1e4f6f6c…c80a` / 11,747,288 字节已取代） |
+| hub（本地构建） | 已修 | 原 `build: ../hub` 无 Dockerfile；现用 `deploy/Dockerfile.hub` + 预编译 `deploy/hub-linux-amd64`（12,093,544 字节，SHA256 `973a3b1fa2d34acab7a1feaa5c6fb146bc01167735b4c50ba408d1acd0213091`，2026-11-18 P2 轮收尾从分支尖 afcdcf0 重编，清单 `deploy/hub-linux-amd64.sha256`；旧值 `95535eee…ead7de` / 12,093,552 字节、`1e4f6f6c…c80a` / 11,747,288 字节已取代）。**2026-11-23 审查补：部署前必须从当前 main（5d63e26，含 PR #16）重编二进制并更新清单**（见 flash-kit CHECKLIST 步骤 1b；`nas-install.sh` §0 会比对，不一致即 FAIL） |
