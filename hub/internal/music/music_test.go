@@ -243,7 +243,7 @@ func TestMPDPlayURL(t *testing.T) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	want := []string{"clear", "add http://music.example.com/12345.mp3", "play"}
+	want := []string{"clear", `add "http://music.example.com/12345.mp3"`, "play"}
 	if len(f.cmds) != len(want) {
 		t.Fatalf("MPD 应收到 %v，实际 %v", want, f.cmds)
 	}
@@ -251,5 +251,70 @@ func TestMPDPlayURL(t *testing.T) {
 		if f.cmds[i] != w {
 			t.Fatalf("MPD 第 %d 条命令应为 %q，实际 %q", i, w, f.cmds[i])
 		}
+	}
+}
+
+// TestMPDPlayFile 断言 PlayFile 发出的 add 命令带引号：
+// 含空格的文件名是 2026-11-23 彩排复测的真实 blocker
+// （MPD 拒收：wrong number of arguments）。
+func TestMPDPlayFile(t *testing.T) {
+	cases := []struct {
+		name string
+		file string
+		want string
+	}{
+		{"含空格文件名", "周杰伦 - 青花瓷.flac", `add "周杰伦 - 青花瓷.flac"`},
+		{"不含空格文件名", "青花瓷.mp3", `add "青花瓷.mp3"`},
+		{"含双引号与反斜杠", `a"b\c.flac`, `add "a\"b\\c.flac"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := startFakeMPD(t)
+			defer f.ln.Close()
+			c, err := DialMPD(f.ln.Addr().String(), 5*time.Second)
+			if err != nil {
+				t.Fatalf("DialMPD: %v", err)
+			}
+			defer c.Close()
+
+			if err := c.PlayFile(tc.file); err != nil {
+				t.Fatalf("PlayFile(%q): %v", tc.file, err)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			want := []string{"clear", tc.want, "play"}
+			if len(f.cmds) != len(want) {
+				t.Fatalf("MPD 应收到 %v，实际 %v", want, f.cmds)
+			}
+			for i, w := range want {
+				if f.cmds[i] != w {
+					t.Fatalf("MPD 第 %d 条命令应为 %q，实际 %q", i, w, f.cmds[i])
+				}
+			}
+		})
+	}
+}
+
+func TestMPDPlayFileRejects(t *testing.T) {
+	f := startFakeMPD(t)
+	defer f.ln.Close()
+	c, err := DialMPD(f.ln.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatalf("DialMPD: %v", err)
+	}
+	defer c.Close()
+
+	// 空路径仍报错，且不向 MPD 发任何命令。
+	if err := c.PlayFile(""); err == nil {
+		t.Fatal("PlayFile(\"\") 应报错")
+	}
+	// 含换行仍被 validateMPDArg 拒掉（引号化不削弱注入防护）。
+	if err := c.PlayFile("a\nb.flac"); err == nil {
+		t.Fatal("PlayFile 含换行路径应报错")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.cmds) != 0 {
+		t.Fatalf("被拒的 PlayFile 不应向 MPD 发命令，实际 %v", f.cmds)
 	}
 }

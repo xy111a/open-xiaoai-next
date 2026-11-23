@@ -120,7 +120,7 @@ func TestMusicDirectOrderAndFallbackToLocal(t *testing.T) {
 	}
 	cmds := mpdFake.commands()
 	joined := strings.Join(cmds, "\n")
-	if !strings.Contains(joined, "search filename") || !strings.Contains(joined, "add 青花瓷.mp3") {
+	if !strings.Contains(joined, "search filename") || !strings.Contains(joined, `add "青花瓷.mp3"`) {
 		t.Fatalf("兜底应搜本地文件并播，MPD 实际收到: %v", cmds)
 	}
 	// 内存当前曲应记为本地版。
@@ -150,7 +150,7 @@ func TestMusicSearchFailureFallsBackToLocal(t *testing.T) {
 		t.Fatalf("快路径下搜歌失败兜底播出成功应回空回复，实际 %q", reply)
 	}
 	joined := strings.Join(mpdFake.commands(), "\n")
-	if !strings.Contains(joined, "add 青花瓷.mp3") {
+	if !strings.Contains(joined, `add "青花瓷.mp3"`) {
 		t.Fatalf("兜底应播本地文件，MPD 实际收到: %v", mpdFake.commands())
 	}
 }

@@ -504,7 +504,7 @@ func (c *MPDClient) PlayURL(url string) error {
 	if err := c.cmd("clear"); err != nil {
 		return err
 	}
-	if err := c.cmd("add %s", url); err != nil {
+	if err := c.cmd("add %s", quoteMPDArg(url)); err != nil {
 		return err
 	}
 	return c.cmd("play")
@@ -520,6 +520,16 @@ func validateMPDURL(url string) error {
 		return err
 	}
 	return validatePlayableURL(url)
+}
+
+// quoteMPDArg 把 MPD 命令参数包进双引号，里面的反斜杠与双引号转义：
+// MPD 按空白切分未加引号的参数，含空格的路径会被拒收
+// （add 命令报 wrong number of arguments，2026-11-23 彩排复测实测）。
+// 必须在 validateMPDArg 之后调用：控制字符先被拒掉，引号化本身
+// 不改变注入面——参数里的 " 与 \ 都已转义，无法提前闭合引号。
+func quoteMPDArg(s string) string {
+	esc := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s)
+	return `"` + esc + `"`
 }
 
 // validateMPDArg 拒绝含换行/控制字符的 MPD 参数（URL 或本地文件路径共用）：
@@ -664,8 +674,7 @@ func (c *MPDClient) SearchFile(query string) ([]string, error) {
 		return nil, fmt.Errorf("mpd: 搜索词为空")
 	}
 	// MPD search 参数用双引号包起来，里面的反斜杠与双引号要转义。
-	esc := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(query)
-	lines, err := c.query(`search filename "%s"`, esc)
+	lines, err := c.query(`search filename %s`, quoteMPDArg(query))
 	if err != nil {
 		return nil, err
 	}
@@ -689,7 +698,7 @@ func (c *MPDClient) PlayFile(file string) error {
 	if err := c.cmd("clear"); err != nil {
 		return err
 	}
-	if err := c.cmd("add %s", file); err != nil {
+	if err := c.cmd("add %s", quoteMPDArg(file)); err != nil {
 		return err
 	}
 	return c.cmd("play")

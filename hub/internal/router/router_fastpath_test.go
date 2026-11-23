@@ -51,7 +51,7 @@ func TestMusicFastPathDirectSuccess(t *testing.T) {
 		t.Fatalf("快路径下大模型不应被调用，实际 %d 次", cap.calls)
 	}
 	// MPD 应收到 clear/add 直链/play，顺序不能错。
-	if got := mpdFake.commands(); len(got) != 3 || got[0] != "clear" || got[1] != "add http://music.example.com/12345.mp3" || got[2] != "play" {
+	if got := mpdFake.commands(); len(got) != 3 || got[0] != "clear" || got[1] != `add "http://music.example.com/12345.mp3"` || got[2] != "play" {
 		t.Fatalf("MPD 应收到 clear/add/play，实际 %v", got)
 	}
 	if song, source, ok := r.CurrentTrack(); !ok || song.Name != "青花瓷" || song.Artist != "周杰伦" || source != "netease" {
@@ -83,7 +83,7 @@ func TestMusicFastPathLocalFallbackSuccess(t *testing.T) {
 		t.Fatalf("快路径下大模型不应被调用，实际 %d 次", cap.calls)
 	}
 	joined := strings.Join(mpdFake.commands(), "\n")
-	if !strings.Contains(joined, "search filename") || !strings.Contains(joined, "add 青花瓷.mp3") {
+	if !strings.Contains(joined, "search filename") || !strings.Contains(joined, `add "青花瓷.mp3"`) {
 		t.Fatalf("兜底应搜本地文件并播，MPD 实际收到: %v", mpdFake.commands())
 	}
 	if song, source, ok := r.CurrentTrack(); !ok || song.Name != "青花瓷" || source != "local" {

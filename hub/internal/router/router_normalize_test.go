@@ -95,7 +95,7 @@ func TestRouteSTTNormalizationMusic(t *testing.T) {
 		t.Fatalf("搜歌关键词应为“陈奕迅的孤勇者”，实际 %v", queries)
 	}
 	joined := strings.Join(mpdFake.commands(), "\n")
-	if !strings.Contains(joined, "add http://music.example.com/12345.mp3") {
+	if !strings.Contains(joined, `add "http://music.example.com/12345.mp3"`) {
 		t.Fatalf("归一化后点歌应让 MPD 播直链，实际 %v", mpdFake.commands())
 	}
 

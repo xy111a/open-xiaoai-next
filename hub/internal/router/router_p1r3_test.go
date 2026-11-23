@@ -101,7 +101,7 @@ func TestMusicSearchTimeoutFallsBackToLocal(t *testing.T) {
 		t.Fatalf("快路径下超时兜底播出成功应回空回复，实际 %q", reply)
 	}
 	joined := strings.Join(mpdFake.commands(), "\n")
-	if !strings.Contains(joined, "add 青花瓷.mp3") {
+	if !strings.Contains(joined, `add "青花瓷.mp3"`) {
 		t.Fatalf("超时后应兜底播本地文件，MPD 实际收到: %v", mpdFake.commands())
 	}
 }
@@ -136,7 +136,7 @@ func TestMusicSongURLTimeoutFallsBackToLocal(t *testing.T) {
 		t.Fatalf("快路径下超时兜底播出成功应回空回复，实际 %q", reply)
 	}
 	joined := strings.Join(mpdFake.commands(), "\n")
-	if !strings.Contains(joined, "add 青花瓷.mp3") {
+	if !strings.Contains(joined, `add "青花瓷.mp3"`) {
 		t.Fatalf("超时后应兜底播本地文件，MPD 实际收到: %v", mpdFake.commands())
 	}
 }
@@ -180,7 +180,7 @@ func TestMusicSongURLParallel(t *testing.T) {
 		t.Fatalf("第一首无地址时应播第二首，实际 %+v ok=%v", song, ok)
 	}
 	joined := strings.Join(mpdFake.commands(), "\n")
-	if !strings.Contains(joined, "add http://music.example.com/22.mp3") {
+	if !strings.Contains(joined, `add "http://music.example.com/22.mp3"`) {
 		t.Fatalf("MPD 应收到第二首的地址，实际 %v", mpdFake.commands())
 	}
 	if strings.Contains(joined, "33.mp3") {
